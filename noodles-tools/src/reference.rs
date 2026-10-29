@@ -1,11 +1,23 @@
 //! Random access to an indexed (`.fai`) FASTA file.
 
-use std::{collections::HashMap, fs::File, path::Path};
+use std::{collections::HashMap, ffi::OsString, fs::File, path::Path};
 
 use anyhow::Context;
 use noodles_fasta::{self as fasta, fai};
 
-use crate::commands::faidx::read_bases;
+use crate::commands::faidx::{build_index, read_bases};
+
+/// Builds and saves a FASTA file's `.fai` index if it has none, as HTSlib's `fai_load` does.
+pub fn ensure_index(path: &Path) -> anyhow::Result<()> {
+    let mut index = OsString::from(path);
+    index.push(".fai");
+
+    if !Path::new(&index).exists() {
+        build_index(path).with_context(|| format!("Could not build faidx: {}", path.display()))?;
+    }
+
+    Ok(())
+}
 
 /// An indexed FASTA file, read through its index.
 pub struct IndexedFasta {
@@ -15,6 +27,7 @@ pub struct IndexedFasta {
 
 impl IndexedFasta {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        ensure_index(path)?;
         let index = fasta::fs::read_associated_index(path)
             .with_context(|| format!("Could not load faidx: {}", path.display()))?;
         let records = index

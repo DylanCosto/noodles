@@ -532,6 +532,8 @@ pub fn reference_repository(src: Option<&Path>) -> anyhow::Result<fasta::Reposit
         return Ok(fasta::Repository::default());
     };
 
+    crate::reference::ensure_index(src)?;
+
     let reader = fasta::io::indexed_reader::Builder::default()
         .build_from_path(src)
         .with_context(|| format!("opening reference {}", src.display()))?;

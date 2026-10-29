@@ -8,7 +8,13 @@
 # reference.path), plus synthetic-reference.fa and fragmented-reference.fa with .fai indexes,
 # as produced by the noodles benchmark preparation scripts.
 #
-# Prints one OK or DIFF line per check and exits nonzero if any check differs.
+# Prints one OK or DIFF line per check, then the slowest checks, and exits nonzero if any check
+# differs. Per-check wall times are written to WORK_DIR/timings.tsv.
+#
+# samtools outputs are cached as checksums in $COMPARE_CACHE (default
+# ${XDG_CACHE_HOME:-~/.cache}/ntools-compare-samtools), keyed on the samtools build, the corpus files, the command,
+# and the sizes of the work files it names, so later runs only run ntools. Set COMPARE_CACHE=
+# to run samtools every time.
 set -uo pipefail
 
 nt=$1
@@ -22,10 +28,61 @@ cd "$work" || exit 2
 
 failures=0
 
+cache=${COMPARE_CACHE-${XDG_CACHE_HOME:-$HOME/.cache}/ntools-compare-samtools}
+if [ -n "$cache" ]; then
+    mkdir -p "$cache"
+    cache_id=$({
+        readlink -f "$(command -v "$st")"
+        "$st" --version | head -2
+        find "$corpus" -type f -printf '%P %s %T@\n' | sort
+    } | sha256sum | cut -c1-64)
+fi
+
+timings=$work/timings.tsv
+: >"$timings"
+
+# Prints the cache key of a samtools command: the command and the sizes of the work files it
+# names. Files named st.* or *.st.* are samtools outputs, absent when a cached result is used.
+cache_key() {
+    local - word
+    set -f
+    {
+        echo "$cache_id"
+        printf '%s\n' "$1"
+        for word in $1; do
+            case $word in
+                st.* | *.st.*) ;;
+                *) [ -f "$word" ] && printf '%s %s\n' "$word" "$(stat -c %s "$word")" ;;
+            esac
+        done
+    } | sha256sum | cut -c1-64
+}
+
 check() {
     local name=$1 expected=$2 actual=$3
+    local start=$EPOCHREALTIME key="" source=run expected_sum actual_sum pid
 
-    if cmp -s <(eval "$expected" 2>/dev/null) <(eval "$actual" 2>/dev/null); then
+    # Expectations that run ntools are never cached.
+    if [ -n "$cache" ] && [[ $expected != *"$nt"* ]]; then
+        key=$(cache_key "$expected")
+    fi
+
+    if [ -n "$key" ] && [ -f "$cache/$key" ]; then
+        source=cache
+        expected_sum=$(<"$cache/$key")
+        actual_sum=$(eval "$actual" 2>/dev/null | sha256sum)
+    else
+        (eval "$expected" 2>/dev/null | sha256sum >.expected.sum) &
+        pid=$!
+        actual_sum=$(eval "$actual" 2>/dev/null | sha256sum)
+        wait "$pid"
+        expected_sum=$(<.expected.sum)
+        [ -n "$key" ] && echo "$expected_sum" >"$cache/$key"
+    fi
+
+    printf '%s\t%s\t%s\n' "$(awk -v a="$start" -v b="$EPOCHREALTIME" 'BEGIN { printf "%.3f", b - a }')" "$source" "$name" >>"$timings"
+
+    if [ "$expected_sum" = "$actual_sum" ]; then
         echo "OK   $name"
     else
         echo "DIFF $name"
@@ -232,10 +289,11 @@ long_name=$("$st" idxstats "$long" | head -1 | cut -f1)
 "$st" view -b -o mp.long.bam "$long" "$long_name:1-300000" && "$st" index mp.long.bam
 check "mpileup" "$st mpileup mp.short.bam 2>/dev/null" "$nt mpileup mp.short.bam 2>/dev/null"
 check "mpileup -f (BAQ) -@4" "$st mpileup -f $ref mp.short.bam 2>/dev/null" "$nt mpileup -@ 4 -f $ref mp.short.bam 2>/dev/null"
-check "mpileup long -f" "$st mpileup -f $long_ref mp.long.bam 2>/dev/null" "$nt mpileup -f $long_ref mp.long.bam 2>/dev/null"
+# Long-read BAQ takes ~2 minutes single-threaded; single-threaded BAQ is covered on short reads.
+check "mpileup long -f -@8" "$st mpileup -f $long_ref mp.long.bam 2>/dev/null" "$nt mpileup -@ 8 -f $long_ref mp.long.bam 2>/dev/null"
 check "mpileup CRAM -f" "$st mpileup -f $ref -r chrS:1-300000 $corpus/short/input.3.1.cram 2>/dev/null" "$nt mpileup -f $ref -r chrS:1-300000 $corpus/short/input.3.1.cram 2>/dev/null"
 check "mpileup -aa -r -l -s -O --output-extra" "$st mpileup -aa -r chrS:1000-60000 -l targets.txt -s -O --output-BP-5 --output-extra QNAME,FLAG,RG,NM mp.short.bam 2>/dev/null" "$nt mpileup -aa -r chrS:1000-60000 -l targets.txt -s -O --output-BP-5 --output-extra QNAME,FLAG,RG,NM mp.short.bam 2>/dev/null"
-check "mpileup long ins/del options" "$st mpileup --reverse-del --no-output-ins --no-output-del --no-output-ends -f $long_ref mp.long.bam 2>/dev/null" "$nt mpileup --reverse-del --no-output-ins --no-output-del --no-output-ends -f $long_ref mp.long.bam 2>/dev/null"
+check "mpileup long ins/del options -@8" "$st mpileup --reverse-del --no-output-ins --no-output-del --no-output-ends -f $long_ref mp.long.bam 2>/dev/null" "$nt mpileup -@ 8 --reverse-del --no-output-ins --no-output-del --no-output-ends -f $long_ref mp.long.bam 2>/dev/null"
 
 if [ -f md.bam ]; then
     check "mpileup overlapping pairs -A -Q 0 -d 3" "$st mpileup -A -Q 0 -d 3 md.bam 2>/dev/null" "$nt mpileup -A -Q 0 -d 3 md.bam 2>/dev/null"
@@ -374,7 +432,7 @@ done
 check "calmd" "$st calmd --no-PG mp.short.bam $ref 2>/dev/null" "$nt calmd --no-PG mp.short.bam $ref 2>/dev/null"
 check "calmd -e -r -A -E -@4" "$st calmd --no-PG -e -r -A -E mp.short.bam $ref 2>/dev/null" "$nt calmd --no-PG -@ 4 -e -r -A -E mp.short.bam $ref 2>/dev/null"
 check "calmd -r -n 1 -d -q -C 50" "$st calmd --no-PG -r -n 1 -d -q -C 50 mp.short.bam $ref 2>/dev/null" "$nt calmd --no-PG -r -n 1 -d -q -C 50 mp.short.bam $ref 2>/dev/null"
-check "calmd long -e -r -A" "$st calmd --no-PG -e -r -A mp.long.bam $long_ref 2>/dev/null" "$nt calmd --no-PG -e -r -A mp.long.bam $long_ref 2>/dev/null"
+check "calmd long -e -r -A -@8" "$st calmd --no-PG -e -r -A mp.long.bam $long_ref 2>/dev/null" "$nt calmd --no-PG -@ 8 -e -r -A mp.long.bam $long_ref 2>/dev/null"
 check "calmd CRAM -u" "$st calmd --no-PG -u $corpus/short/input.3.1.cram $ref 2>/dev/null | $st view -h -" "$nt calmd --no-PG -u $corpus/short/input.3.1.cram $ref 2>/dev/null | $st view -h -"
 
 # cram-size
@@ -399,5 +457,8 @@ check "reference -e -r" "$st reference -q -e -r chrS:1000000-1003000 embed.cram"
 check "reference tagged (spliced reads) matches the reference" "echo 0" \
     "cmp -l <($nt reference -q $tagged | grep -v '>' | tr -d '\\n') <($st faidx $ref chrS | grep -v '>' | tr -d '\\n') | awk '\$2 != 116' | wc -l"
 
+echo "Slowest checks (seconds, samtools run or cached):"
+sort -rn "$timings" | head -15
+awk -F'\t' '{ t += $1; if ($2 == "cache") c++ } END { printf "Total %.0f s over %d checks, %d from cache\n", t, NR, c }' "$timings"
 echo "$failures difference(s)"
 [ "$failures" -eq 0 ]
