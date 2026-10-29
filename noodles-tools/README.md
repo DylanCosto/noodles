@@ -171,10 +171,10 @@ libdeflate. "short" is 1M synthetic 150 bp paired reads, "tagged" 250k reads wit
 | ampliconclip, short | 3.048 | 1.792 | 1.70x |
 | ampliconclip --both-ends, short, -@4 | 0.809 | 0.395 | 2.05x |
 | coverage, short | 1.145 | 0.413 | 2.77x |
-| consensus, short | 6.362 | 6.089 | 1.04x |
-| consensus, short, -@4 | 1.615 | 1.557 | 1.04x |
-| consensus, long | 11.280 | 10.655 | 1.06x |
-| consensus, long, -@4 | 3.468 | 3.222 | 1.08x |
+| consensus, short | 6.383 | 5.562 | 1.15x |
+| consensus, short, -@4 | 1.633 | 1.429 | 1.14x |
+| consensus, long | 11.325 | 10.012 | 1.13x |
+| consensus, long, -@4 | 3.467 | 3.022 | 1.15x |
 | faidx 1024 regions | 0.018 | 0.020 | 0.90x |
 
 Where ntools is slower, it is single-threaded (single-threaded `mpileup` without BAQ spends its

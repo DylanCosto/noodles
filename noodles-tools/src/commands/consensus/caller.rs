@@ -149,10 +149,11 @@ const CONS_PROBS_PADDED: usize = PMMD + 256;
 /// Precomputed matrices for the Bayesian caller (`cons_probs`).
 #[derive(Clone, Debug)]
 pub struct ConsProbs {
-    v: Vec<f64>,
+    /// Fixed-size, so that clamped table lookups need no bounds checks.
+    v: Box<[f64; CONS_PROBS_PADDED]>,
     /// [`qual2`] for homopolymer lengths up to [`MAX_POLY`] and all qualities, at
     /// `poly * 256 + qual`.
-    qual2: Vec<i32>,
+    qual2: Box<[i32; (MAX_POLY + 1) * 256]>,
 }
 
 impl Default for ConsProbs {
@@ -253,11 +254,19 @@ impl ConsProbs {
 
     fn from_values(v: Vec<f64>) -> Self {
         let poly_mul = v[POLY_MUL];
-        let qual2 = (0..=MAX_POLY as i32)
+        let qual2: Vec<i32> = (0..=MAX_POLY as i32)
             .flat_map(|poly| (0..=u8::MAX).map(move |q| qual2(q, poly, poly_mul)))
             .collect();
 
-        Self { v, qual2 }
+        Self {
+            v: v.into_boxed_slice()
+                .try_into()
+                .expect("cons_probs has its fixed length"),
+            qual2: qual2
+                .into_boxed_slice()
+                .try_into()
+                .expect("one entry per poly and quality"),
+        }
     }
 
     /// [`qual2`] with this set's homopolymer multiplier.
@@ -302,13 +311,17 @@ fn mq_adjusted(q: u8, m: usize) -> u8 {
 }
 
 /// [`mq_adjusted`] for all base qualities and table indexes, at `m * 256 + q`.
-fn mq_adjusted_table() -> &'static [u8] {
-    static TABLE: OnceLock<Vec<u8>> = OnceLock::new();
+fn mq_adjusted_table() -> &'static [u8; MQUAL_POW_1M.len() * 256] {
+    static TABLE: OnceLock<Box<[u8; MQUAL_POW_1M.len() * 256]>> = OnceLock::new();
 
     TABLE.get_or_init(|| {
-        (0..MQUAL_POW_1M.len())
+        let table: Vec<u8> = (0..MQUAL_POW_1M.len())
             .flat_map(|m| (0..=u8::MAX).map(move |q| mq_adjusted(q, m)))
-            .collect()
+            .collect();
+        table
+            .into_boxed_slice()
+            .try_into()
+            .expect("one entry per index and quality")
     })
 }
 
@@ -319,6 +332,15 @@ const MAX_POLY: usize = 100;
 fn qual2(qual: u8, poly: i32, poly_mul: f64) -> i32 {
     let q2 = f64::from(qual) - (f64::from(poly) - 2.0) * poly_mul;
     if 1.0 > q2 { 1 } else { c_int(q2) }
+}
+
+/// Scratch space for [`Caller::init_read`], reused across reads.
+#[derive(Debug, Default)]
+pub struct ReadScratch {
+    /// The read's decoded bases.
+    bases: Vec<u8>,
+    /// Quality minima of the read's windows.
+    window_min: Vec<u8>,
 }
 
 /// The result of the Bayesian caller (`consensus_t`).
@@ -803,7 +825,7 @@ impl Caller {
     /// `nm_init`: precomputes a read's local NM and homopolymer figures as it enters the
     /// pileup, and redistributes homopolymer qualities with `-p`. Returns whether to keep it.
     /// `bases` is scratch space for the read's decoded bases.
-    pub fn init_read(&self, p: &mut Entry, bases: &mut Vec<u8>) -> bool {
+    pub fn init_read(&self, p: &mut Entry, scratch: &mut ReadScratch) -> bool {
         let opts = &self.opts;
 
         if !opts.use_mqual {
@@ -817,6 +839,7 @@ impl Caller {
         }
 
         let n = qlen as usize;
+        let ReadScratch { bases, window_min } = scratch;
         bases.clear();
         bases.extend((0..qlen).map(|i| p.seqi(i) as u8));
         let bases = bases.as_slice();
@@ -829,7 +852,7 @@ impl Caller {
         };
 
         if opts.adj_qual {
-            adjust_by_local_quality(p, bases, &mut local_nm, opts, poly_adj);
+            adjust_by_local_quality(p, bases, window_min, &mut local_nm, opts, poly_adj);
         }
 
         if opts.homopoly_fix != 0.0 {
@@ -867,6 +890,7 @@ impl Caller {
 fn adjust_by_local_quality(
     p: &Entry,
     bases: &[u8],
+    window_min: &mut Vec<u8>,
     local_nm: &mut [i32],
     opts: &CallerOptions,
     poly_adj: f64,
@@ -878,6 +902,9 @@ fn adjust_by_local_quality(
     let quals = p.quals();
     let qual = |i: i32| i32::from(quals[i as usize]);
     let bayes116 = opts.mode == Mode::Bayes116;
+
+    // The minimum quality of each window of `2 * QHALO` bases, by its start.
+    window_minima(quals, 2 * QHALO as usize, window_min);
 
     let mut qmin = qual(0);
     let mut qminp = qual(0);
@@ -948,10 +975,8 @@ fn adjust_by_local_quality(
         if qmin > qual(i + QHALO) {
             qmin = qual(i + QHALO);
         } else if qmin <= qual(i - QHALO) {
-            qmin = 99;
-            let window = &quals[(i - QHALO + 1) as usize..=(i + QHALO) as usize];
-            let lowest = window.iter().fold(u8::MAX, |m, &q| m.min(q));
-            qmin = qmin.min(i32::from(lowest));
+            // The minimum of quals[i - QHALO + 1..=i + QHALO], capped at 99.
+            qmin = 99.min(i32::from(window_min[(i - QHALO + 1) as usize]));
         }
 
         i += 1;
@@ -967,6 +992,33 @@ fn adjust_by_local_quality(
         local_nm[i as usize] += if t < qual(i) { qual(i) - t } else { 0 };
         i += 1;
     }
+}
+
+/// Writes the minimum of each `width`-long window of `values` (a power of two) to `dst`, indexed
+/// by the window's start, by halving: windows of 2, then 4, and so on.
+fn window_minima(values: &[u8], width: usize, dst: &mut Vec<u8>) {
+    debug_assert!(width.is_power_of_two());
+    dst.clear();
+
+    if values.len() < width {
+        return;
+    }
+
+    dst.extend_from_slice(values);
+    let mut len = values.len();
+    let mut span = 1;
+
+    while span < width {
+        len -= span;
+
+        for i in 0..len {
+            dst[i] = dst[i].min(dst[i + span]);
+        }
+
+        span *= 2;
+    }
+
+    dst.truncate(len);
 }
 
 /// The soft-clip and MD parts of `nm_init`: raises the local NM near soft-clips and
@@ -1108,6 +1160,22 @@ fn homopoly_qual_fix(p: &mut Entry, bases: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_window_minima() {
+        let values: Vec<u8> = (0..40u32).map(|i| (i * 37 % 23) as u8).collect();
+        let mut dst = Vec::new();
+        window_minima(&values, 16, &mut dst);
+
+        let expected: Vec<u8> = values
+            .windows(16)
+            .map(|w| *w.iter().min().unwrap())
+            .collect();
+        assert_eq!(dst, expected);
+
+        window_minima(&values[..15], 16, &mut dst);
+        assert!(dst.is_empty());
+    }
 
     #[test]
     fn test_fast_log2() {

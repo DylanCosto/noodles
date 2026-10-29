@@ -26,7 +26,7 @@ use noodles_bam as bam;
 use noodles_sam::{self as sam, alignment::io::Write as _};
 
 use self::{
-    caller::{Caller, ConsProbs, Mode},
+    caller::{Caller, ConsProbs, Mode, ReadScratch},
     options::{Format, Options, Parsed, USAGE},
     pileup::{Column, Entry, Handler, POS_MAX, Pileup},
 };
@@ -170,7 +170,7 @@ struct Ctx<'e, 'a> {
     /// The thread data reference cache (`tdata->ref_tid`, `tdata->ref`).
     tdata: (i32, Option<Arc<Vec<u8>>>),
     /// Scratch space for [`Caller::init_read`].
-    bases: Vec<u8>,
+    scratch: ReadScratch,
 }
 
 impl<'e, 'a> Ctx<'e, 'a> {
@@ -188,7 +188,7 @@ impl<'e, 'a> Ctx<'e, 'a> {
             iter,
             cur_ref: None,
             tdata: (-1, None),
-            bases: Vec::new(),
+            scratch: ReadScratch::default(),
         }
     }
 
@@ -545,7 +545,7 @@ impl Handler for Ctx<'_, '_> {
             return Ok(true);
         }
 
-        Ok(self.env.caller.init_read(entry, &mut self.bases))
+        Ok(self.env.caller.init_read(entry, &mut self.scratch))
     }
 
     fn column(&mut self, column: &Column<'_>) -> anyhow::Result<()> {
