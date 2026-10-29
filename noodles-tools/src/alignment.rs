@@ -213,6 +213,22 @@ impl AlignmentReader {
         index: Option<&Path>,
         header: &sam::Header,
         queries: &Queries<'_>,
+        f: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(Rec<'_>) -> anyhow::Result<()>,
+    {
+        let index = AlignmentIndex::read(self.format(), path, index)?;
+        self.for_each_in_indexed_queries(&index, header, queries, f)
+    }
+
+    /// Like [`Self::for_each_in_queries`], with an index already read, for callers that query
+    /// the same file many times.
+    pub fn for_each_in_indexed_queries<F>(
+        &mut self,
+        index: &AlignmentIndex,
+        header: &sam::Header,
+        queries: &Queries<'_>,
         mut f: F,
     ) -> anyhow::Result<()>
     where
@@ -241,20 +257,18 @@ impl AlignmentReader {
             f(record)
         };
 
-        match self {
-            Self::Bam(reader) => {
-                let index = read_bam_index(path, index)?;
-
+        match (self, index) {
+            (Self::Bam(reader), AlignmentIndex::Bam(index)) => {
                 for query in &queries {
                     match query {
                         Query::Unmapped => {
-                            for result in reader.query_unmapped(&index)? {
+                            for result in reader.query_unmapped(index)? {
                                 let record = result?;
                                 visit(Rec::Bam(&record), query)?;
                             }
                         }
                         Query::Region(region) | Query::Interval { region, .. } => {
-                            let mut query_reader = reader.query(header, &index, region)?;
+                            let mut query_reader = reader.query(header, index, region)?;
                             let mut record = bam::Record::default();
 
                             while query_reader.read_record(&mut record)? != 0 {
@@ -264,23 +278,17 @@ impl AlignmentReader {
                     }
                 }
             }
-            Self::Cram(reader, _) => {
-                let index = match index {
-                    Some(index) => cram::crai::fs::read(index),
-                    None => cram::fs::read_associated_index(path),
-                }
-                .with_context(|| format!("reading index for {}", path.display()))?;
-
+            (Self::Cram(reader, _), AlignmentIndex::Cram(index)) => {
                 for query in &queries {
                     match query {
                         Query::Unmapped => {
-                            for result in reader.query_unmapped(header, &index)? {
+                            for result in reader.query_unmapped(header, index)? {
                                 let record = result?;
                                 visit(Rec::Buf(&record), query)?;
                             }
                         }
                         Query::Region(region) | Query::Interval { region, .. } => {
-                            let mut query_reader = reader.query(header, &index, region)?;
+                            let mut query_reader = reader.query(header, index, region)?;
                             let mut record = RecordBuf::default();
 
                             while query_reader.read_record_buf(&mut record)? != 0 {
@@ -290,10 +298,35 @@ impl AlignmentReader {
                     }
                 }
             }
-            Self::Sam(_) => bail!("region queries on SAM input are not supported; use BAM or CRAM"),
+            (Self::Sam(_), _) => {
+                bail!("region queries on SAM input are not supported; use BAM or CRAM")
+            }
+            _ => bail!("the index does not match the input format"),
         }
 
         Ok(())
+    }
+}
+
+/// A BAM (BAI or CSI) or CRAM (CRAI) index.
+pub enum AlignmentIndex {
+    Bam(bam::Index),
+    Cram(cram::crai::Index),
+}
+
+impl AlignmentIndex {
+    /// Reads the index named by `explicit`, or the one next to `path`, for an input of `format`.
+    pub fn read(format: Format, path: &Path, explicit: Option<&Path>) -> anyhow::Result<Self> {
+        match format {
+            Format::Bam => read_bam_index(path, explicit).map(Self::Bam),
+            Format::Cram => match explicit {
+                Some(index) => cram::crai::fs::read(index),
+                None => cram::fs::read_associated_index(path),
+            }
+            .map(Self::Cram)
+            .with_context(|| format!("reading index for {}", path.display())),
+            Format::Sam => bail!("region queries on SAM input are not supported; use BAM or CRAM"),
+        }
     }
 }
 

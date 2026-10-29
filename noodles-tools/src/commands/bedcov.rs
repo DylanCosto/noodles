@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use noodles_sam::alignment::record::Flags;
 
 use crate::{
-    alignment::{AlignmentReader, Queries, ReadOptions},
+    alignment::{AlignmentIndex, AlignmentReader, Queries, ReadOptions},
     depth::{CountOptions, DEFAULT_EXCLUDE_FLAGS, DepthWindow},
     filter::Filter,
     flags, output,
@@ -88,7 +88,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let (mut reader, path) = AlignmentReader::open(src, &options)?;
         let header = reader.read_header()?;
         let path = path.with_context(|| format!("{src}: bedcov needs indexed files, not stdin"))?;
-        inputs.push((reader, path, header));
+        let index = AlignmentIndex::read(reader.format(), &path, None)?;
+        inputs.push((reader, index, header));
     }
 
     let exclude = (DEFAULT_EXCLUDE_FLAGS - args.unexclude_flags.unwrap_or_else(Flags::empty))
@@ -141,10 +142,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .parse()
             .with_context(|| format!("{}:{}: invalid end", args.bed.display(), i + 1))?;
 
-        for ((reader, path, header), counts) in inputs.iter_mut().zip(counts.iter_mut()) {
+        for ((reader, index, header), counts) in inputs.iter_mut().zip(counts.iter_mut()) {
             *counts = count_region(
                 reader,
-                path,
+                index,
                 header,
                 &filter,
                 count_options,
@@ -182,7 +183,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 /// Sums depth over the 0-based half-open region `[start, end)` of one input.
 fn count_region(
     reader: &mut AlignmentReader,
-    path: &std::path::Path,
+    index: &AlignmentIndex,
     header: &noodles_sam::Header,
     filter: &Filter,
     count_options: CountOptions,
@@ -219,7 +220,7 @@ fn count_region(
 
     let mut reads = 0;
 
-    reader.for_each_in_queries(path, None, header, &Queries::Regions(&regions), |record| {
+    reader.for_each_in_indexed_queries(index, header, &Queries::Regions(&regions), |record| {
         if !filter.matches(&record, header)? {
             return Ok(());
         }
