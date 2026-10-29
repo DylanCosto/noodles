@@ -209,6 +209,25 @@ impl Default for Record {
     }
 }
 
+/// Returns the encoded record, excluding the leading `block_size`.
+///
+/// This allows records to be copied between BAM streams without decoding and re-encoding them.
+/// Reference sequence IDs in the raw record are relative to the header of the stream it was read
+/// from.
+///
+/// # Examples
+///
+/// ```
+/// use noodles_bam as bam;
+/// let record = bam::Record::default();
+/// assert_eq!(record.as_ref().len(), 34);
+/// ```
+impl AsRef<[u8]> for Record {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 impl fmt::Debug for Record {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Record")
