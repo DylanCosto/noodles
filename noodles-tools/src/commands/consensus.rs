@@ -1,10 +1,9 @@
 //! `ntools consensus`: a consensus sequence from aligned reads (samtools consensus).
 //!
-//! A port of `bam_consensus.c` and `consensus_pileup.c` from samtools 1.24. The output matches
-//! samtools byte for byte. Like samtools, `-@` with an indexed input splits each reference into
-//! blocks (`-Z`) that are piled up independently on the worker threads; this can give slightly
-//! different output from the serial path at block boundaries, so both paths are kept, and each
-//! matches samtools run the same way.
+//! A port of `bam_consensus.c` and `consensus_pileup.c` from samtools 1.24, with the same
+//! consensus calls, but with samtools' output bugs fixed rather than reproduced (see the README).
+//! Like samtools, `-@` with an indexed input splits each reference into blocks (`-Z`) that are
+//! piled up independently on the worker threads, and the output is the same as without threads.
 
 mod caller;
 mod options;
@@ -159,10 +158,6 @@ struct Ctx<'e, 'a> {
     out: Vec<u8>,
     /// Where `out` goes in serial mode.
     sink: Option<&'e mut dyn Write>,
-    /// Drop `ks_pileup` writes: serial pileup output with `-@` (samtools never writes it).
-    drop_ks: bool,
-    /// Whether `empty_pileup2` calls from the pileup callback write to `ks_pileup`.
-    threaded: bool,
     seq: Vec<u8>,
     qual: Vec<u8>,
     ks_ins_start: i64,
@@ -184,8 +179,6 @@ impl<'e, 'a> Ctx<'e, 'a> {
             env,
             out: Vec::new(),
             sink: None,
-            drop_ks: false,
-            threaded: env.opts.threads > 0,
             seq: Vec::new(),
             qual: Vec::new(),
             ks_ins_start: -1,
@@ -249,13 +242,7 @@ impl<'e, 'a> Ctx<'e, 'a> {
 
     /// `empty_pileup2`: pileup lines for uncovered positions `[start, end)`, with the reference
     /// base if there is one. Returns whether the reference was unavailable (with `-T`).
-    fn empty_pileup(
-        &mut self,
-        tid: i32,
-        threaded: bool,
-        start: i64,
-        end: i64,
-    ) -> anyhow::Result<bool> {
+    fn empty_pileup(&mut self, tid: i32, start: i64, end: i64) -> anyhow::Result<bool> {
         let mut err = false;
         let mut rseq = None;
 
@@ -265,10 +252,6 @@ impl<'e, 'a> Ctx<'e, 'a> {
             if !err {
                 rseq = self.cur_ref.clone();
             }
-        }
-
-        if threaded && self.drop_ks {
-            return Ok(err);
         }
 
         let name = self.env.name(tid).unwrap_or(b"(null)");
@@ -317,7 +300,7 @@ impl<'e, 'a> Ctx<'e, 'a> {
                         len = len.min(it.end);
                     }
 
-                    if self.empty_pileup(self.last_tid, self.threaded, self.last_pos, len)? {
+                    if self.empty_pileup(self.last_tid, self.last_pos, len)? {
                         bail!("failed to fetch the reference");
                     }
                 }
@@ -335,7 +318,7 @@ impl<'e, 'a> Ctx<'e, 'a> {
                     }
 
                     let len = self.env.len(self.last_tid);
-                    if self.empty_pileup(self.last_tid, false, 0, len)? {
+                    if self.empty_pileup(self.last_tid, 0, len)? {
                         bail!("failed to fetch the reference");
                     }
                 }
@@ -351,7 +334,7 @@ impl<'e, 'a> Ctx<'e, 'a> {
             };
 
             if let Some(start) = gap
-                && self.empty_pileup(tid, self.threaded, start, pos - 1)?
+                && self.empty_pileup(tid, start, pos - 1)?
             {
                 bail!("failed to fetch the reference");
             }
@@ -359,11 +342,16 @@ impl<'e, 'a> Ctx<'e, 'a> {
 
         let (cb, cq) = self.env.caller.call(column);
 
+        // A deleted consensus base is not printed, but its position is covered. (samtools does
+        // not record it, so with -a every later column re-prints the uncovered positions since
+        // the last printed one: duplicated, growing runs of depth-0 lines.)
         if !opts.show_del && cb == b'*' {
+            self.last_pos = pos;
+            self.last_tid = tid;
             return Ok(());
         }
 
-        if !self.drop_ks {
+        {
             let out = &mut self.out;
             out.extend_from_slice(self.env.name(tid).unwrap_or(b"(null)"));
             out.push(b'\t');
@@ -844,10 +832,8 @@ fn run_serial(
     index: Option<&AlignmentIndex>,
     sink: &mut dyn Write,
 ) -> anyhow::Result<()> {
-    let opts = env.opts;
     let mut ctx = Ctx::new(env, None);
     ctx.sink = Some(sink);
-    ctx.drop_ks = opts.threads > 0 && opts.fmt == Format::Pileup;
 
     let result = serial_loop(&mut ctx, reader, header, index);
 
@@ -957,7 +943,7 @@ fn finish_serial_pileup(ctx: &mut Ctx<'_, '_>, n_targets: i32) -> anyhow::Result
             pos = pos.max(it.beg);
         }
 
-        if ctx.empty_pileup(tid, false, pos, len)? {
+        if ctx.empty_pileup(tid, pos, len)? {
             bail!("failed to fetch the reference");
         }
     }
@@ -970,7 +956,7 @@ fn finish_serial_pileup(ctx: &mut Ctx<'_, '_>, n_targets: i32) -> anyhow::Result
         }
 
         let len = ctx.env.len(ctx.last_tid);
-        if ctx.empty_pileup(ctx.last_tid, false, 0, len)? {
+        if ctx.empty_pileup(ctx.last_tid, 0, len)? {
             bail!("failed to fetch the reference");
         }
     }
@@ -1184,7 +1170,7 @@ fn run_job(
 
     if opts.fmt == Format::Pileup && ctx.last_pos < job.end && opts.all_bases > 0 {
         let beg = job.start.max(ctx.last_pos);
-        ctx.empty_pileup(job.tid, true, beg, job.end)?;
+        ctx.empty_pileup(job.tid, beg, job.end)?;
     }
 
     Ok(JobOutput {
@@ -1424,7 +1410,7 @@ fn write_empty_reference(main: &mut Ctx<'_, '_>, tid: i32) -> anyhow::Result<()>
     let len = main.env.len(tid);
 
     if opts.fmt == Format::Pileup {
-        if main.empty_pileup(tid, false, 0, len)? {
+        if main.empty_pileup(tid, 0, len)? {
             bail!("failed to fetch the reference");
         }
 

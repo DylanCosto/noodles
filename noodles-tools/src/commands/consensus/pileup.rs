@@ -4,11 +4,10 @@
 //! inserted base (`nth` > 0), and keeps per-read state such as the running quality of a read
 //! that is padded across another read's insertion.
 //!
-//! Read state structs are recycled through a free list, as in C, because a recycled struct keeps
-//! its last quality (`qual`), which seeds the quality of a read whose first column is a deletion.
-//! Each record is also copied into its struct's buffer without shrinking it, so bytes past the
-//! end of a record are those of an earlier record, as with a reused `bam1_t`; the C code reads
-//! one such byte for a read padded after its last base.
+//! Unlike samtools, a read's state does not depend on earlier reads: a recycled read struct
+//! starts with the quality of a new one (samtools keeps the last read's, which seeds a read whose
+//! first column is a deletion), and the quality of a padded or deleted position comes from the
+//! read's own qualities (samtools reads a byte past them, from an earlier record).
 
 use anyhow::bail;
 
@@ -157,16 +156,15 @@ impl Entry {
         i32::from((byte >> ((!i & 1) << 2)) & 0xf)
     }
 
-    /// `b_qual[i]`, which C may read just outside the qualities: before them (the end of the
-    /// sequence or CIGAR) or after them (aux data, or a stale byte past the record). Bytes
-    /// outside the buffer read as 0.
+    /// The quality of base `i`, clamped to the read's bases (samtools reads just outside its
+    /// qualities there); 0 for a read without bases.
     pub fn qual_at(&self, i: i32) -> i32 {
-        let idx = self.qual_off as i64 + i64::from(i);
+        if self.l_qseq <= 0 {
+            return 0;
+        }
 
-        usize::try_from(idx)
-            .ok()
-            .and_then(|idx| self.buf.get(idx))
-            .map_or(0, |&q| i32::from(q))
+        let i = i.clamp(0, self.l_qseq - 1) as usize;
+        i32::from(self.buf[self.qual_off + i])
     }
 
     /// The qualities, for in-place editing.
@@ -488,6 +486,7 @@ impl Pileup {
         p.cigar_op = -1;
         p.seq_offset = -1;
         p.first_del = false;
+        p.qual = 0;
         p.is_rev = p.flag & FREVERSE != 0;
 
         if handler.init(p)? {

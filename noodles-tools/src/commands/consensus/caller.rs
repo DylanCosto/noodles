@@ -130,6 +130,8 @@ fn ph_log(x: f64) -> f64 {
 /// arrays, zero padding), so that C's reads past the end of one table (qualities above 100)
 /// read the next table as they do in C.
 const PRIOR: usize = 0;
+/// The highest quality the tables cover.
+const MAX_QUAL: i32 = 100;
 const LPRIOR15: usize = 26;
 const PMM: usize = 42;
 const PXX: usize = 144;
@@ -266,18 +268,15 @@ impl ConsProbs {
         }
     }
 
-    /// `cp->table[q]`, reading past the table as C does; past the struct reads 0.
+    /// `cp->table[q]`, with qualities clamped to the tables' range (samtools reads past a
+    /// table, into the next one, for qualities above 100).
     fn at(&self, table: usize, q: i32) -> f64 {
-        usize::try_from(q)
-            .ok()
-            .and_then(|q| self.v.get(table + q))
-            .copied()
-            .unwrap_or(0.0)
+        self.v[table + q.clamp(0, MAX_QUAL) as usize]
     }
 
-    /// `cp->table[q]` for a quality that fits in a byte (always within the padded table).
+    /// `cp->table[q]` for a byte quality, clamped as in [`Self::at`].
     fn at_u8(&self, table: usize, q: u8) -> f64 {
-        self.v[table + usize::from(q)]
+        self.v[table + usize::from(q.min(MAX_QUAL as u8))]
     }
 
     fn lprior15(&self, j: usize) -> f64 {
@@ -289,9 +288,9 @@ impl ConsProbs {
     }
 }
 
-/// `q2p[q]`. C reads past the table for qualities above 100; that reads 0 here.
+/// `q2p[q]`, with qualities clamped to 100 (samtools reads past the table above it).
 fn q2p(q: u8) -> f64 {
-    Q2P.get(usize::from(q)).copied().unwrap_or(0.0)
+    Q2P[usize::from(q.min(MAX_QUAL as u8))]
 }
 
 /// The quality adjusted by the mapping quality, `(uint8_t)ph_log(P+.75*M-P*M)`, for a base
@@ -1142,8 +1141,9 @@ mod tests {
         let cp = ConsProbs::new(1e-3, 2e-4, 1.0, 0.01, &qcal, Mode::Recall);
         // The flat table's last entry is 0, so log(1 - 10^0) = -inf at quality 100.
         assert_eq!(cp.at(PMM, 100), f64::NEG_INFINITY);
-        // Past pMM is pxx.
-        assert_eq!(cp.at(PMM, 102), cp.at(PXX, 0));
-        assert_eq!(cp.at(PMMD, 101), 0.01);
+        // Qualities above the tables' range use quality 100.
+        assert_eq!(cp.at(PMM, 102), cp.at(PMM, 100));
+        assert_eq!(cp.at(PMMD, 101), cp.at(PMMD, 100));
+        assert_eq!(cp.at_u8(PXX, 250), cp.at(PXX, 100));
     }
 }

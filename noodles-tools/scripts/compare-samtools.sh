@@ -295,18 +295,34 @@ check "samples -h -i -T LB -f" "$st samples -h -i -T LB -f $ref rg.bam $short $c
 
 # consensus: every mode and -X preset, output formats, -a/-aa, insertions and deletions, regions,
 # and the threaded (-@) block layout, which samtools computes differently from the serial path
+# samtools' pileup output with -a repeats depth-0 lines after positions whose consensus is a
+# deletion (and gives such positions a depth-0 line); ntools fixes this, so with -a only covered
+# columns are compared with samtools, and -a output is checked to be the same with threads.
+covered="awk -F'\t' '\$4 != 0'"
+compare_consensus() {
+    local name=$1 opts=$2 input=$3
+    case "$opts" in
+        *pileup*-a*|*-a*pileup*)
+            check "$name" "$st consensus $opts $input 2>/dev/null | $covered" "$nt consensus $opts $input 2>/dev/null | $covered" ;;
+        *)
+            check "$name" "$st consensus $opts $input 2>/dev/null" "$nt consensus $opts $input 2>/dev/null" ;;
+    esac
+}
+
 for set in short long; do
     for opts in "" "-f fastq" "-f pileup" "-a -f fastq --show-del yes --show-ins no" "-A --mark-ins" \
         "-m simple" "-m simple -q -A -d 3 -c 0.6 -H 0.3" "-m bayesian_m -A" "-m bayesian_p" "-m bayesian_116" \
         "-X hiseq" "-X hifi -A" "-X r10.4_sup" "-X r10.4_dup -f fastq" "-X ultima" \
         "-p --no-adj-MQ --min-MQ 10 --min-BQ 5" "--no-use-MQ -C 20" "-t :hifi --P-het 1e-2 --het-scale 0.5" \
         "-@4" "-@4 -f pileup -a -Z 20000" "-@4 -f fastq --mark-ins -Z 777"; do
-        check "consensus $set $opts" "$st consensus $opts mp.$set.bam 2>/dev/null" "$nt consensus $opts mp.$set.bam 2>/dev/null"
+        compare_consensus "consensus $set $opts" "$opts" "mp.$set.bam"
     done
 done
+check "consensus -f pileup -aa: threads give the serial output" "$nt consensus -f pileup -aa mp.long.bam" "$nt consensus -@4 -Z 777 -f pileup -aa mp.long.bam"
+check "consensus -f pileup -aa: one line per column" "echo 0" "$nt consensus -f pileup -aa mp.long.bam | cut -f1-3 | sort | uniq -d | wc -l"
 check "consensus long -r -a -T" "$st consensus -r $long_name:20000-60000 -a -f fastq -T $long_ref --ref-qual 5 mp.long.bam" "$nt consensus -r $long_name:20000-60000 -a -f fastq -T $long_ref --ref-qual 5 mp.long.bam"
-check "consensus -r -a -f pileup" "$st consensus -r chrS:1000-60000 -a -f pileup mp.short.bam" "$nt consensus -r chrS:1000-60000 -a -f pileup mp.short.bam"
-check "consensus -aa -f pileup -T" "$st consensus -aa -f pileup -T $ref mp.short.bam" "$nt consensus -aa -f pileup -T $ref mp.short.bam"
+compare_consensus "consensus -r -a -f pileup" "-r chrS:1000-60000 -a -f pileup" mp.short.bam
+compare_consensus "consensus -aa -f pileup -T" "-aa -f pileup -T $ref" mp.short.bam
 printf "chrS\t5000\t9000\nchrS\t100\t2000\nchrS\t1500\t2500\n" > cons.bed
 check "consensus --regions-file" "$st consensus --regions-file cons.bed -a mp.short.bam" "$nt consensus --regions-file cons.bed -a mp.short.bam"
 check "consensus --regions-file -@2" "$st consensus -@2 -Z 700 --regions-file cons.bed -f pileup mp.short.bam" "$nt consensus -@2 -Z 700 --regions-file cons.bed -f pileup mp.short.bam"
@@ -327,7 +343,7 @@ check "consensus CRAM -r" "$st consensus -r chrS:1-300000 -f fastq $corpus/short
 } > cons.sam
 "$st" view -b -o cons.bam cons.sam && "$st" index cons.bam
 for opts in "" "-f pileup" "-aa -f fastq --show-del yes" "-aa -f pileup" "-A --mark-ins -d 1 -C 0" "-m simple -A" "-m simple -q --show-del yes -f pileup" "--no-use-MQ -A" "-@2 -aa -Z 7 -f fastq"; do
-    check "consensus synthetic $opts" "$st consensus $opts cons.bam 2>/dev/null" "$nt consensus $opts cons.bam 2>/dev/null"
+    compare_consensus "consensus synthetic $opts" "$opts" cons.bam
 done
 
 # calmd

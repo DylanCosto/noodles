@@ -47,7 +47,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `head` | `head` | `-h` (header lines), `-n` (records) |
 | `flags` | `flags` | numbers and flag names, both ways |
 | `samples` | `samples` | `-h`, `-i`, `-T`, `-f/-F` (matching references), `-X`, `-o`, paths from stdin |
-| `consensus` | `consensus` | FASTA/FASTQ/pileup; `simple` and Bayesian modes (`bayesian`, `_r`, `_p`, `_m`, `_116`), `-X` presets and `-t` calibration files, `-a/-aa`, `--show-ins/--show-del/--mark-ins`, `-A`, `-r`, `--regions-file`, `-T`, every tuning option; `-@` on an indexed input computes `-Z` blocks in parallel, as samtools does |
+| `consensus` | `consensus` | FASTA/FASTQ/pileup; `simple` and Bayesian modes (`bayesian`, `_r`, `_p`, `_m`, `_116`), `-X` presets and `-t` calibration files, `-a/-aa`, `--show-ins/--show-del/--mark-ins`, `-A`, `-r`, `--regions-file`, `-T`, every tuning option; `-@` on an indexed input computes `-Z` blocks in parallel, with the same output as without threads |
 
 CRAM input without `--reference` uses the FASTA file named by the `@SQ` `UR` fields when it exists
 locally with a `.fai` index, as HTSlib does.
@@ -108,15 +108,14 @@ Intentional differences:
   `regex` syntax rather than POSIX extended regular expressions (the same for ordinary
   patterns). Without `-S`, `--move-umi-to-tag` moves the UMI of every read; samtools 1.24 moves
   only those of reads still buffered at the end of the input.
-- `consensus` follows samtools where it reads past a record: a read padded or deleted after its
-  last stored base (e.g. a mapped `SEQ *` read, kept by `-m simple` or `--no-use-MQ`) takes a
-  quality from the bytes after the record, which in samtools can be uninitialized memory. ntools
-  reads the stale bytes of earlier records there, as a reused `bam1_t` holds them, so those
-  columns may differ. Base qualities above 100 read past samtools' probability tables; ntools
-  reads the following tables within the same struct and 0 beyond it. With `-@` and a `-T` FASTA
-  that lacks a needed sequence, samtools silently writes truncated or garbage sequence; ntools
-  stops with an error. As in samtools, `-@` with pileup output on an unindexed input drops the
-  pileup lines.
+- `consensus` fixes samtools bugs instead of reproducing them. Pileup output with `-a` lists each
+  column once; samtools repeats growing runs of depth-0 lines after positions whose consensus is
+  a deletion (and prints such positions as depth 0). `-@` gives the serial output, and on an
+  unindexed input writes pileup lines, which samtools drops. A read's qualities never come from
+  other reads (samtools takes a deleted or padded position's quality from stale bytes of earlier
+  records), and qualities above 100 use the tables' quality-100 values instead of reading past
+  them. With `-@` and a `-T` FASTA that lacks a needed sequence, ntools stops with an error where
+  samtools writes truncated or garbage sequence.
 
 ## Performance
 
