@@ -1,5 +1,6 @@
 //! CRAM record.
 
+mod bam_record;
 mod cigar;
 pub(crate) mod data;
 pub(crate) mod feature;

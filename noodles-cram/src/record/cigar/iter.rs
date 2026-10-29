@@ -5,7 +5,7 @@ use noodles_sam::alignment::record::cigar::{Op, op::Kind};
 
 use crate::record::Feature;
 
-pub(super) struct Iter<'r, 'c: 'r> {
+pub(in crate::record) struct Iter<'r, 'c: 'r> {
     features: slice::Iter<'r, Feature<'c>>,
     read_length: usize,
     read_position: Position,
@@ -13,7 +13,7 @@ pub(super) struct Iter<'r, 'c: 'r> {
 }
 
 impl<'r, 'c: 'r> Iter<'r, 'c> {
-    pub(super) fn new(features: &'r [Feature<'c>], read_length: usize) -> Self {
+    pub(in crate::record) fn new(features: &'r [Feature<'c>], read_length: usize) -> Self {
         Self {
             features: features.iter(),
             read_length,

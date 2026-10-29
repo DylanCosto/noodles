@@ -15,6 +15,22 @@ pub enum Array<'c> {
     Float(Values<'c, f32>),
 }
 
+impl Array<'_> {
+    /// Returns the BAM encoding of the array (subtype, count, and values), if its source is
+    /// well-formed.
+    pub(crate) fn as_bam_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Int8(values) => values.as_bam_bytes(),
+            Self::UInt8(values) => values.as_bam_bytes(),
+            Self::Int16(values) => values.as_bam_bytes(),
+            Self::UInt16(values) => values.as_bam_bytes(),
+            Self::Int32(values) => values.as_bam_bytes(),
+            Self::UInt32(values) => values.as_bam_bytes(),
+            Self::Float(values) => values.as_bam_bytes(),
+        }
+    }
+}
+
 impl<'c> From<&'c Array<'c>> for sam::alignment::record::data::field::value::Array<'c> {
     fn from(array: &'c Array<'c>) -> Self {
         match array {

@@ -17,6 +17,13 @@ impl<'c, N> Values<'c, N> {
             _marker: PhantomData,
         }
     }
+
+    /// Returns the BAM encoding of the array (subtype, count, and values), if the values fill
+    /// the source exactly.
+    pub(crate) fn as_bam_bytes(&self) -> Option<&[u8]> {
+        let values_len = self.len.checked_mul(size_of::<N>())?;
+        (self.src.len() == OFFSET.checked_add(values_len)?).then_some(&self.src[..])
+    }
 }
 
 const OFFSET: usize = 5;

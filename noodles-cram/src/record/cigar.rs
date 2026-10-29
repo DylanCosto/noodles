@@ -1,4 +1,4 @@
-mod iter;
+pub(super) mod iter;
 
 use std::io;
 

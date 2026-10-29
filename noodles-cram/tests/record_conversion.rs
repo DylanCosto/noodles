@@ -2,6 +2,7 @@
 
 use std::{error::Error, io};
 
+use noodles_bam as bam;
 use noodles_core::Position;
 use noodles_cram as cram;
 use noodles_fasta as fasta;
@@ -42,6 +43,7 @@ fn test_records_match_generic_conversion() -> Result<(), Box<dyn Error>> {
     reader.read_header()?;
     let mut container = cram::io::reader::Container::default();
     let mut sequence = Vec::new();
+    let mut bam_record = Vec::new();
 
     while reader.read_container(&mut container)? != 0 {
         let compression_header = container.compression_header()?;
@@ -66,6 +68,11 @@ fn test_records_match_generic_conversion() -> Result<(), Box<dyn Error>> {
                 let view = record.with_sequence(&mut sequence);
                 let mut writer = sam::io::Writer::new(&mut sam_via_view);
                 writer.write_alignment_record(&header, &view)?;
+
+                let mut generic_bam = bam::io::Writer::from(Vec::new());
+                generic_bam.write_alignment_record(&header, &view)?;
+                record.encode_bam_record(&header, &mut bam_record)?;
+                assert_eq!(bam_record, generic_bam.get_ref()[size_of::<u32>()..]);
             }
         }
     }
@@ -79,7 +86,7 @@ fn test_records_match_generic_conversion() -> Result<(), Box<dyn Error>> {
 
 /// Records exercising every kind of read feature: substitutions (including against lowercase
 /// reference bases), insertions, deletions, skips, soft clips, missing sequences, and unmapped
-/// reads.
+/// reads, with integer, string, array, and read group data fields.
 fn records(reference: &[u8]) -> Vec<RecordBuf> {
     use Kind::{Deletion, Insertion, Match, Skip, SoftClip};
 
@@ -126,6 +133,8 @@ fn records(reference: &[u8]) -> Vec<RecordBuf> {
                     .set_data(
                         [
                             (Tag::from(*b"XI"), Value::from(7)),
+                            (Tag::from(*b"XZ"), Value::from("a b~")),
+                            (Tag::READ_GROUP, Value::from("rg0")),
                             (
                                 Tag::from(*b"XB"),
                                 Value::Array(Array::UInt8(vec![1, 2, 255])),
@@ -189,7 +198,7 @@ fn reference_sequence(len: usize) -> Vec<u8> {
 }
 
 fn header() -> sam::Header {
-    format!("@SQ\tSN:sq0\tLN:{REFERENCE_LEN}\n")
+    format!("@SQ\tSN:sq0\tLN:{REFERENCE_LEN}\n@RG\tID:rg0\n")
         .parse()
         .expect("valid header")
 }
