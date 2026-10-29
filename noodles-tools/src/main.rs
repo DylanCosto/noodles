@@ -64,6 +64,8 @@ enum Command {
     Split(commands::split::Args),
     /// Group records by read name.
     Collate(commands::collate::Args),
+    /// Fill in mate information from name-grouped alignments.
+    Fixmate(commands::fixmate::Args),
 }
 
 fn main() -> ExitCode {
@@ -88,6 +90,7 @@ fn main() -> ExitCode {
         Command::Coverage(args) => commands::coverage::run(args).map(|()| ExitCode::SUCCESS),
         Command::Split(args) => commands::split::run(args).map(|()| ExitCode::SUCCESS),
         Command::Collate(args) => commands::collate::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Fixmate(args) => commands::fixmate::run(args).map(|()| ExitCode::SUCCESS),
     };
 
     match result {

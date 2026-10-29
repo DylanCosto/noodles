@@ -6,6 +6,7 @@ pub mod coverage;
 pub mod depth;
 pub mod faidx;
 pub mod fastq;
+pub mod fixmate;
 pub mod flagstat;
 pub mod idxstats;
 pub mod index;

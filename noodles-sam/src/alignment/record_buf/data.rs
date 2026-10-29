@@ -264,6 +264,37 @@ impl Data {
         self.swap_remove(tag)
     }
 
+    /// Removes the field with the given tag, keeping the order of the remaining fields.
+    ///
+    /// Unlike [`Self::remove`], which moves the last field into the removed field's place, this
+    /// shifts every following field, so it takes time linear in the number of fields.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use noodles_sam::alignment::{
+    ///     record::data::field::Tag,
+    ///     record_buf::{data::field::Value, Data},
+    /// };
+    ///
+    /// let nh = (Tag::ALIGNMENT_HIT_COUNT, Value::from(1));
+    /// let md = (Tag::MISMATCHED_POSITIONS, Value::from("10"));
+    /// let rg = (Tag::READ_GROUP, Value::from("rg0"));
+    ///
+    /// let mut data: Data = [nh.clone(), md, rg.clone()].into_iter().collect();
+    /// data.shift_remove(&Tag::MISMATCHED_POSITIONS);
+    ///
+    /// let expected: Data = [nh, rg].into_iter().collect();
+    /// assert_eq!(data, expected);
+    /// assert!(data.keys().eq([Tag::ALIGNMENT_HIT_COUNT, Tag::READ_GROUP]));
+    /// ```
+    pub fn shift_remove<K>(&mut self, tag: &K) -> Option<(Tag, Value)>
+    where
+        K: indexmap::Equivalent<Tag>,
+    {
+        self.get_index_of(tag).map(|i| self.0.remove(i))
+    }
+
     fn swap_remove<K>(&mut self, tag: &K) -> Option<(Tag, Value)>
     where
         K: indexmap::Equivalent<Tag>,
