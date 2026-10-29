@@ -257,6 +257,17 @@ check "view CRAM without MD/NM" "$st view -T $ref mp.short.nomd.cram" "$nt view 
 check "view long CRAM with dropped MD/NM" "$st view -T $long_ref mp.long.cram" "$nt view -T $long_ref mp.long.cram"
 check "consensus CRAM with dropped MD/NM" "$st consensus mp.short.cram" "$nt consensus mp.short.cram"
 
+# import: FASTQ written by samtools fastq (with MM/ML tags, paired files, interleaved names)
+"$st" fastq -T MM,ML mp.long.bam > imp.long.fq 2>/dev/null
+"$st" collate -u -O mp.short.bam 2>/dev/null | "$st" fastq -1 imp.R1.fq -2 imp.R2.fq -s imp.S.fq -0 /dev/null - 2>/dev/null
+"$st" collate -u -O mp.short.bam 2>/dev/null | "$st" fastq -N - > imp.inter.fq 2>/dev/null
+printf '@M:7:FC:1:1101:10:20:ACGT 1:Y:0:GGTT\tXA:i:5\nACGTN\n+\nIII#I\n@M:7:FC:1:1101:11:21:A+G 2:N:18:NN\nAC\n+\nII\n' > imp.casava.fq
+check "import -T * (long, MM/ML)" "$st import --no-PG -T '*' imp.long.fq" "$nt import --no-PG -T '*' imp.long.fq"
+check "import -1 -2 -s -r --order" "$st import --no-PG -1 imp.R1.fq -2 imp.R2.fq -s imp.S.fq -r ID:a -r SM:b --order XO:5" "$nt import --no-PG -1 imp.R1.fq -2 imp.R2.fq -s imp.S.fq -r ID:a -r SM:b --order XO:5"
+check "import interleaved -O bam" "$st import --no-PG -O bam imp.inter.fq | $st view -h -" "$nt import --no-PG -O bam imp.inter.fq | $st view -h -"
+check "import --i1 -1 -2 -b" "$st import --no-PG --i1 imp.R2.fq -1 imp.R1.fq -2 imp.R2.fq -b" "$nt import --no-PG --i1 imp.R2.fq -1 imp.R1.fq -2 imp.R2.fq -b"
+check "import -i -U -T *" "$st import --no-PG -i -U -T '*' imp.casava.fq" "$nt import --no-PG -i -U -T '*' imp.casava.fq"
+
 # head, flags, samples
 check "head" "$st head $tagged" "$nt head $tagged"
 check "head -n 5 -h 2" "$st head -n 5 -h 2 $long" "$nt head -n 5 -h 2 $long"

@@ -86,6 +86,8 @@ enum Command {
     Ampliconclip(commands::ampliconclip::Args),
     /// Print the header and first records as SAM.
     Head(commands::head::Args),
+    /// Convert FASTQ or FASTA to unaligned SAM/BAM/CRAM.
+    Import(commands::import::Args),
     /// Convert between numeric and textual flags.
     Flags(commands::flags::Args),
     /// List the samples (read group SM values) of alignment files.
@@ -130,6 +132,7 @@ fn main() -> ExitCode {
         Command::Ampliconclip(args) => {
             commands::ampliconclip::run(args).map(|()| ExitCode::SUCCESS)
         }
+        Command::Import(args) => commands::import::run(args).map(|()| ExitCode::SUCCESS),
         Command::Head(args) => commands::head::run(args).map(|()| ExitCode::SUCCESS),
         Command::Flags(args) => commands::flags::run(args),
         Command::Samples(args) => commands::samples::run(args),

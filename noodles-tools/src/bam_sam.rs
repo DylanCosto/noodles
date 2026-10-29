@@ -295,6 +295,13 @@ fn write_data(dst: &mut Vec<u8>, mut src: &[u8]) -> Option<()> {
                 write_f32(dst, n)?;
                 4
             }
+            // HTSlib's non-standard double, printed with `%g`.
+            b'd' => {
+                let n = f64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
+                dst.extend_from_slice(b"d:");
+                dst.extend_from_slice(crate::depth::format_g(n, 6).as_bytes());
+                8
+            }
             b'Z' | b'H' => {
                 let len = memchr::memchr(0, rest)?;
                 let s = &rest[..len];

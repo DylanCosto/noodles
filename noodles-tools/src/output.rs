@@ -131,6 +131,39 @@ impl AlignmentWriter {
         }
     }
 
+    /// Writes a header as the given SAM text, keeping its line order, as HTSlib writes a header it
+    /// built or read. `header` must be `text` parsed; CRAM output writes that instead.
+    pub fn write_header_text(&mut self, header: &sam::Header, text: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Sam { writer, .. } => writer.get_mut().write_all(text),
+            Self::ParallelSam { writer, .. } => writer.write_text(text.to_vec()),
+            Self::Bam(w) => {
+                let dst = w.get_mut();
+                let len = |n: usize| {
+                    u32::try_from(n)
+                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "header too long"))
+                };
+
+                dst.write_all(b"BAM\x01")?;
+                dst.write_all(&len(text.len())?.to_le_bytes())?;
+                dst.write_all(text)?;
+
+                let reference_sequences = header.reference_sequences();
+                dst.write_all(&len(reference_sequences.len())?.to_le_bytes())?;
+
+                for (name, reference_sequence) in reference_sequences {
+                    dst.write_all(&len(name.len() + 1)?.to_le_bytes())?;
+                    dst.write_all(name)?;
+                    dst.write_all(&[0])?;
+                    dst.write_all(&len(reference_sequence.length().get())?.to_le_bytes())?;
+                }
+
+                Ok(())
+            }
+            Self::Cram(w) => w.write_header(header),
+        }
+    }
+
     /// Writes a record. BAM records going to BAM output are forwarded without re-encoding, so
     /// `header` must have the same reference sequences as the header the record was read with.
     pub fn write(&mut self, header: &sam::Header, record: &Rec<'_>) -> io::Result<()> {

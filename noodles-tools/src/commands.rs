@@ -17,6 +17,7 @@ pub mod flags;
 pub mod flagstat;
 pub mod head;
 pub mod idxstats;
+pub mod import;
 pub mod index;
 pub mod markdup;
 pub mod merge;

@@ -50,6 +50,8 @@ fn next_field(src: &[u8]) -> io::Result<([u8; 2], usize)> {
         b'A' | b'c' | b'C' => 1,
         b's' | b'S' => 2,
         b'i' | b'I' | b'f' => 4,
+        // HTSlib's non-standard double.
+        b'd' => 8,
         b'Z' | b'H' => memchr::memchr(0, rest).ok_or_else(truncated)? + 1,
         b'B' => {
             let &[subtype, n0, n1, n2, n3, ..] = rest else {
