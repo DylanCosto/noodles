@@ -199,6 +199,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .collect();
 
     let mut template: Vec<RecordBuf> = Vec::new();
+    let mut framed = Vec::new();
 
     let flush =
         |template: &mut Vec<RecordBuf>, writer: &mut AlignmentWriter| -> anyhow::Result<()> {
@@ -219,7 +220,17 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         };
 
     reader.for_each(&header.clone(), |record| {
-        let mut record = RecordBuf::try_from_alignment_record(&header, record.as_dyn())?;
+        let mut record = match &record {
+            // The BAM decoder builds record buffers much faster than the generic conversion.
+            crate::alignment::Rec::Bam(r) => {
+                framed.clear();
+                crate::runs::write_raw_record(&mut framed, r.as_ref())?;
+                let mut buf = RecordBuf::default();
+                noodles_bam::io::Reader::from(&framed[..]).read_record_buf(&header, &mut buf)?;
+                buf
+            }
+            _ => RecordBuf::try_from_alignment_record(&header, record.as_dyn())?,
+        };
         sanitize_record(&mut record, &lengths, sanitize)?;
 
         if template
