@@ -740,7 +740,7 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        write_array_field(&mut buf, &mut &src[..], [b'Z', b'Z'])?;
+        write_array_field(&mut buf, &mut &src[..], *b"ZZ")?;
 
         let mut expected = b"\tZZ:B:I".to_vec();
         for n in &values {
