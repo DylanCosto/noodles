@@ -48,6 +48,8 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `flags` | `flags` | numbers and flag names, both ways |
 | `samples` | `samples` | `-h`, `-i`, `-T`, `-f/-F` (matching references), `-X`, `-o`, paths from stdin |
 | `consensus` | `consensus` | FASTA/FASTQ/pileup; `simple` and Bayesian modes (`bayesian`, `_r`, `_p`, `_m`, `_116`), `-X` presets and `-t` calibration files, `-a/-aa`, `--show-ins/--show-del/--mark-ins`, `-A`, `-r`, `--regions-file`, `-T`, every tuning option; `-@` on an indexed input computes `-Z` blocks in parallel, with the same output as without threads |
+| `cram-size` | `cram-size` | sizes by content ID and expanded compression method (gzip level, rANS order and transforms, ...), with the data series using each block; `-v`, `-e` (encodings), `-o` |
+| `reference` | `reference` | from `MD` tags (any input) or embedded CRAM references (`-e`); `-r` (indexed), `-q`, `-o` |
 
 CRAM input without `--reference` uses the FASTA file named by the `@SQ` `UR` fields when it exists
 locally with a `.fai` index, as HTSlib does.
@@ -120,6 +122,11 @@ Intentional differences:
   records), and qualities above 100 use the tables' quality-100 values instead of reading past
   them. With `-@` and a `-T` FASTA that lacks a needed sequence, ntools stops with an error where
   samtools writes truncated or garbage sequence.
+- `reference` advances the reference position over `N` (reference skip) CIGAR operations;
+  samtools does not, so it writes the bases after a splice at the wrong positions (76 wrong
+  bases on the tagged corpus, against none for ntools). A region with no data is labelled with
+  its range (`>chr:1-100`), as one with data is; samtools labels it as the whole sequence. An
+  `MD` tag that runs past the CIGAR is reported as an error; samtools fails without a message.
 
 ## Performance
 
@@ -197,6 +204,9 @@ ntools relies on these changes to the noodles crates, which downstream tools get
 - CRAM: a missing reference sequence is an error rather than a panic, and
   `Reader::set_reference_sequence_repository` lets a reference be chosen after reading the
   header.
+- CRAM: `io::reader::read_block`, `Block`, and `Container::src` expose a container's raw blocks
+  (method as stored, content type and ID, sizes, compressed bytes) for block-level tools such
+  as `cram-size`.
 - New crate `noodles-pileup`: HTSlib-compatible pileup (`bam_plp`), BAQ, mapping quality capping,
   MD/NM calculation, and MM/ML base modifications over encoded BAM records, which `mpileup` and
   `calmd` use.

@@ -377,5 +377,27 @@ check "calmd -r -n 1 -d -q -C 50" "$st calmd --no-PG -r -n 1 -d -q -C 50 mp.shor
 check "calmd long -e -r -A" "$st calmd --no-PG -e -r -A mp.long.bam $long_ref 2>/dev/null" "$nt calmd --no-PG -e -r -A mp.long.bam $long_ref 2>/dev/null"
 check "calmd CRAM -u" "$st calmd --no-PG -u $corpus/short/input.3.1.cram $ref 2>/dev/null | $st view -h -" "$nt calmd --no-PG -u $corpus/short/input.3.1.cram $ref 2>/dev/null | $st view -h -"
 
+# cram-size
+for set in short tagged long; do
+    for c in 3.0 3.1 3.1.multislice 3.1.noref; do
+        cram=$corpus/$set/input.$c.cram
+        check "cram-size $set $c" "$st cram-size $cram" "$nt cram-size $cram"
+        check "cram-size $set $c -v -e" "$st cram-size -v -e $cram" "$nt cram-size -v -e $cram"
+    done
+done
+"$st" view -T "$ref" -O cram,embed_ref=1,version=3.1,archive -o embed.cram "$tagged" 2>/dev/null && "$st" index embed.cram
+check "cram-size embedded reference, archive codecs" "$st cram-size -v -e embed.cram" "$nt cram-size -v -e embed.cram"
+
+# reference
+check "reference short" "$st reference -q $short" "$nt reference -q $short"
+check "reference long" "$st reference -q $long" "$nt reference -q $long"
+check "reference CRAM" "$st reference -q $corpus/short/input.3.1.cram" "$nt reference -q $corpus/short/input.3.1.cram"
+check "reference -r" "$st reference -q -r chrS:1000000-1003000 $short" "$nt reference -q -r chrS:1000000-1003000 $short"
+check "reference -e" "$st reference -q -e embed.cram" "$nt reference -q -e embed.cram"
+check "reference -e -r" "$st reference -q -e -r chrS:1000000-1003000 embed.cram" "$nt reference -q -e -r chrS:1000000-1003000 embed.cram"
+# samtools misplaces bases after N CIGAR operations; ntools must agree with the true reference.
+check "reference tagged (spliced reads) matches the reference" "echo 0" \
+    "cmp -l <($nt reference -q $tagged | grep -v '>' | tr -d '\\n') <($st faidx $ref chrS | grep -v '>' | tr -d '\\n') | awk '\$2 != 116' | wc -l"
+
 echo "$failures difference(s)"
 [ "$failures" -eq 0 ]

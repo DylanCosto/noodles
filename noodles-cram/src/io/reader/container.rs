@@ -1,4 +1,4 @@
-pub(crate) mod block;
+pub mod block;
 pub mod compression_header;
 pub mod header;
 pub mod slice;
@@ -9,7 +9,12 @@ use std::{
 };
 
 use self::{block::read_block_as, header::read_header};
-pub use self::{compression_header::read_compression_header, slice::Slice, slice::read_slice};
+pub use self::{
+    block::{Block, read_block},
+    compression_header::read_compression_header,
+    slice::Slice,
+    slice::read_slice,
+};
 use crate::container::{CompressionHeader, Header};
 
 /// A CRAM container.
@@ -23,6 +28,14 @@ impl Container {
     /// Returns the header.
     pub fn header(&self) -> &Header {
         &self.header
+    }
+
+    /// Returns the raw container data that follows the header.
+    ///
+    /// This is the compression header block followed by the slices. The header landmarks are
+    /// offsets of the slices into this data.
+    pub fn src(&self) -> &[u8] {
+        &self.src
     }
 
     /// Returns the compression header.

@@ -6,6 +6,7 @@ mod bam_raw;
 mod bam_sam;
 mod bgzf_stream;
 mod commands;
+mod cram_raw;
 mod depth;
 mod filter;
 mod flags;
@@ -98,6 +99,11 @@ enum Command {
     Checksum(commands::checksum::Args),
     /// Convert between numeric and textual flags.
     Flags(commands::flags::Args),
+    /// Report CRAM block sizes by content ID and data series.
+    #[command(alias = "cram_size")]
+    CramSize(commands::cram_size::Args),
+    /// Rebuild a reference from MD tags or embedded CRAM references.
+    Reference(commands::reference::Args),
     /// List the samples (read group SM values) of alignment files.
     Samples(commands::samples::Args),
     /// Generate a consensus sequence from aligned reads.
@@ -146,6 +152,8 @@ fn main() -> ExitCode {
         Command::Import(args) => commands::import::run(args).map(|()| ExitCode::SUCCESS),
         Command::Head(args) => commands::head::run(args).map(|()| ExitCode::SUCCESS),
         Command::Flags(args) => commands::flags::run(args),
+        Command::CramSize(args) => commands::cram_size::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Reference(args) => commands::reference::run(args).map(|()| ExitCode::SUCCESS),
         Command::Samples(args) => commands::samples::run(args),
         Command::Consensus(args) => commands::consensus::run(args),
     };

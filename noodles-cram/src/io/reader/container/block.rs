@@ -11,18 +11,35 @@ use crate::{
     io::reader::num::{read_itf8, read_itf8_as, read_u32_le},
 };
 
+/// A CRAM container block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Block<'c> {
+    /// The compression method, as stored in the block.
     pub compression_method: CompressionMethod,
+    /// The content type.
     pub content_type: ContentType,
+    /// The content ID.
     pub content_id: ContentId,
+    /// The uncompressed size.
     pub uncompressed_size: usize,
+    /// The compressed data.
     pub src: &'c [u8],
 }
 
 impl<'c> Block<'c> {
+    /// Decompresses the block data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data fails to decompress.
     pub fn decode(&self) -> io::Result<Cow<'c, [u8]>> {
         use crate::codecs::{aac, bzip2, fqzcomp, gzip, lzma, name_tokenizer, rans_4x8, rans_nx16};
+
+        // § 8 "Block structure" (2024-09-04): "Blocks with a raw (uncompressed) size of zero are
+        // treated as empty, irrespective of their `method` byte."
+        if self.uncompressed_size == 0 {
+            return Ok(Cow::from(&[][..]));
+        }
 
         match self.compression_method {
             CompressionMethod::None => Ok(Cow::from(self.src)),
@@ -54,10 +71,15 @@ impl<'c> Block<'c> {
     }
 }
 
-fn read_block<'c>(src: &mut &'c [u8]) -> io::Result<Block<'c>> {
+/// Reads a block, verifying its CRC32.
+///
+/// # Errors
+///
+/// Returns an error if the block is truncated, malformed, or fails its checksum.
+pub fn read_block<'c>(src: &mut &'c [u8]) -> io::Result<Block<'c>> {
     let original_src = *src;
 
-    let mut compression_method = read_compression_method(src)?;
+    let compression_method = read_compression_method(src)?;
 
     let content_type = read_content_type(src)?;
     let content_id = read_itf8(src)?;
@@ -83,12 +105,6 @@ fn read_block<'c>(src: &mut &'c [u8]) -> io::Result<Block<'c>> {
         ));
     }
 
-    // § 8 "Block structure" (2024-09-04): "Blocks with a raw (uncompressed) size of zero are
-    // treated as empty, irrespective of their `method` byte."
-    if uncompressed_size == 0 {
-        compression_method = CompressionMethod::None;
-    }
-
     Ok(Block {
         compression_method,
         content_type,
@@ -98,7 +114,10 @@ fn read_block<'c>(src: &mut &'c [u8]) -> io::Result<Block<'c>> {
     })
 }
 
-pub fn read_block_as<'c>(src: &mut &'c [u8], content_type: ContentType) -> io::Result<Block<'c>> {
+pub(crate) fn read_block_as<'c>(
+    src: &mut &'c [u8],
+    content_type: ContentType,
+) -> io::Result<Block<'c>> {
     let block = read_block(src)?;
     validate_content_type(block.content_type, content_type)?;
     Ok(block)
@@ -167,7 +186,7 @@ mod tests {
         let actual = read_block(&mut &src[..])?;
 
         let expected = Block {
-            compression_method: CompressionMethod::None,
+            compression_method: CompressionMethod::Rans4x8,
             content_type: ContentType::ExternalData,
             content_id: ContentId::from(1),
             uncompressed_size: 0,
@@ -175,6 +194,7 @@ mod tests {
         };
 
         assert_eq!(actual, expected);
+        assert!(actual.decode()?.is_empty());
 
         Ok(())
     }
