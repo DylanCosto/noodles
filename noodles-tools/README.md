@@ -89,32 +89,33 @@ libdeflate. "short" is 1M synthetic 150 bp paired reads, "tagged" 250k reads wit
 
 | Operation | samtools (s) | ntools (s) | Speedup |
 |---|---:|---:|---:|
-| view BAM->SAM, short | 0.379 | 0.432 | 0.88x |
-| view BAM->SAM, long | 2.130 | 1.848 | 1.15x |
-| view BAM->SAM, long, -@4 | 0.571 | 0.350 | 1.63x |
-| view BAM->SAM, long, -@8 | 0.301 | 0.236 | 1.28x |
-| view CRAM->SAM, short | 0.883 | 1.619 | 0.55x |
-| view CRAM->SAM, long | 2.889 | 3.520 | 0.82x |
-| view CRAM->SAM, long, -@8 | 0.569 | 0.472 | 1.21x |
-| view CRAM->BAM, long, -@8 | 2.128 | 1.421 | 1.50x |
-| view BAM->BAM, long, -@4 | 3.372 | 2.416 | 1.40x |
-| view -c -q 30, short | 0.144 | 0.148 | 0.97x |
-| flagstat, long, -@4 | 0.332 | 0.339 | 0.98x |
-| index, long, -@4 | 0.333 | 0.340 | 0.98x |
-| sort, short, -@4 | 0.992 | 0.588 | 1.69x |
-| sort -n, short, -@4 | 1.086 | 0.581 | 1.87x |
-| collate -Ou, short, -@4 | 2.089 | 0.381 | 5.48x |
-| fixmate -m, short | 3.416 | 3.350 | 1.02x |
-| fixmate -m, short, -@4 | 0.886 | 0.457 | 1.94x |
-| markdup, short | 3.818 | 2.400 | 1.59x |
-| markdup, short, -@4 | 0.912 | 0.699 | 1.30x |
-| fastq, short | 0.606 | 0.699 | 0.87x |
-| depth, short | 0.284 | 0.318 | 0.89x |
-| coverage, short | 1.138 | 0.407 | 2.80x |
+| view BAM->SAM, short | 0.381 | 0.346 | 1.10x |
+| view BAM->SAM, long | 2.129 | 1.699 | 1.25x |
+| view BAM->SAM, long, -@4 | 0.568 | 0.347 | 1.64x |
+| view BAM->SAM, long, -@8 | 0.300 | 0.234 | 1.28x |
+| view CRAM->SAM, short | 0.880 | 1.513 | 0.58x |
+| view CRAM->SAM, long | 2.891 | 3.361 | 0.86x |
+| view CRAM->SAM, long, -@8 | 0.570 | 0.453 | 1.26x |
+| view CRAM->BAM, long, -@8 | 2.132 | 1.441 | 1.48x |
+| view BAM->BAM, long, -@4 | 3.372 | 2.357 | 1.43x |
+| view -c -q 30, short | 0.144 | 0.150 | 0.96x |
+| flagstat, long, -@4 | 0.330 | 0.340 | 0.97x |
+| index, long, -@4 | 0.333 | 0.341 | 0.98x |
+| sort, short, -@4 | 0.994 | 0.579 | 1.72x |
+| sort -n, short, -@4 | 1.063 | 0.574 | 1.85x |
+| collate -Ou, short, -@4 | 2.107 | 0.382 | 5.52x |
+| fixmate -m, short | 3.409 | 3.340 | 1.02x |
+| fixmate -m, short, -@4 | 0.891 | 0.457 | 1.95x |
+| markdup, short | 3.812 | 2.408 | 1.58x |
+| markdup, short, -@4 | 0.912 | 0.700 | 1.30x |
+| fastq, short | 0.606 | 0.626 | 0.97x |
+| depth, short | 0.283 | 0.319 | 0.89x |
+| coverage, short | 1.134 | 0.403 | 2.81x |
 | faidx 1024 regions | 0.018 | 0.020 | 0.90x |
 
-Where ntools is slower, it is single-threaded: per-thread CRAM decoding (rANS) and short-read
-formatting still trail HTSlib. With threads, ntools parallelizes more of the work than samtools
+Where ntools is slower, it is single-threaded: per-thread CRAM decoding still trails HTSlib,
+whose rANS decoder uses SIMD. Rows near 1.0x (flagstat, index, counting) are bound by BGZF
+decompression, which both tools do with libdeflate. With threads, ntools parallelizes more of the work than samtools
 does, so the gap reverses.
 
 ## Library changes in this fork

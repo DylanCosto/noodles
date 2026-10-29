@@ -133,5 +133,11 @@ for f in multi_0.bam multi_1.bam u.bam; do
     check "split $f" "$st view --no-PG -h split-s/$f" "$st view --no-PG -h split-n/$f"
 done
 
+# dict, bedcov, addreplacerg
+check "dict" "$st dict -a A -s S -u U frag.fa" "$nt dict -a A -s S -u U frag.fa"
+check "bedcov -c -d 5" "$st bedcov -c -d 5 q.bed $short" "$nt bedcov -c -d 5 q.bed $short"
+check "bedcov long -j" "$st bedcov -j $(head -30 "$corpus/long/queries.100.bed" > lq.bed; echo lq.bed) $long" "$nt bedcov -j lq.bed $long"
+check "addreplacerg records" "$st addreplacerg --no-PG -r 'ID:z\tSM:z' multi.bam | grep -v '^@'" "$nt addreplacerg --no-PG -r 'ID:z\tSM:z' multi.bam | grep -v '^@'"
+
 echo "$failures difference(s)"
 [ "$failures" -eq 0 ]
