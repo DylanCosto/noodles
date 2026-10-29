@@ -10,6 +10,7 @@ pub mod fixmate;
 pub mod flagstat;
 pub mod idxstats;
 pub mod index;
+pub mod markdup;
 pub mod merge;
 pub mod quickcheck;
 pub mod reheader;

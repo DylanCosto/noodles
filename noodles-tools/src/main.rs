@@ -66,6 +66,8 @@ enum Command {
     Collate(commands::collate::Args),
     /// Fill in mate information from name-grouped alignments.
     Fixmate(commands::fixmate::Args),
+    /// Mark duplicate alignments.
+    Markdup(commands::markdup::Args),
 }
 
 fn main() -> ExitCode {
@@ -91,6 +93,7 @@ fn main() -> ExitCode {
         Command::Split(args) => commands::split::run(args).map(|()| ExitCode::SUCCESS),
         Command::Collate(args) => commands::collate::run(args).map(|()| ExitCode::SUCCESS),
         Command::Fixmate(args) => commands::fixmate::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Markdup(args) => commands::markdup::run(args).map(|()| ExitCode::SUCCESS),
     };
 
     match result {
