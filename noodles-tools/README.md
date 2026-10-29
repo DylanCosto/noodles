@@ -50,6 +50,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `consensus` | `consensus` | FASTA/FASTQ/pileup; `simple` and Bayesian modes (`bayesian`, `_r`, `_p`, `_m`, `_116`), `-X` presets and `-t` calibration files, `-a/-aa`, `--show-ins/--show-del/--mark-ins`, `-A`, `-r`, `--regions-file`, `-T`, every tuning option; `-@` on an indexed input computes `-Z` blocks in parallel, with the same output as without threads |
 | `cram-size` | `cram-size` | sizes by content ID and expanded compression method (gzip level, rANS order and transforms, ...), with the data series using each block; `-v`, `-e` (encodings), `-o` |
 | `reference` | `reference` | from `MD` tags (any input) or embedded CRAM references (`-e`); `-r` (indexed), `-q`, `-o` |
+| `rmdup` | `rmdup` | paired-end, `-s`, `-S`; libraries from `@RG` `LB`; single-end mode holds only the reads that can still be replaced |
 
 CRAM input without `--reference` uses the FASTA file named by the `@SQ` `UR` fields when it exists
 locally with a `.fai` index, as HTSlib does.

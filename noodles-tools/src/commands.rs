@@ -28,6 +28,7 @@ pub mod quickcheck;
 pub mod reference;
 pub mod reheader;
 pub mod reset;
+pub mod rmdup;
 pub mod samples;
 pub mod sort;
 pub mod split;

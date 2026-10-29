@@ -110,6 +110,50 @@ where
     Ok(())
 }
 
+/// Reads a record's CIGAR operations into `dst`, replacing a `kSmN` placeholder with the `CG`
+/// tag's operations as HTSlib does when it reads a record.
+pub fn read_cigar(record: &[u8], dst: &mut Vec<u32>) -> io::Result<()> {
+    const SOFT_CLIP: u32 = 4;
+    const SKIP: u32 = 3;
+
+    let name_len = usize::from(record[field::NAME_LENGTH]);
+    let n_cigar = usize::from(le_u16(&record[field::CIGAR_OP_COUNT]));
+    let start = field::NAME + name_len;
+    let raw = record
+        .get(start..start + 4 * n_cigar)
+        .ok_or_else(truncated)?;
+
+    dst.clear();
+    dst.extend(
+        raw.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b)),
+    );
+
+    let l_seq = le_u32(&record[field::SEQUENCE_LENGTH]);
+
+    if dst.len() == 2
+        && dst[0] & 0xf == SOFT_CLIP
+        && dst[0] >> 4 == l_seq
+        && dst[1] & 0xf == SKIP
+        && let Some(range) = find_field(record, *b"CG")?
+        && record[range.start + 2] == b'B'
+        && record[range.start + 3] == b'I'
+    {
+        dst.clear();
+        dst.extend(
+            record[range.start + 8..range.end]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b)),
+        );
+    }
+
+    Ok(())
+}
+
 /// Returns the byte range of the first auxiliary field with `tag`, including its tag and type.
 pub fn find_field(record: &[u8], tag: [u8; 2]) -> io::Result<Option<Range<usize>>> {
     let data = data_range(record)?;

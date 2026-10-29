@@ -104,6 +104,8 @@ enum Command {
     CramSize(commands::cram_size::Args),
     /// Rebuild a reference from MD tags or embedded CRAM references.
     Reference(commands::reference::Args),
+    /// Remove PCR duplicates (superseded by markdup).
+    Rmdup(commands::rmdup::Args),
     /// List the samples (read group SM values) of alignment files.
     Samples(commands::samples::Args),
     /// Generate a consensus sequence from aligned reads.
@@ -154,6 +156,7 @@ fn main() -> ExitCode {
         Command::Flags(args) => commands::flags::run(args),
         Command::CramSize(args) => commands::cram_size::run(args).map(|()| ExitCode::SUCCESS),
         Command::Reference(args) => commands::reference::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Rmdup(args) => commands::rmdup::run(args).map(|()| ExitCode::SUCCESS),
         Command::Samples(args) => commands::samples::run(args),
         Command::Consensus(args) => commands::consensus::run(args),
     };

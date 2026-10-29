@@ -331,7 +331,7 @@ fn patch_reference(
     let seq_start = cigar_start + 4 * n_cigar;
     let seq = &record[seq_start..seq_start + l_seq.div_ceil(2)];
 
-    read_cigar(record, &record[cigar_start..seq_start], l_seq, cigar)?;
+    bam_raw::read_cigar(record, cigar)?;
 
     let pos = i32::from_le_bytes(record[field::POSITION].try_into()?);
     let mut ops = CigarWalker::new(cigar);
@@ -398,37 +398,6 @@ fn patch_reference(
             iref += 1;
             iseq += 1;
         }
-    }
-
-    Ok(())
-}
-
-/// Reads a raw CIGAR, replacing a `kSmN` placeholder with the CG tag's operations as htslib does.
-fn read_cigar(record: &[u8], raw: &[u8], l_seq: usize, cigar: &mut Vec<u32>) -> io::Result<()> {
-    cigar.clear();
-    cigar.extend(
-        raw.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| u32::from_le_bytes(*b)),
-    );
-
-    if cigar.len() == 2
-        && cigar[0] & 0xf == CIGAR_SOFT_CLIP
-        && (cigar[0] >> 4) as usize == l_seq
-        && cigar[1] & 0xf == CIGAR_SKIP
-        && let Some(range) = bam_raw::find_field(record, *b"CG")?
-        && record[range.start + 2] == b'B'
-        && record[range.start + 3] == b'I'
-    {
-        cigar.clear();
-        cigar.extend(
-            record[range.start + 8..range.end]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| u32::from_le_bytes(*b)),
-        );
     }
 
     Ok(())

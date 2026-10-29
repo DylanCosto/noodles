@@ -457,6 +457,15 @@ check "reference -e -r" "$st reference -q -e -r chrS:1000000-1003000 embed.cram"
 check "reference tagged (spliced reads) matches the reference" "echo 0" \
     "cmp -l <($nt reference -q $tagged | grep -v '>' | tr -d '\\n') <($st faidx $ref chrS | grep -v '>' | tr -d '\\n') | awk '\$2 != 116' | wc -l"
 
+# rmdup, on md.bam's duplicates as one library and with its read groups as two
+"$st" view --no-PG -h md.bam | sed 's/^@RG\tID:a\t.*/&\tLB:la/; s/^@RG\tID:b\t.*/&\tLB:lb/' | "$st" view -b -o md.lb.bam -
+for input in md.bam md.lb.bam; do
+    for opts in "" "-s" "-S"; do
+        check "rmdup $opts $input" "$st rmdup $opts $input - 2>/dev/null | $st view --no-PG -h -" "$nt rmdup $opts $input - 2>/dev/null | $st view --no-PG -h -"
+    done
+done
+check "rmdup -s long" "$st rmdup -s $long - 2>/dev/null | $st view --no-PG -h -" "$nt rmdup -s $long - 2>/dev/null | $st view --no-PG -h -"
+
 echo "Slowest checks (seconds, samtools run or cached):"
 sort -rn "$timings" | head -15
 awk -F'\t' '{ t += $1; if ($2 == "cache") c++ } END { printf "Total %.0f s over %d checks, %d from cache\n", t, NR, c }' "$timings"
