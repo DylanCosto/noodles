@@ -14,6 +14,7 @@ use noodles_sam::{self as sam, alignment::io::Write as _};
 
 use crate::{
     alignment::{Rec, reference_repository},
+    bam_sam::{self, Names},
     bgzf_stream::BgzfWriter,
     parallel_sam::ParallelSamWriter,
     runs::write_raw_record,
@@ -57,7 +58,12 @@ pub type Sink = Box<dyn Write + Send>;
 
 /// An open alignment writer.
 pub enum AlignmentWriter {
-    Sam(sam::io::Writer<BufWriter<Sink>>),
+    Sam {
+        writer: sam::io::Writer<BufWriter<Sink>>,
+        /// For formatting BAM records directly; see [`bam_sam`].
+        names: Names,
+        line: Vec<u8>,
+    },
     /// SAM formatted on worker threads. Records that are not raw BAM are encoded first.
     ParallelSam {
         writer: ParallelSamWriter,
@@ -87,10 +93,11 @@ impl AlignmentWriter {
                 writer: ParallelSamWriter::new(sink, header, options.threads),
                 encoder: bam::io::Writer::from(Vec::new()),
             },
-            OutputFormat::Sam => Self::Sam(sam::io::Writer::new(BufWriter::with_capacity(
-                SAM_BUFFER_CAPACITY,
-                sink,
-            ))),
+            OutputFormat::Sam => Self::Sam {
+                writer: sam::io::Writer::new(BufWriter::with_capacity(SAM_BUFFER_CAPACITY, sink)),
+                names: Names::new(header),
+                line: Vec::new(),
+            },
             OutputFormat::Bam => Self::Bam(bam::io::Writer::from(BgzfWriter::new(
                 sink,
                 options.level,
@@ -113,7 +120,7 @@ impl AlignmentWriter {
 
     pub fn write_header(&mut self, header: &sam::Header) -> io::Result<()> {
         match self {
-            Self::Sam(w) => w.write_header(header),
+            Self::Sam { writer, .. } => writer.write_header(header),
             Self::ParallelSam { writer, .. } => {
                 let mut text = sam::io::Writer::new(Vec::new());
                 text.write_header(header)?;
@@ -135,7 +142,23 @@ impl AlignmentWriter {
                 encoder.write_alignment_record(header, record.as_dyn())?;
                 writer.push(&encoder.get_ref()[size_of::<u32>()..])
             }
-            (Self::Sam(w), _) => w.write_alignment_record(header, record.as_dyn()),
+            (
+                Self::Sam {
+                    writer,
+                    names,
+                    line,
+                },
+                Rec::Bam(r),
+            ) => {
+                line.clear();
+
+                if bam_sam::format_record(names, r.as_ref(), line) {
+                    writer.get_mut().write_all(line)
+                } else {
+                    writer.write_alignment_record(header, record.as_dyn())
+                }
+            }
+            (Self::Sam { writer, .. }, _) => writer.write_alignment_record(header, record.as_dyn()),
             (Self::Bam(w), _) => w.write_alignment_record(header, record.as_dyn()),
             (Self::Cram(w), _) => w.write_alignment_record(header, record.as_dyn()),
         }
@@ -158,7 +181,7 @@ impl AlignmentWriter {
     /// records ([`Self::write_bam_records`]) can be written directly, and which.
     pub fn preformatted_kind(&self) -> Option<OutputFormat> {
         match self {
-            Self::Sam(_) | Self::ParallelSam { .. } => Some(OutputFormat::Sam),
+            Self::Sam { .. } | Self::ParallelSam { .. } => Some(OutputFormat::Sam),
             Self::Bam(_) => Some(OutputFormat::Bam),
             Self::Cram(_) => None,
         }
@@ -167,7 +190,7 @@ impl AlignmentWriter {
     /// Writes SAM record lines formatted elsewhere. Only valid for SAM output.
     pub fn write_sam_text(&mut self, text: Vec<u8>) -> io::Result<()> {
         match self {
-            Self::Sam(w) => w.get_mut().write_all(&text),
+            Self::Sam { writer, .. } => writer.get_mut().write_all(&text),
             Self::ParallelSam { writer, .. } => writer.write_text(text),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -190,7 +213,7 @@ impl AlignmentWriter {
     /// Flushes buffered records and writes any end-of-file marker.
     pub fn finish(self, header: &sam::Header) -> io::Result<()> {
         match self {
-            Self::Sam(w) => w.into_inner().flush(),
+            Self::Sam { writer, .. } => writer.into_inner().flush(),
             Self::ParallelSam { writer, .. } => writer.finish(),
             Self::Bam(w) => w.into_inner().finish()?.flush(),
             Self::Cram(mut w) => {

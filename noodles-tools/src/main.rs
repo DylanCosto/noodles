@@ -3,6 +3,7 @@
 mod alignment;
 mod bam_blocks;
 mod bam_raw;
+mod bam_sam;
 mod bgzf_stream;
 mod commands;
 mod depth;

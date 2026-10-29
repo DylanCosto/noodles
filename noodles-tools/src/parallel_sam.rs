@@ -15,7 +15,10 @@ use crossbeam_channel::{Receiver, Sender};
 use noodles_bam as bam;
 use noodles_sam::{self as sam, alignment::io::Write as _};
 
-use crate::runs::write_raw_record;
+use crate::{
+    bam_sam::{self, Names},
+    runs::write_raw_record,
+};
 
 /// Raw record bytes per batch. Large enough to amortize channel traffic, small enough that
 /// batches spread evenly across workers.
@@ -150,10 +153,11 @@ impl ParallelSamWriter {
 
 fn format_batches(header: &sam::Header, work: &Receiver<Batch>, done: &Sender<Formatted>) {
     let mut record = bam::Record::default();
+    let names = Names::new(header);
 
     for (id, job) in work {
         let result = match job {
-            Job::Records(batch) => format_batch(header, &batch, &mut record),
+            Job::Records(batch) => format_batch(header, &names, &batch, &mut record),
             Job::Text(text) => Ok(text),
         };
 
@@ -165,6 +169,7 @@ fn format_batches(header: &sam::Header, work: &Receiver<Batch>, done: &Sender<Fo
 
 fn format_batch(
     header: &sam::Header,
+    names: &Names,
     batch: &[u8],
     record: &mut bam::Record,
 ) -> io::Result<Vec<u8>> {
@@ -173,7 +178,9 @@ fn format_batch(
     let mut reader = bam::io::Reader::from(batch);
 
     while reader.read_record(record)? != 0 {
-        writer.write_alignment_record(header, &*record)?;
+        if !bam_sam::format_record(names, record.as_ref(), writer.get_mut()) {
+            writer.write_alignment_record(header, &*record)?;
+        }
     }
 
     Ok(writer.into_inner())
