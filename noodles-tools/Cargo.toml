@@ -1,0 +1,37 @@
+[package]
+name = "noodles-tools"
+version = "0.1.0"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "A samtools-compatible command-line toolkit built on noodles"
+publish = false
+
+[[bin]]
+name = "ntools"
+path = "src/main.rs"
+
+[features]
+default = ["libdeflate"]
+libdeflate = ["noodles-bgzf/libdeflate", "noodles-cram/libdeflate"]
+
+[dependencies]
+anyhow = "1.0.86"
+bstr.workspace = true
+clap = { version = "4.5.0", features = ["derive"] }
+flate2.workspace = true
+noodles-bam = { path = "../noodles-bam" }
+noodles-bgzf = { path = "../noodles-bgzf" }
+noodles-core = { path = "../noodles-core" }
+noodles-cram = { path = "../noodles-cram" }
+noodles-csi = { path = "../noodles-csi" }
+noodles-fasta = { path = "../noodles-fasta" }
+noodles-sam = { path = "../noodles-sam" }
+noodles-util = { path = "../noodles-util", features = ["alignment"] }
+tempfile = "3.10.0"
+
+[dev-dependencies]
+assert_cmd = "2.0.14"
+
+[lints]
+workspace = true
