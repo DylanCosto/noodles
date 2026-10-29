@@ -1626,15 +1626,29 @@ fn write_sample(
     let mut cnt = 0i64;
     let n_entries = if active { pileup.entries().len() } else { 0 };
 
-    for k in 0..n_entries {
-        let entry = pileup.entries()[k];
-        let (read, mods) = pileup.read_and_base_mods(&entry);
-        let c = base_quality(read, &entry);
+    if options.mods == Mods::None {
+        for entry in &pileup.entries()[..n_entries] {
+            let read = pileup.read(entry);
+            let c = base_quality(read, entry);
 
-        if c >= options.min_bq {
-            push_base(seq, read, mods, &entry, pos, reference, options, ins)?;
-            qual.push(if c + 33 < 126 { (c + 33) as u8 } else { 126 });
-            cnt += 1;
+            if c >= options.min_bq {
+                push_base(seq, read, None, entry, pos, reference, options, ins)?;
+                qual.push(if c + 33 < 126 { (c + 33) as u8 } else { 126 });
+                cnt += 1;
+            }
+        }
+    } else {
+        // Modification states advance as bases are printed, so they are borrowed mutably.
+        for k in 0..n_entries {
+            let entry = pileup.entries()[k];
+            let (read, mods) = pileup.read_and_base_mods(&entry);
+            let c = base_quality(read, &entry);
+
+            if c >= options.min_bq {
+                push_base(seq, read, mods, &entry, pos, reference, options, ins)?;
+                qual.push(if c + 33 < 126 { (c + 33) as u8 } else { 126 });
+                cnt += 1;
+            }
         }
     }
 
@@ -1792,6 +1806,7 @@ fn push_tag_value(line: &mut Vec<u8>, read: &Read, tag: [u8; 2], empty: u8) {
 
 /// `pileup_seq`: one read's base column entry.
 #[expect(clippy::too_many_arguments, reason = "the read's context")]
+#[inline]
 fn push_base(
     seq: &mut Vec<u8>,
     read: &Read,

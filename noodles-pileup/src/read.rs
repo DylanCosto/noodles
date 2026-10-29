@@ -90,6 +90,7 @@ impl Read {
     }
 
     /// The encoded record.
+    #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.raw
     }
@@ -100,61 +101,73 @@ impl Read {
     }
 
     /// The reference sequence ID, or -1.
+    #[inline]
     pub fn reference_sequence_id(&self) -> i32 {
         self.tid
     }
 
     /// The 0-based position, or -1.
+    #[inline]
     pub fn position(&self) -> i64 {
         self.pos
     }
 
     /// The SAM flags.
+    #[inline]
     pub fn flags(&self) -> u16 {
         self.flag
     }
 
     /// The mate's reference sequence ID, or -1.
+    #[inline]
     pub fn mate_reference_sequence_id(&self) -> i32 {
         self.mtid
     }
 
     /// The mate's 0-based position, or -1.
+    #[inline]
     pub fn mate_position(&self) -> i64 {
         self.mpos
     }
 
     /// The template length.
+    #[inline]
     pub fn template_length(&self) -> i32 {
         self.isize
     }
 
     /// The number of bases.
+    #[inline]
     pub fn sequence_len(&self) -> usize {
         self.l_seq
     }
 
     /// The CIGAR operations, encoded as in BAM (`len << 4 | op`).
+    #[inline]
     pub fn cigar(&self) -> &[u32] {
         &self.cigar
     }
 
     /// The read name.
+    #[inline]
     pub fn name(&self) -> &[u8] {
         &self.raw[NAME..self.name_end]
     }
 
     /// The mapping quality.
+    #[inline]
     pub fn mapping_quality(&self) -> u8 {
         self.raw[9]
     }
 
     /// Sets the mapping quality.
+    #[inline]
     pub fn set_mapping_quality(&mut self, mapq: u8) {
         self.raw[9] = mapq;
     }
 
     /// Whether the read is on the reverse strand.
+    #[inline]
     pub fn is_reverse_complemented(&self) -> bool {
         self.flag & 0x10 != 0
     }
@@ -164,6 +177,7 @@ impl Read {
     /// # Panics
     ///
     /// Panics if `i` is out of bounds.
+    #[inline]
     pub fn base(&self, i: usize) -> u8 {
         assert!(i < self.l_seq, "base {i} of {}", self.l_seq);
         (self.raw[self.seq_start + i / 2] >> ((!i & 1) << 2)) & 0xf
@@ -174,6 +188,7 @@ impl Read {
     /// # Panics
     ///
     /// Panics if `i` is out of bounds.
+    #[inline]
     pub fn set_base(&mut self, i: usize, code: u8) {
         assert!(i < self.l_seq, "base {i} of {}", self.l_seq);
         let byte = &mut self.raw[self.seq_start + i / 2];
@@ -186,11 +201,13 @@ impl Read {
     }
 
     /// The base qualities.
+    #[inline]
     pub fn quality_scores(&self) -> &[u8] {
         &self.raw[self.qual_start..self.qual_start + self.l_seq]
     }
 
     /// The base qualities, to change.
+    #[inline]
     pub fn quality_scores_mut(&mut self) -> &mut [u8] {
         &mut self.raw[self.qual_start..self.qual_start + self.l_seq]
     }

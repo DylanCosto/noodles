@@ -294,6 +294,7 @@ impl BaseMods {
     }
 
     /// Whether the read has no modification calls.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.mods.is_empty()
     }

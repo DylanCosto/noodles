@@ -95,7 +95,7 @@ struct CigarState {
 /// `lbnode_t`
 struct Node {
     read: Read,
-    mods: Option<BaseMods>,
+    mods: Option<Box<BaseMods>>,
     beg: i64,
     end: i64,
     s: CigarState,
@@ -178,34 +178,40 @@ impl Pileup {
     }
 
     /// The reads at the position [`Self::next_position`] last prepared.
+    #[inline]
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
 
     /// Whether the end of the input was pushed.
+    #[inline]
     pub fn is_eof(&self) -> bool {
         self.is_eof
     }
 
     /// The reference sequence ID and 0-based position [`Self::next_position`] last prepared.
+    #[inline]
     pub fn position(&self) -> (i32, i64) {
         (self.out_tid, self.out_pos)
     }
 
     /// The read of an entry.
+    #[inline]
     pub fn read(&self, entry: &Entry) -> &Read {
         &self.node(entry.node as u32).read
     }
 
     /// The read of an entry and, if [`Self::enable_base_modifications`] was called, its base
     /// modification state. Ask the state for query positions in increasing order.
+    #[inline]
     pub fn read_and_base_mods(&mut self, entry: &Entry) -> (&Read, Option<&mut BaseMods>) {
         let node = self.slots[entry.node]
             .as_mut()
             .expect("ordered slots are occupied");
-        (&node.read, node.mods.as_mut())
+        (&node.read, node.mods.as_deref_mut())
     }
 
+    #[inline]
     fn node(&self, slot: u32) -> &Node {
         self.slots[slot as usize]
             .as_ref()
@@ -252,7 +258,9 @@ impl Pileup {
 
         if end > self.pos || read.tid > self.tid {
             let mods = if self.base_mods {
-                Some(BaseMods::parse(&read).map_err(Error::BaseModifications)?)
+                Some(Box::new(
+                    BaseMods::parse(&read).map_err(Error::BaseModifications)?,
+                ))
             } else {
                 None
             };

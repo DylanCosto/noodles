@@ -117,40 +117,46 @@ libdeflate. "short" is 1M synthetic 150 bp paired reads, "tagged" 250k reads wit
 
 | Operation | samtools (s) | ntools (s) | Speedup |
 |---|---:|---:|---:|
-| view BAM->SAM, short | 0.388 | 0.353 | 1.10x |
-| view BAM->SAM, long | 2.129 | 1.742 | 1.22x |
-| view BAM->SAM, long, -@4 | 0.569 | 0.353 | 1.61x |
-| view BAM->SAM, long, -@8 | 0.299 | 0.246 | 1.22x |
-| view CRAM->SAM, short | 0.883 | 0.970 | 0.91x |
-| view CRAM->SAM, long | 2.901 | 2.504 | 1.16x |
-| view CRAM->SAM, long, -@8 | 0.577 | 0.346 | 1.67x |
-| view CRAM->BAM, long, -@8 | 2.167 | 1.456 | 1.49x |
-| view BAM->BAM, long, -@4 | 3.409 | 2.373 | 1.44x |
-| view -c -q 30, short | 0.145 | 0.150 | 0.97x |
-| flagstat, long, -@4 | 0.330 | 0.342 | 0.96x |
-| index, long, -@4 | 0.333 | 0.342 | 0.97x |
-| sort, short, -@4 | 1.009 | 0.644 | 1.57x |
-| sort -n, short, -@4 | 1.146 | 0.636 | 1.80x |
-| collate -Ou, short, -@4 | 2.103 | 0.400 | 5.26x |
-| fixmate -m, short | 3.496 | 3.352 | 1.04x |
-| fixmate -m, short, -@4 | 0.886 | 0.445 | 1.99x |
-| markdup, short | 3.820 | 2.384 | 1.60x |
-| markdup, short, -@4 | 0.912 | 0.707 | 1.29x |
-| fastq, short | 0.613 | 0.623 | 0.98x |
-| depth, short | 0.285 | 0.317 | 0.90x |
-| stats, short | 1.663 | 1.169 | 1.42x |
-| stats, short, -@4 | 1.584 | 0.723 | 2.19x |
-| stats, long, -@8 | 5.884 | 1.597 | 3.68x |
-| mpileup, short | 2.906 | 2.989 | 0.97x |
-| mpileup -f (BAQ), short, -@8 | 27.796 | 4.489 | 6.19x |
-| coverage, short | 1.151 | 0.406 | 2.83x |
-| consensus, short | 6.37 | 6.08 | 1.05x |
-| consensus, short, -@4 | 1.61 | 1.54 | 1.05x |
-| consensus, long | 11.51 | 10.89 | 1.06x |
-| consensus, long, -@4 | 3.43 | 3.23 | 1.06x |
+| view BAM->SAM, short | 0.381 | 0.351 | 1.09x |
+| view BAM->SAM, long | 2.135 | 1.706 | 1.25x |
+| view BAM->SAM, long, -@4 | 0.568 | 0.350 | 1.62x |
+| view BAM->SAM, long, -@8 | 0.300 | 0.242 | 1.24x |
+| view CRAM->SAM, short | 0.886 | 0.969 | 0.91x |
+| view CRAM->SAM, long | 2.898 | 2.482 | 1.17x |
+| view CRAM->SAM, long, -@8 | 0.577 | 0.343 | 1.68x |
+| view CRAM->BAM, long, -@8 | 2.199 | 1.445 | 1.52x |
+| view BAM->BAM, long, -@4 | 3.448 | 2.353 | 1.47x |
+| view -c -q 30, short | 0.144 | 0.149 | 0.97x |
+| flagstat, long, -@4 | 0.330 | 0.340 | 0.97x |
+| index, long, -@4 | 0.333 | 0.341 | 0.98x |
+| sort, short, -@4 | 0.997 | 0.596 | 1.67x |
+| sort -n, short, -@4 | 1.088 | 0.580 | 1.88x |
+| collate -Ou, short, -@4 | 2.106 | 0.386 | 5.46x |
+| fixmate -m, short | 3.427 | 3.349 | 1.02x |
+| fixmate -m, short, -@4 | 0.882 | 0.450 | 1.96x |
+| markdup, short | 3.817 | 2.458 | 1.55x |
+| markdup, short, -@4 | 0.909 | 0.756 | 1.20x |
+| fastq, short | 0.607 | 0.691 | 0.88x |
+| depth, short | 0.284 | 0.317 | 0.90x |
+| stats, short | 1.659 | 1.142 | 1.45x |
+| stats, short, -@4 | 1.581 | 0.727 | 2.17x |
+| stats, long, -@8 | 5.699 | 1.577 | 3.61x |
+| mpileup, short | 2.880 | 3.020 | 0.95x |
+| mpileup -f (BAQ), short, -@8 | 27.771 | 4.413 | 6.29x |
+| calmd -b, short, -@4 | 0.697 | 0.644 | 1.08x |
+| calmd -r -A -b (BAQ), short, -@8 | 26.236 | 4.643 | 5.65x |
+| mpileup -M (base modifications), long | 16.360 | 11.130 | 1.47x |
+| ampliconclip, short | 3.048 | 1.792 | 1.70x |
+| ampliconclip --both-ends, short, -@4 | 0.809 | 0.395 | 2.05x |
+| coverage, short | 1.145 | 0.413 | 2.77x |
+| consensus, short | 6.362 | 6.089 | 1.04x |
+| consensus, short, -@4 | 1.615 | 1.557 | 1.04x |
+| consensus, long | 11.280 | 10.655 | 1.06x |
+| consensus, long, -@4 | 3.468 | 3.222 | 1.08x |
 | faidx 1024 regions | 0.018 | 0.020 | 0.90x |
 
-Where ntools is slower, it is single-threaded. Short-read CRAM decoding still trails HTSlib in
+Where ntools is slower, it is single-threaded (single-threaded `mpileup` without BAQ spends its
+time in the pileup engine itself, as samtools does). Short-read CRAM decoding still trails HTSlib in
 per-record tag decoding and allocation; its rANS decoding (AVX2) now keeps pace with HTSlib's.
 Rows near 1.0x (flagstat, index, counting) are bound by BGZF decompression, which both tools do
 with libdeflate. With threads, ntools parallelizes more of the work than samtools does, so the
@@ -172,3 +178,9 @@ ntools relies on these changes to the noodles crates, which downstream tools get
 - BAM: `Record` exposes its encoded bytes (`AsRef<[u8]>`, `TryFrom<Vec<u8>>`,
   `From<Record> for Vec<u8>`) for copying records without re-encoding.
 - SAM: integer arrays are formatted through a buffer, which speeds up long-read tags (`MM`/`ML`).
+- CRAM: a missing reference sequence is an error rather than a panic, and
+  `Reader::set_reference_sequence_repository` lets a reference be chosen after reading the
+  header.
+- New crate `noodles-pileup`: HTSlib-compatible pileup (`bam_plp`), BAQ, mapping quality capping,
+  MD/NM calculation, and MM/ML base modifications over encoded BAM records, which `mpileup` and
+  `calmd` use.
