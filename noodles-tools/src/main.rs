@@ -72,6 +72,8 @@ enum Command {
     Dict(commands::dict::Args),
     /// Sum read depth over BED regions.
     Bedcov(commands::bedcov::Args),
+    /// Add or replace read group tags and header lines.
+    Addreplacerg(commands::addreplacerg::Args),
 }
 
 fn main() -> ExitCode {
@@ -100,6 +102,9 @@ fn main() -> ExitCode {
         Command::Markdup(args) => commands::markdup::run(args).map(|()| ExitCode::SUCCESS),
         Command::Dict(args) => commands::dict::run(args).map(|()| ExitCode::SUCCESS),
         Command::Bedcov(args) => commands::bedcov::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Addreplacerg(args) => {
+            commands::addreplacerg::run(args).map(|()| ExitCode::SUCCESS)
+        }
     };
 
     match result {

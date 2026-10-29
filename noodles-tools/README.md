@@ -33,6 +33,9 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `split` | `split` | by read group or `-d` tag; `-f`, `-p`, `-u`, `-M` |
 | `collate` | `collate` | groups templates by name; `-f`, `-O/-o`, `-u`, `-l`, `-m`, `-T` |
 | `fixmate` | `fixmate` | `-m`, `-c`, `-r`, `-p`, `-z`; parallel with `-@` |
+| `dict` | `dict` | `-a`, `-s`, `-u`, `-H`, `-o` |
+| `bedcov` | `bedcov` | `-c`, `-d`, `-j`, `-Q`, `-g/-G`, `-H`; several inputs |
+| `addreplacerg` | `addreplacerg` | `-r` (repeatable, `\\t` escapes), `-R`, `-m overwrite_all\|orphan_only`, `-w` |
 | `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-s/-f`, `--include-fails`, `--use-read-groups`, `--duplicate-count` |
 
 `-@ N` adds worker threads throughout. Beyond BGZF compression and decompression, which is what
@@ -71,6 +74,9 @@ Intentional differences:
   so files can differ in size by a few bytes; records are identical.
 - `collate` groups each template's records together, in input order, as samtools does, but
   templates come out in a different (hash) order.
+- Header lines are written grouped by type (`@HD`, `@SQ`, `@RG`, `@PG`, `@CO`). HTSlib keeps
+  the input's line order and appends new lines at the end, so `addreplacerg` places a new `@RG`
+  line before existing `@PG` lines where samtools places it after them.
 - `markdup` does not yet support `-S`, `-t`, `-d` (optical duplicates), or barcode options.
 
 ## Performance
