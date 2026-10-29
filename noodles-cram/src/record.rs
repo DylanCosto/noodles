@@ -6,6 +6,7 @@ pub(crate) mod data;
 pub(crate) mod feature;
 mod flags;
 mod mate_flags;
+pub(crate) mod md_nm;
 mod quality_scores;
 mod sequence;
 mod sequence_record;

@@ -172,6 +172,10 @@ impl<'c> Slice<'c> {
             set_record_reference_sequences(&reference_sequence_repository, header, &mut records)?;
         }
 
+        for record in &mut records {
+            crate::record::md_nm::add_missing_md_nm(record);
+        }
+
         resolve_mates(&mut records)?;
 
         Ok(records)

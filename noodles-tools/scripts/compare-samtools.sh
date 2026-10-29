@@ -248,6 +248,15 @@ check "ampliconclip --primer-counts" \
     "$st ampliconclip --no-PG -b primers.bed --strand --primer-counts /dev/stdout -o /dev/null mp.short.bam" \
     "$nt ampliconclip --no-PG -b primers.bed --strand --primer-counts /dev/stdout -o /dev/null mp.short.bam"
 
+# CRAMs written with HTSlib's defaults drop MD and NM tags that match; both tools regenerate them
+"$st" view -C -T "$ref" -o mp.short.cram mp.short.bam
+"$st" view -C -T "$ref" -x MD -x NM -o mp.short.nomd.cram mp.short.bam
+"$st" view -C -T "$long_ref" -o mp.long.cram mp.long.bam
+check "view CRAM with dropped MD/NM" "$st view -T $ref mp.short.cram" "$nt view -T $ref mp.short.cram"
+check "view CRAM without MD/NM" "$st view -T $ref mp.short.nomd.cram" "$nt view -T $ref mp.short.nomd.cram"
+check "view long CRAM with dropped MD/NM" "$st view -T $long_ref mp.long.cram" "$nt view -T $long_ref mp.long.cram"
+check "consensus CRAM with dropped MD/NM" "$st consensus mp.short.cram" "$nt consensus mp.short.cram"
+
 # head, flags, samples
 check "head" "$st head $tagged" "$nt head $tagged"
 check "head -n 5 -h 2" "$st head -n 5 -h 2 $long" "$nt head -n 5 -h 2 $long"

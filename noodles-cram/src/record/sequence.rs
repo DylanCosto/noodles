@@ -49,7 +49,7 @@ impl<'r, 'c: 'r> Sequence<'r, 'c> {
             if let Some(reference) = self.reference_sequence {
                 let start = usize::from(previous_reference) - 1;
                 let end = usize::from(reference_position) - 1;
-                dst.extend_from_slice(&reference[start..end]);
+                extend_reference(dst, reference, start, end - start);
             } else if read_position != previous_read {
                 panic!("next: missing reference sequence");
             }
@@ -65,7 +65,11 @@ impl<'r, 'c: 'r> Sequence<'r, 'c> {
                     let reference = self
                         .reference_sequence
                         .expect("missing reference sequence (substitution)");
-                    let raw_reference_base = reference[usize::from(reference_position) - 1];
+                    // Past the end of the reference, HTSlib substitutes against N.
+                    let raw_reference_base = reference
+                        .get(usize::from(reference_position) - 1)
+                        .copied()
+                        .unwrap_or(b'N');
                     let reference_base = Base::try_from(raw_reference_base).unwrap_or(Base::N);
                     let mut base = u8::from(self.substitution_matrix.get(reference_base, *code));
                     if raw_reference_base.is_ascii_lowercase() {
@@ -84,7 +88,7 @@ impl<'r, 'c: 'r> Sequence<'r, 'c> {
             if last_read_position <= self.read_length {
                 let len = self.read_length - last_read_position + 1;
                 let start = usize::from(previous_reference) - 1;
-                dst.extend_from_slice(&reference[start..start + len]);
+                extend_reference(dst, reference, start, len);
             }
         } else if last_read_position != self.read_length + 1 {
             panic!(
@@ -93,6 +97,15 @@ impl<'r, 'c: 'r> Sequence<'r, 'c> {
             );
         }
     }
+}
+
+/// Appends `len` reference bases from `start`, with `N`s for any past the end of the reference, as
+/// HTSlib does for alignments that overhang it.
+fn extend_reference(dst: &mut Vec<u8>, reference: &[u8], start: usize, len: usize) {
+    let end = (start + len).min(reference.len());
+    let available = reference.get(start..end).unwrap_or_default();
+    dst.extend_from_slice(available);
+    dst.resize(dst.len() + len - available.len(), b'N');
 }
 
 impl sam::alignment::record::Sequence for Sequence<'_, '_> {

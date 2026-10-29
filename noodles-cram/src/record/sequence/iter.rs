@@ -19,15 +19,18 @@ impl<'c> ReferenceSequence<'c> {
         Self(src)
     }
 
+    /// The base at `position`, or `N` past the end of the reference (as in HTSlib).
     fn at(&self, position: Position) -> u8 {
         let i = usize::from(position) - 1;
-        self.0[i]
+        self.0.get(i).copied().unwrap_or(b'N')
     }
 
-    fn slice(&self, range: Range<Position>) -> &'c [u8] {
+    /// The bases in `range` that the reference has, and how many past its end are missing.
+    fn slice(&self, range: Range<Position>) -> (&'c [u8], usize) {
         let start = usize::from(range.start) - 1;
         let end = usize::from(range.end) - 1;
-        &self.0[start..end]
+        let available = self.0.get(start..end.min(self.0.len())).unwrap_or_default();
+        (available, end - start - available.len())
     }
 }
 
@@ -38,6 +41,8 @@ pub(super) struct Iter<'r, 'c: 'r> {
     read_length: usize,
     last_reference_position: Position,
     last_read_position: Position,
+    /// `N`s still to emit after the current reference bases, for alignments past its end.
+    missing_bases: usize,
     state: State<'r, 'c>,
 }
 
@@ -59,6 +64,7 @@ impl<'r, 'c: 'r> Iter<'r, 'c> {
             read_length,
             last_reference_position,
             last_read_position,
+            missing_bases: 0,
             state: State::Next,
         }
     }
@@ -85,8 +91,10 @@ impl<'r: 'c, 'c: 'r> Iterator for Iter<'r, 'c> {
                     {
                         let bases =
                             if let Some(reference_sequence) = self.reference_sequence.as_ref() {
-                                reference_sequence
-                                    .slice(self.last_reference_position..reference_position)
+                                let (bases, missing) = reference_sequence
+                                    .slice(self.last_reference_position..reference_position);
+                                self.missing_bases = missing;
+                                bases
                             } else if read_position != self.last_read_position {
                                 panic!("next: missing reference sequence");
                             } else {
@@ -107,7 +115,9 @@ impl<'r: 'c, 'c: 'r> Iterator for Iter<'r, 'c> {
                                 .checked_add(len)
                                 .expect("attempt to add with overflow");
 
-                            let bases = reference_sequence.slice(self.last_reference_position..end);
+                            let (bases, missing) =
+                                reference_sequence.slice(self.last_reference_position..end);
+                            self.missing_bases = missing;
 
                             State::Finish(bases.iter())
                         }
@@ -128,6 +138,11 @@ impl<'r: 'c, 'c: 'r> Iterator for Iter<'r, 'c> {
                 State::Prepare(ref mut reference_bases, reference_position, feature) => {
                     if let Some(base) = reference_bases.next() {
                         return Some(*base);
+                    }
+
+                    if self.missing_bases > 0 {
+                        self.missing_bases -= 1;
+                        return Some(b'N');
                     }
 
                     self.state = match feature {
@@ -174,6 +189,10 @@ impl<'r: 'c, 'c: 'r> Iterator for Iter<'r, 'c> {
                 },
                 State::Finish(ref mut iter) => match iter.next() {
                     Some(base) => return Some(*base),
+                    None if self.missing_bases > 0 => {
+                        self.missing_bases -= 1;
+                        return Some(b'N');
+                    }
                     None => self.state = State::Done,
                 },
                 State::Done => return None,
@@ -187,7 +206,7 @@ impl<'r: 'c, 'c: 'r> Iterator for Iter<'r, 'c> {
         match &self.state {
             State::Next => (n, Some(n)),
             State::Prepare(iter, ..) => {
-                let m = n + iter.len() + 1;
+                let m = n + iter.len() + self.missing_bases + 1;
                 (m, Some(m))
             }
             State::Base(_) => {
@@ -198,7 +217,10 @@ impl<'r: 'c, 'c: 'r> Iterator for Iter<'r, 'c> {
                 let m = n + iter.len();
                 (m, Some(m))
             }
-            State::Finish(iter) => iter.size_hint(),
+            State::Finish(iter) => {
+                let m = iter.len() + self.missing_bases;
+                (m, Some(m))
+            }
             State::Done => (0, Some(0)),
         }
     }

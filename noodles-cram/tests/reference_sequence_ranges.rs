@@ -46,7 +46,10 @@ fn test_single_reference_slice() -> Result<(), Box<dyn Error>> {
     let src = write(&references, &records)?;
 
     let indexed = indexed_repository(&references)?;
-    assert_eq!(read(&src, indexed.clone())?, records);
+    assert_eq!(
+        read(&src, indexed.clone())?,
+        with_md_nm(&references, &records)
+    );
     // `sq0` was not read whole, which would have cached it.
     assert!(indexed.is_empty());
 
@@ -78,7 +81,10 @@ fn test_multi_reference_slice() -> Result<(), Box<dyn Error>> {
     let src = write(&references, &records)?;
 
     let indexed = indexed_repository(&references)?;
-    assert_eq!(read(&src, indexed.clone())?, records);
+    assert_eq!(
+        read(&src, indexed.clone())?,
+        with_md_nm(&references, &records)
+    );
     // Only `sq1` was read whole.
     assert_eq!(indexed.len(), 1);
 
@@ -131,6 +137,49 @@ fn record(
         .set_quality_scores(vec![30; sequence.len()].into())
         .set_sequence(sequence.into())
         .build()
+}
+
+/// The records with the MD and NM tags that decoding generates, as HTSlib does.
+fn with_md_nm(references: &References, records: &[RecordBuf]) -> Vec<RecordBuf> {
+    use sam::alignment::{record::data::field::Tag, record_buf::data::field::Value};
+
+    records
+        .iter()
+        .map(|record| {
+            let reference_sequence = &references[record.reference_sequence_id().unwrap()].1;
+            let mut i = usize::from(record.alignment_start().unwrap()) - 1;
+            let (mut md, mut nm, mut matches) = (String::new(), 0u8, 0);
+
+            for op in record.cigar().as_ref() {
+                match op.kind() {
+                    Match => {
+                        matches += op.len();
+                        i += op.len();
+                    }
+                    Deletion => {
+                        md.push_str(&format!("{matches}^"));
+                        md.push_str(
+                            std::str::from_utf8(&reference_sequence[i..i + op.len()]).unwrap(),
+                        );
+                        matches = 0;
+                        nm += op.len() as u8;
+                        i += op.len();
+                    }
+                    Skip => i += op.len(),
+                    Insertion => nm += op.len() as u8,
+                    _ => {}
+                }
+            }
+
+            md.push_str(&matches.to_string());
+
+            let mut record = record.clone();
+            let data = record.data_mut();
+            data.insert(Tag::MISMATCHED_POSITIONS, Value::from(md));
+            data.insert(Tag::EDIT_DISTANCE, Value::UInt8(nm));
+            record
+        })
+        .collect()
 }
 
 fn fasta_records(references: &References) -> Vec<fasta::Record> {

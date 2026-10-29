@@ -80,7 +80,12 @@ Intentional differences:
 - BAI/CSI bins are written in insertion order, not HTSlib's hash order. samtools reads them and
   returns identical query results.
 - CRAM written by ntools keeps `MD`/`NM` tags as stored; HTSlib drops and regenerates them.
-  Decoded records are the same apart from tag order.
+  Decoded records are the same apart from tag order. Reading CRAM, ntools regenerates `MD`/`NM`
+  as HTSlib does: for mapped records with a reference, missing tags are added after the stored
+  ones (a `cF` tag can turn this off, and is removed).
+- Reading CRAM records that overhang the end of the reference, ntools fills the bases past the
+  end with `N`, as HTSlib does when it can decode them; HTSlib fails on such slices when it
+  must regenerate `MD`.
 - `reheader` and `cat` recompress the block holding the end of the header with noodles' encoder,
   so files can differ in size by a few bytes; records are identical.
 - `collate` groups each template's records together, in input order, as samtools does, but
@@ -104,8 +109,7 @@ Intentional differences:
   reads the following tables within the same struct and 0 beyond it. With `-@` and a `-T` FASTA
   that lacks a needed sequence, samtools silently writes truncated or garbage sequence; ntools
   stops with an error. As in samtools, `-@` with pileup output on an unindexed input drops the
-  pileup lines. CRAM files whose `MD`/`NM` tags HTSlib stripped (to regenerate on decoding) give
-  a different consensus, because ntools does not regenerate the tags and `--adj-MQ` uses `MD`.
+  pileup lines.
 
 ## Performance
 
@@ -178,6 +182,8 @@ ntools relies on these changes to the noodles crates, which downstream tools get
 - BAM: `Record` exposes its encoded bytes (`AsRef<[u8]>`, `TryFrom<Vec<u8>>`,
   `From<Record> for Vec<u8>`) for copying records without re-encoding.
 - SAM: integer arrays are formatted through a buffer, which speeds up long-read tags (`MM`/`ML`).
+- CRAM: decoding regenerates `MD`/`NM` tags that HTSlib's writer drops (as HTSlib's reader
+  does), and fills bases past the end of the reference with `N` instead of panicking.
 - CRAM: a missing reference sequence is an error rather than a panic, and
   `Reader::set_reference_sequence_repository` lets a reference be chosen after reading the
   header.
