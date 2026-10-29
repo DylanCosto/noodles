@@ -11,13 +11,15 @@
 //! output goes through a temporary file, and a second pass marks the supplementary, secondary,
 //! and unmapped records of primary duplicates.
 //!
-//! Not yet supported: `--read-coords`/`--coords-order` (coordinates from a regex), barcodes, and
-//! `--move-umi-to-tag`.
+//! Regexes (`--read-coords`, `--barcode-rgx`) use Rust's `regex` syntax rather than POSIX
+//! extended regular expressions; for the usual patterns of literals, classes, and groups, they
+//! match the same text.
 
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     io::{self, BufRead, Read as _, Write},
+    ops::Range,
     path::{Path, PathBuf},
 };
 
@@ -35,6 +37,7 @@ use noodles_sam::{
     },
     header::record::value::map::header::{sort_order::QUERY_NAME, tag::SORT_ORDER},
 };
+use regex::bytes::{Regex, RegexBuilder};
 
 use crate::{
     alignment::{AlignmentReader, ReadOptions, Rec},
@@ -47,7 +50,7 @@ use crate::{
 /// Base qualities below this are not scored (`MD_MIN_QUALITY`).
 const MIN_SCORED_QUALITY: u8 = 15;
 
-/// Read name coordinate warnings reported before going quiet (`BMD_WARNING_MAX`).
+/// Read name coordinate (or barcode) warnings reported before going quiet (`BMD_WARNING_MAX`).
 const MAX_WARNINGS: u64 = 10;
 
 // Orientations and read sides, the values samtools hashes.
@@ -62,6 +65,7 @@ const MATE_CIGAR: Tag = Tag::new(b'M', b'C');
 const MATE_SCORE: Tag = Tag::new(b'm', b's');
 const DUPLICATE_COUNT: Tag = Tag::new(b'd', b'c');
 
+const UMI: [u8; 2] = *b"RX";
 const ORIGINAL_NAME: [u8; 2] = *b"do";
 const DUPLICATE_TYPE: [u8; 2] = *b"dt";
 const OPTICAL: &[u8] = b"SQ";
@@ -163,6 +167,36 @@ pub struct Args {
     /// Do not add an @PG line to the header.
     #[arg(long = "no-PG")]
     no_pg: bool,
+
+    /// Regex for the coordinates in read names, with groups for the x and y coordinates and
+    /// (optionally) a part, such as the lane and tile, that must match [default: Illumina names].
+    #[arg(long = "read-coords")]
+    read_coords: Option<String>,
+
+    /// Order of the --read-coords groups: t (the part that must match), x, and y; txy, tyx, xyt,
+    /// yxt, xty, ytx, xy, or yx.
+    #[arg(long = "coords-order", default_value = "txy")]
+    coords_order: String,
+
+    /// Tag with a barcode that duplicates must match.
+    #[arg(long = "barcode-tag")]
+    barcode_tag: Option<String>,
+
+    /// Use the UMI/barcode in the read name (the eighth colon-delimited part).
+    #[arg(long = "barcode-name")]
+    barcode_name: bool,
+
+    /// Regex for the barcode in the read name, as its first group (instead of --barcode-name).
+    #[arg(long = "barcode-rgx")]
+    barcode_rgx: Option<String>,
+
+    /// Move the UMI from the read name to an RX tag (with --barcode-name or --barcode-rgx).
+    #[arg(long = "move-umi-to-tag")]
+    move_umi_to_tag: bool,
+
+    /// The separator removed with the UMI from read names.
+    #[arg(long = "umi-separator", default_value = ":")]
+    umi_separator: String,
 }
 
 /// `key_data_t`. Single-read keys leave the mate fields zero, so derived equality matches
@@ -173,6 +207,8 @@ struct Key {
     other_coord: i64,
     this_ref: i32,
     other_ref: i32,
+    /// The barcode's hash (`do_hash`), as samtools compares barcodes.
+    barcode: i32,
     read_group: i32,
     single: bool,
     leftmost: i8,
@@ -225,10 +261,46 @@ struct Check {
 
 /// Flowcell coordinates parsed from a read name.
 struct Coordinates {
-    /// The end of the prefix (lane and tile) that must match.
-    prefix_end: usize,
+    /// The part of the name (such as the lane and tile) that must match.
+    prefix: Range<usize>,
     x: i64,
     y: i64,
+}
+
+/// How flowcell coordinates are read from read names.
+enum CoordinateParser {
+    /// Illumina's colon-separated fields (`get_coordinates_colons`).
+    Colons,
+    /// `--read-coords`, with the groups of the x and y coordinates and the part that must match.
+    Regex {
+        regex: Regex,
+        x: usize,
+        y: usize,
+        t: Option<usize>,
+    },
+}
+
+/// Why coordinates could not be read from a read name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoordinateError {
+    /// The `--read-coords` regex did not match (samtools fails if this is a kept read's name).
+    Unmatched,
+    /// The coordinates were not numbers, or the name had the wrong fields; a warning is counted.
+    Unreadable,
+}
+
+/// Where barcodes that duplicates must match come from.
+enum Barcodes {
+    None,
+    Tag([u8; 2]),
+    /// The first group of a regex on the read name.
+    Name(Regex),
+}
+
+/// `--move-umi-to-tag`: the barcode regex and the separator removed with the UMI.
+struct UmiMover {
+    regex: Regex,
+    separator: u8,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -308,6 +380,11 @@ struct Markdup {
     stats: Vec<Stats>,
     /// Failed attempts to read coordinates from read names.
     warnings: u64,
+    coordinates: CoordinateParser,
+    barcodes: Barcodes,
+    /// Failed attempts to read barcodes.
+    barcode_warnings: u64,
+    umi: Option<UmiMover>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -324,6 +401,50 @@ struct Options {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
+    let barcode_name = args.barcode_name || args.barcode_rgx.is_some();
+
+    if args.barcode_tag.is_some() && barcode_name {
+        bail!(
+            "[markdup] error, cannot specify --barcode-tag and --barcode-name (or --barcode-rgx) at same time."
+        );
+    }
+
+    if args.move_umi_to_tag && !barcode_name {
+        bail!("[markdup] error, --move-umi-to-tag requires --barcode-name or --barcode-rgx.");
+    }
+
+    let coordinates = match &args.read_coords {
+        Some(pattern) => coordinate_regex(pattern, &args.coords_order)?,
+        None => CoordinateParser::Colons,
+    };
+
+    let barcodes = if let Some(tag) = &args.barcode_tag {
+        let tag = tag.as_bytes();
+        Barcodes::Tag([
+            tag.first().copied().unwrap_or(0),
+            tag.get(1).copied().unwrap_or(0),
+        ])
+    } else if barcode_name {
+        // From Illumina's UMI documentation: "The UMI sequence is located in the eighth
+        // colon-delimited field of the read name (QNAME)".
+        const ILLUMINA_UMI: &str = "[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:([!-?A-~]+)";
+        let pattern = args.barcode_rgx.as_deref().unwrap_or(ILLUMINA_UMI);
+        Barcodes::Name(
+            compile_regex(pattern)
+                .with_context(|| "[markdup] error, barcode regex fail".to_string())?,
+        )
+    } else {
+        Barcodes::None
+    };
+
+    let umi = match &barcodes {
+        Barcodes::Name(regex) if args.move_umi_to_tag => Some(UmiMover {
+            regex: regex.clone(),
+            separator: args.umi_separator.bytes().next().unwrap_or(0),
+        }),
+        _ => None,
+    };
+
     let read_options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
@@ -406,6 +527,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         duplicates: HashMap::new(),
         stats: vec![Stats::default(); group_count + 1],
         warnings: 0,
+        coordinates,
+        barcodes,
+        barcode_warnings: 0,
+        umi,
     };
 
     let exclude = if args.include_fails {
@@ -506,6 +631,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         );
     }
 
+    if state.barcode_warnings > 0 {
+        eprintln!(
+            "[markdup] warning, number of failed attempts to get barcodes = {}",
+            state.barcode_warnings
+        );
+    }
+
     if args.stats || args.stats_file.is_some() || args.json {
         let mut out: Box<dyn Write> = match &args.stats_file {
             Some(path) => Box::new(
@@ -602,6 +734,20 @@ impl Markdup {
         result
     }
 
+    /// The barcode hash of a buffered read, counting a warning if it cannot be read.
+    fn barcode(&mut self, id: u64) -> i32 {
+        let Self {
+            reads,
+            front_id,
+            barcodes,
+            barcode_warnings,
+            ..
+        } = self;
+
+        let i = usize::try_from(id - *front_id).expect("buffered read");
+        barcodes.hash(reads[i].record.as_ref(), barcode_warnings)
+    }
+
     /// The last read in the duplicate chain starting at `id`.
     fn chain_end(&self, mut id: u64) -> u64 {
         while let Some(next) = self.get(id).duplicate {
@@ -615,11 +761,14 @@ impl Markdup {
     fn examine(&mut self, id: u64, read_group: usize) -> anyhow::Result<()> {
         let read_group_key = i32::try_from(read_group).unwrap_or(i32::MAX);
         let chain = self.options.check_chain;
-        let record = &self.get(id).record;
 
-        if has_mate(record) {
-            let pair_key = make_pair_key(record, self.options.mode, read_group_key)?;
-            let single_key = make_single_key(record, read_group_key);
+        if has_mate(&self.get(id).record) {
+            // samtools reads the barcode for each key, warning twice.
+            let pair_barcode = self.barcode(id);
+            let single_barcode = self.barcode(id);
+            let record = &self.get(id).record;
+            let pair_key = make_pair_key(record, self.options.mode, read_group_key, pair_barcode)?;
+            let single_key = make_single_key(record, read_group_key, single_barcode);
 
             self.stats[read_group].pair += 1;
             self.get_mut(id).pos = single_key.this_coord;
@@ -722,7 +871,8 @@ impl Markdup {
                 }
             }
         } else {
-            let single_key = make_single_key(record, read_group_key);
+            let barcode = self.barcode(id);
+            let single_key = make_single_key(&self.get(id).record, read_group_key, barcode);
 
             self.stats[read_group].single += 1;
             self.get_mut(id).pos = single_key.this_coord;
@@ -794,6 +944,7 @@ impl Markdup {
 
         let is_optical = options.optical_distance > 0
             && is_optical_duplicate(
+                &self.coordinates,
                 &original_name,
                 &duplicate_name,
                 options.optical_distance,
@@ -914,11 +1065,10 @@ impl Markdup {
         let options = self.options;
         let original_name = name(self.get(root).record.as_ref()).to_vec();
 
-        let original_coordinates = if options.optical_distance > 0 {
-            coordinates(&original_name, &mut self.warnings)
-        } else {
-            None
-        };
+        let parsed = (options.optical_distance > 0)
+            .then(|| self.coordinates.parse(&original_name, &mut self.warnings));
+        let unmatched = matches!(parsed, Some(Err(CoordinateError::Unmatched)));
+        let original_coordinates = parsed.and_then(Result::ok);
 
         let coordinates_failed = options.optical_distance > 0 && original_coordinates.is_none();
 
@@ -969,6 +1119,7 @@ impl Markdup {
                 check.optical = matches!(bam_raw::string_field(raw, DUPLICATE_TYPE), Ok(Some(t)) if t == OPTICAL);
 
                 let is_optical = optical_duplicate_partial(
+                    &self.coordinates,
                     &original_name,
                     original,
                     &read_name,
@@ -995,6 +1146,13 @@ impl Markdup {
         }
 
         self.get_mut(root).dup_checked = true;
+
+        if unmatched {
+            bail!(
+                "read name {} does not match --read-coords",
+                String::from_utf8_lossy(&original_name)
+            );
+        }
 
         Ok((!coordinates_failed).then_some(checks))
     }
@@ -1138,14 +1296,24 @@ impl Markdup {
         let is_duplicate = flags_of(read.record.as_ref()).is_duplicate();
 
         if !self.options.remove || !is_duplicate {
+            let mut raw = Vec::from(read.record);
+
             if self.options.duplicate_count && !is_duplicate {
-                let mut raw = Vec::new();
-                bam_raw::strip_fields(read.record.as_ref(), &mut raw, |tag| tag == *b"dc")?;
-                append_integer_tag(&mut raw, DUPLICATE_COUNT, read.duplicate_count);
-                out.write(header, &raw)?;
-            } else {
-                out.write(header, read.record.as_ref())?;
+                let mut stripped = Vec::new();
+                bam_raw::strip_fields(&raw, &mut stripped, |tag| tag == *b"dc")?;
+                append_integer_tag(&mut stripped, DUPLICATE_COUNT, read.duplicate_count);
+                raw = stripped;
             }
+
+            // With -S, names are moved in the second pass, after other records are matched to
+            // them. (samtools 1.24 moves names here only at the end of the input, a bug.)
+            if let Some(umi) = &self.umi
+                && !self.options.supplementary
+            {
+                umi.move_to_tag(&mut raw)?;
+            }
+
+            out.write(header, &raw)?;
 
             self.stats[read.read_group].writing += 1;
         }
@@ -1218,10 +1386,14 @@ impl Markdup {
                 if self.options.duplicate_count && is_duplicate {
                     let mut stripped = Vec::new();
                     bam_raw::strip_fields(&raw, &mut stripped, |tag| tag == *b"dc")?;
-                    writer.write_raw(header, &stripped)?;
-                } else {
-                    writer.write_raw(header, &raw)?;
+                    raw = stripped;
                 }
+
+                if let Some(umi) = &self.umi {
+                    umi.move_to_tag(&mut raw)?;
+                }
+
+                writer.write_raw(header, &raw)?;
             }
         }
 
@@ -1249,7 +1421,7 @@ fn warn(warnings: &mut u64, message: std::fmt::Arguments<'_>) {
 /// `get_coordinates_colons`: the x and y coordinates from an Illumina-style read name
 /// (`machine:run:flowcell:lane:tile:x:y`, with an optional `:UMI`, or older forms with 3 or 4
 /// colons).
-fn coordinates(name: &[u8], warnings: &mut u64) -> Option<Coordinates> {
+fn colon_coordinates(name: &[u8], warnings: &mut u64) -> Option<Coordinates> {
     let mut separators = 0;
     let (mut x_start, mut y_start) = (0, 0);
 
@@ -1300,10 +1472,204 @@ fn coordinates(name: &[u8], warnings: &mut u64) -> Option<Coordinates> {
     };
 
     Some(Coordinates {
-        prefix_end: x_start,
+        prefix: 0..x_start,
         x,
         y,
     })
+}
+
+/// `--read-coords` and `--coords-order`.
+fn coordinate_regex(pattern: &str, order: &str) -> anyhow::Result<CoordinateParser> {
+    let (t, x, y) = if order.starts_with("txy") || order.starts_with("tyx") {
+        (Some(1), 2, 3)
+    } else if order.starts_with("xyt") || order.starts_with("yxt") {
+        (Some(3), 1, 2)
+    } else if order.starts_with("xty") || order.starts_with("ytx") {
+        (Some(2), 1, 3)
+    } else if order.starts_with("xy") || order.starts_with("yx") {
+        (None, 1, 2)
+    } else {
+        bail!("[markdup] error,  could not recognise regex coordinate order \"{order}\".");
+    };
+
+    let regex = compile_regex(pattern).context("[markdup] error, regex fail")?;
+    Ok(CoordinateParser::Regex { regex, x, y, t })
+}
+
+/// A regex over the bytes of read names.
+fn compile_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    RegexBuilder::new(pattern).unicode(false).build()
+}
+
+impl CoordinateParser {
+    /// `get_coordinates`: the coordinates in a read name, counting a warning if they cannot be
+    /// read. A name that a `--read-coords` regex does not match is not warned about.
+    fn parse(&self, name: &[u8], warnings: &mut u64) -> Result<Coordinates, CoordinateError> {
+        let Self::Regex { regex, x, y, t } = self else {
+            return colon_coordinates(name, warnings).ok_or(CoordinateError::Unreadable);
+        };
+
+        let groups = || {
+            let captures = regex.captures(name)?;
+            let prefix = match t {
+                Some(t) => captures.get(*t)?.range(),
+                None => 0..0,
+            };
+            Some((captures.get(*x)?, captures.get(*y)?, prefix))
+        };
+
+        let (x, y, prefix) = groups().ok_or(CoordinateError::Unmatched)?;
+
+        let display = String::from_utf8_lossy(name);
+        let mut coordinate = |axis: &str, m: regex::bytes::Match<'_>| {
+            // samtools copies each coordinate into a 255-byte buffer.
+            if m.len() > 254 {
+                warn(
+                    warnings,
+                    format_args!(
+                        "{axis} coordinate string longer than allowed qname length in {display} ({} long).",
+                        m.len()
+                    ),
+                );
+                return None;
+            }
+
+            let n = strtol(m.as_bytes());
+
+            if n.is_none() {
+                warn(
+                    warnings,
+                    format_args!(
+                        "cannot decipher {axis} coordinate in {display} ({}).",
+                        String::from_utf8_lossy(m.as_bytes())
+                    ),
+                );
+            }
+
+            n
+        };
+
+        let x = coordinate("x", x).ok_or(CoordinateError::Unreadable)?;
+        let y = coordinate("y", y).ok_or(CoordinateError::Unreadable)?;
+
+        Ok(Coordinates { prefix, x, y })
+    }
+}
+
+impl Barcodes {
+    /// The barcode's hash for a read's keys (0 if it has none), counting a warning if it cannot
+    /// be read.
+    fn hash(&self, record: &[u8], warnings: &mut u64) -> i32 {
+        let incoming_warnings = *warnings;
+
+        let barcode = match self {
+            Self::None => None,
+            Self::Tag(tag) => match bam_raw::find_field(record, *tag) {
+                Ok(Some(range)) if matches!(record[range.start + 2], b'Z' | b'H') => {
+                    Some(&record[range.start + 3..range.end - 1])
+                }
+                Ok(None) => None,
+                _ => {
+                    warn(
+                        warnings,
+                        format_args!(
+                            "{} tag wrong type. Aux tag needs to be a string type.",
+                            String::from_utf8_lossy(tag).trim_end_matches('\0')
+                        ),
+                    );
+                    None
+                }
+            },
+            Self::Name(regex) => {
+                let qname = name(record);
+
+                match regex.captures(qname) {
+                    Some(captures) => {
+                        if captures.get(1).is_none() {
+                            warn(
+                                warnings,
+                                format_args!(
+                                    "barcode regex unable to match substring on {}.",
+                                    String::from_utf8_lossy(qname)
+                                ),
+                            );
+                        }
+
+                        captures.get(1).map(|m| m.as_bytes())
+                    }
+                    None => {
+                        warn(
+                            warnings,
+                            format_args!(
+                                "barcode regex match error \"No match\" on {}.",
+                                String::from_utf8_lossy(qname)
+                            ),
+                        );
+                        None
+                    }
+                }
+            }
+        };
+
+        if *warnings == MAX_WARNINGS && incoming_warnings != *warnings {
+            eprintln!(
+                "[markdup] warning, {} barcode read warnings.  New warnings will not be reported.",
+                *warnings
+            );
+        }
+
+        barcode.map_or(0, |b| do_hash(b) as i32)
+    }
+}
+
+/// samtools markdup's `do_hash` (Jenkins' one-at-a-time hash).
+fn do_hash(key: &[u8]) -> u32 {
+    let mut hash = 0u32;
+
+    for &b in key {
+        hash = hash.wrapping_add(u32::from(b));
+        hash = hash.wrapping_add(hash << 10);
+        hash ^= hash >> 6;
+    }
+
+    hash = hash.wrapping_add(hash << 3);
+    hash ^= hash >> 11;
+    hash.wrapping_add(hash << 15)
+}
+
+impl UmiMover {
+    /// `move_umi_to_tag`: moves the UMI (the regex's first group) from the read name to an RX
+    /// tag, removing one separator next to it.
+    fn move_to_tag(&self, record: &mut Vec<u8>) -> anyhow::Result<()> {
+        let qname = name(record);
+
+        let Some(umi) = self.regex.captures(qname).and_then(|c| c.get(1)) else {
+            return Ok(());
+        };
+
+        let Range { mut start, mut end } = umi.range();
+        let umi = umi.as_bytes().to_vec();
+
+        if start > 0 && qname[start - 1] == self.separator {
+            start -= 1;
+        } else if end < qname.len() && qname[end] == self.separator {
+            end += 1;
+        }
+
+        let mut new_name = Vec::with_capacity(qname.len() - (end - start));
+        new_name.extend_from_slice(&qname[..start]);
+        new_name.extend_from_slice(&qname[end..]);
+
+        bam_raw::update_string_field(record, UMI, &umi)
+            .context("[markdup] error, unable to add RX tag.")?;
+
+        // l_read_name, then the NUL-terminated name at 32.
+        let old_len = usize::from(record[8]);
+        record.splice(32..32 + old_len - 1, new_name.iter().copied());
+        record[8] = u8::try_from(new_name.len() + 1).expect("a shorter name fits");
+
+        Ok(())
+    }
 }
 
 /// C's `strtol(s, &end, 10)`, or `None` if it reads no digits. Out-of-range values saturate.
@@ -1337,25 +1703,27 @@ fn is_close(original: &Coordinates, x: i64, y: i64, distance: i64) -> bool {
 
 /// `is_optical_duplicate`
 fn is_optical_duplicate(
+    parser: &CoordinateParser,
     original: &[u8],
     duplicate: &[u8],
     distance: i64,
     warnings: &mut u64,
 ) -> bool {
-    let Some(o) = coordinates(original, warnings) else {
+    let Ok(o) = parser.parse(original, warnings) else {
         return false;
     };
 
-    let Some(d) = coordinates(duplicate, warnings) else {
+    let Ok(d) = parser.parse(duplicate, warnings) else {
         return false;
     };
 
-    original[..o.prefix_end] == duplicate[..d.prefix_end] && is_close(&o, d.x, d.y, distance)
+    original[o.prefix.clone()] == duplicate[d.prefix] && is_close(&o, d.x, d.y, distance)
 }
 
 /// `optical_duplicate_partial`: like [`is_optical_duplicate`] with the original's coordinates
 /// already parsed, also recording the duplicate's coordinates in `check`.
 fn optical_duplicate_partial(
+    parser: &CoordinateParser,
     original_name: &[u8],
     original: &Coordinates,
     duplicate: &[u8],
@@ -1363,17 +1731,17 @@ fn optical_duplicate_partial(
     distance: i64,
     warnings: &mut u64,
 ) -> bool {
-    let Some(d) = coordinates(duplicate, warnings) else {
+    let Ok(d) = parser.parse(duplicate, warnings) else {
         return false;
     };
 
-    let is_optical = original_name[..original.prefix_end] == duplicate[..d.prefix_end]
+    let is_optical = original_name[original.prefix.clone()] == duplicate[d.prefix.clone()]
         && is_close(original, d.x, d.y, distance);
 
     check.x = d.x;
     check.y = d.y;
     check.has_coordinates = true;
-    check.prefix = duplicate[..d.prefix_end].to_vec();
+    check.prefix = duplicate[d.prefix].to_vec();
 
     is_optical
 }
@@ -1564,7 +1932,7 @@ fn unclipped_other_end(mpos: i64, cigar: &[(u8, i64)]) -> i64 {
 }
 
 /// `make_single_key`
-fn make_single_key(record: &bam::Record, read_group: i32) -> Key {
+fn make_single_key(record: &bam::Record, read_group: i32, barcode: i32) -> Key {
     let ops = cigar_ops(record).unwrap_or_default();
     let raw = record.as_ref();
     let this_ref = i32_field(raw, field::REFERENCE_SEQUENCE_ID) + 1;
@@ -1578,6 +1946,7 @@ fn make_single_key(record: &bam::Record, read_group: i32) -> Key {
     Key {
         this_coord,
         this_ref,
+        barcode,
         read_group,
         single: true,
         orientation,
@@ -1586,7 +1955,12 @@ fn make_single_key(record: &bam::Record, read_group: i32) -> Key {
 }
 
 /// `make_pair_key`
-fn make_pair_key(record: &bam::Record, mode: Mode, read_group: i32) -> anyhow::Result<Key> {
+fn make_pair_key(
+    record: &bam::Record,
+    mode: Mode,
+    read_group: i32,
+    barcode: i32,
+) -> anyhow::Result<Key> {
     let ops = cigar_ops(record)?;
     let raw = record.as_ref();
     let flags = flags_of(raw);
@@ -1719,6 +2093,7 @@ fn make_pair_key(record: &bam::Record, mode: Mode, read_group: i32) -> anyhow::R
         other_coord,
         this_ref,
         other_ref,
+        barcode,
         read_group,
         single: false,
         leftmost: if leftmost { R_LE } else { R_RI },
@@ -1919,20 +2294,52 @@ mod tests {
     fn test_coordinates() {
         let mut warnings = 0;
 
-        let c = coordinates(b"M1:7:FC1:1:1101:1234:5678", &mut warnings).expect("parsed");
-        assert_eq!((c.prefix_end, c.x, c.y), (16, 1234, 5678));
+        let c = colon_coordinates(b"M1:7:FC1:1:1101:1234:5678", &mut warnings).expect("parsed");
+        assert_eq!((c.prefix, c.x, c.y), (0..16, 1234, 5678));
 
-        let c = coordinates(b"M1:7:FC1:1:1101:1234:5678:ACGT", &mut warnings).expect("parsed");
-        assert_eq!((c.prefix_end, c.x, c.y), (16, 1234, 5678));
+        let c =
+            colon_coordinates(b"M1:7:FC1:1:1101:1234:5678:ACGT", &mut warnings).expect("parsed");
+        assert_eq!((c.prefix, c.x, c.y), (0..16, 1234, 5678));
 
         // HiSeq style: machine:lane:tile:x:y
-        let c = coordinates(b"HS:1:1101:12:34", &mut warnings).expect("parsed");
-        assert_eq!((c.prefix_end, c.x, c.y), (10, 12, 34));
+        let c = colon_coordinates(b"HS:1:1101:12:34", &mut warnings).expect("parsed");
+        assert_eq!((c.prefix, c.x, c.y), (0..10, 12, 34));
 
         assert_eq!(warnings, 0);
-        assert!(coordinates(b"read1", &mut warnings).is_none());
-        assert!(coordinates(b"a:b:c:x:y", &mut warnings).is_none());
+        assert!(colon_coordinates(b"read1", &mut warnings).is_none());
+        assert!(colon_coordinates(b"a:b:c:x:y", &mut warnings).is_none());
         assert_eq!(warnings, 2);
+    }
+
+    #[test]
+    fn test_coordinate_regex() -> anyhow::Result<()> {
+        let mut warnings = 0;
+
+        let parser = coordinate_regex(r"^(\w+)_(\d+)_(\d+)$", "txy")?;
+        let c = parser
+            .parse(b"tile7_120_340", &mut warnings)
+            .expect("parsed");
+        assert_eq!((c.prefix, c.x, c.y), (0..5, 120, 340));
+
+        let parser = coordinate_regex(r"_(\d+)_(\d+)$", "yx")?;
+        let c = parser.parse(b"a_1_2", &mut warnings).expect("parsed");
+        assert_eq!((c.prefix, c.x, c.y), (0..0, 1, 2));
+
+        // A name the regex does not match is skipped silently.
+        assert!(matches!(
+            parser.parse(b"a", &mut warnings),
+            Err(CoordinateError::Unmatched)
+        ));
+        assert_eq!(warnings, 0);
+
+        assert!(coordinate_regex("(x)", "abc").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_do_hash() {
+        assert_eq!(do_hash(b""), 0);
+        assert_eq!(do_hash(b"a"), 0xca2e_9442);
     }
 
     #[test]
@@ -1941,18 +2348,21 @@ mod tests {
         let original = b"M:7:FC:1:1101:1000:2000";
 
         assert!(is_optical_duplicate(
+            &CoordinateParser::Colons,
             original,
             b"M:7:FC:1:1101:1100:1900",
             100,
             &mut warnings
         ));
         assert!(!is_optical_duplicate(
+            &CoordinateParser::Colons,
             original,
             b"M:7:FC:1:1101:1101:2000",
             100,
             &mut warnings
         ));
         assert!(!is_optical_duplicate(
+            &CoordinateParser::Colons,
             original,
             b"M:7:FC:1:1102:1000:2000",
             100,

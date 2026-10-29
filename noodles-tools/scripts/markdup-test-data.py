@@ -1,17 +1,23 @@
 """Writes a synthetic SAM file to stdout for checking markdup -S/-t/-d against samtools.
 
-Usage: markdup-test-data.py [SEED]
+Usage: markdup-test-data.py [SEED] [--barcodes]
 
 Reads have Illumina-style names (three formats) with optical and library duplicates,
 supplementary alignments (SA), XA tags, mate-unmapped pairs, secondary alignments, single reads,
 QC fails, and a few names whose coordinates cannot be parsed. Sort it by name, run
 `samtools fixmate -m`, and sort it by coordinate before marking duplicates.
+
+With --barcodes, names with UMIs get one of three, and templates get a BC:Z tag of one of two
+barcodes (some none, and some a BC:i tag of the wrong type), for --barcode-tag/-name/-rgx.
 """
 
 import random
 import sys
+import zlib
 
-rng = random.Random(int(sys.argv[1]) if len(sys.argv) > 1 else 7)
+args = [a for a in sys.argv[1:] if a != "--barcodes"]
+barcodes = "--barcodes" in sys.argv[1:]
+rng = random.Random(int(args[0]) if args else 7)
 REF_LEN = 200_000
 READ_LEN = 100
 
@@ -129,4 +135,12 @@ for fragment in range(4000):
             pair(qname, ref, pos1, pos2, rev1, rg, kind)
 
 for line in lines:
+    if barcodes:
+        h = zlib.crc32(line[0].encode())
+        if line[0].endswith(":ACGTACGT"):
+            line[0] = line[0][:-8] + ["AAAA", "CCGG", "TTAG"][h % 3]
+        if h % 17 == 0:
+            line.append("BC:i:5")
+        elif h % 5 != 0:
+            line.append("BC:Z:" + ["GATT", "CAGA"][h % 2])
     out.write("\t".join(str(f) for f in line) + "\n")

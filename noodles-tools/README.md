@@ -36,7 +36,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `dict` | `dict` | `-a`, `-s`, `-u`, `-H`, `-o` |
 | `bedcov` | `bedcov` | `-c`, `-d`, `-j`, `-Q`, `-g/-G`, `-H`; several inputs |
 | `addreplacerg` | `addreplacerg` | `-r` (repeatable, `\t` escapes), `-R`, `-m overwrite_all\|orphan_only`, `-w` |
-| `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-S`, `-t`, `-d` (optical duplicates), `-T`, `-s/-f`, `--json`, `--no-multi-dup`, `--include-fails`, `--use-read-groups`, `--duplicate-count` |
+| `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-S`, `-t`, `-d` (optical duplicates), `-T`, `-s/-f`, `--json`, `--no-multi-dup`, `--include-fails`, `--use-read-groups`, `--duplicate-count`, `--read-coords`/`--coords-order`, `--barcode-tag`/`-name`/`-rgx`, `--move-umi-to-tag`, `--umi-separator` |
 | `stats` | `stats` | all sections; `-r`, `-t`, regions, `-f/-F/-d`, `-c`, `-i`, `-m`, `-q`, `-l`, `-I`, `-S/-P`, `-p`, `-g`, `-x`, `--GC-depth`, `--ref-stats`; per-cycle counts use `-@` threads |
 | `mpileup` | `mpileup` | text pileup with BAQ (`-B`, `-E`), overlap removal (`-x`), `-f`, `-r`, `-l`, `-a/-aa`, `-q/-Q`, `-d`, `-A`, `-C`, `-G`, `-R`, `-6`, `--rf/--ff`, `-b`, `-X`, `-s`, `-O`, `--output-BP-5`, `--output-QNAME`, `--output-extra`, `--output-sep/-empty`, `--reverse-del`, `--no-output-ins/-del/-ends`, `-M` (base modifications from MM/ML, also in insertions unless `--no-output-ins-mods`); reads and BAQ use `-@` threads, and indexed inputs with several sequences pile up one chromosome per thread |
 | `calmd` | `calmd` | `-e`, `-r` (BAQ), `-A`, `-E`, `-n`, `-C`, `-d`, `-q`, `-N`, `-Q`, `-b/-u`; records are processed on `-@` threads |
@@ -80,10 +80,12 @@ Intentional differences:
 - Header lines are written grouped by type (`@HD`, `@SQ`, `@RG`, `@PG`, `@CO`). HTSlib keeps
   the input's line order and appends new lines at the end, so `addreplacerg` places a new `@RG`
   line before existing `@PG` lines where samtools places it after them.
-- `markdup` does not yet support `--read-coords`/`--coords-order` (coordinates from a regex),
-  barcode options, or `--move-umi-to-tag`. With `-d`, duplicates whose names have no
-  coordinates are not compared with each other; samtools compares them using uninitialized
-  memory, so a chain mixing parseable and unparseable names can come out differently.
+- `markdup`: with `-d`, duplicates whose names have no coordinates are not compared with each
+  other; samtools compares them using uninitialized memory, so a chain mixing parseable and
+  unparseable names can come out differently. `--read-coords` and `--barcode-rgx` take Rust
+  `regex` syntax rather than POSIX extended regular expressions (the same for ordinary
+  patterns). Without `-S`, `--move-umi-to-tag` moves the UMI of every read; samtools 1.24 moves
+  only those of reads still buffered at the end of the input.
 
 ## Performance
 

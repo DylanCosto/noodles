@@ -33,6 +33,7 @@ noodles-fasta = { path = "../noodles-fasta" }
 noodles-pileup = { path = "../noodles-pileup" }
 noodles-sam = { path = "../noodles-sam" }
 noodles-util = { path = "../noodles-util", features = ["alignment"] }
+regex = { version = "1.10.0", default-features = false, features = ["std", "perf"] }
 tempfile = "3.10.0"
 
 [dev-dependencies]

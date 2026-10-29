@@ -125,6 +125,25 @@ if command -v python3 >/dev/null; then
     check "markdup -c -S -t -d 50 (remarking)" "$st markdup --no-PG -c -S -t -d 50 md.marked.bam - | $st view --no-PG -h -" "$nt markdup --no-PG -c -S -t -d 50 md.marked.bam - | $st view --no-PG -h -"
     check "markdup --json" "$st markdup --no-PG --json -S -d 100 --use-read-groups md.bam md.st.bam 2>&1 | grep '^ ' | grep -v COMMAND" "$nt markdup --no-PG --json -S -d 100 --use-read-groups md.bam md.nt.bam 2>&1 | grep '^ ' | grep -v COMMAND"
 
+    # Barcodes from tags and names, UMIs moved to RX, and coordinates from a regex
+    python3 "$scripts/markdup-test-data.py" 11 --barcodes > mdbc.sam
+    "$st" sort -n -o mdbc.name.bam mdbc.sam
+    "$st" fixmate -m mdbc.name.bam - | "$st" sort -o mdbc.bam -
+    "$st" view -h mdbc.bam | grep -v odd_name | "$st" view -b -o mdbc.named.bam -
+
+    # Options are eval'ed, so regexes are quoted inside them.
+    for opts in "--barcode-tag BC -S -t -d 100" "--barcode-name -t -d 100 --use-read-groups" "--barcode-name --move-umi-to-tag -S -t" "--barcode-rgx ':([ACGT]+)\$' --move-umi-to-tag -S"; do
+        check "markdup $opts" \
+            "$st markdup --no-PG -f st.md.stats $opts mdbc.bam - | $st view --no-PG -h -; tail -n +2 st.md.stats" \
+            "$nt markdup --no-PG -f nt.md.stats $opts mdbc.bam - | $st view --no-PG -h -; tail -n +2 nt.md.stats"
+    done
+
+    # Names without coordinates are removed: samtools fails on kept reads the regex does not match.
+    for opts in "--read-coords '([0-9]+):([0-9]+):([0-9]+)(:[ACGT]+)?\$' -d 100 -t" "--read-coords '^([^:]+:[^:]+):.*:([0-9]+):([0-9]+)(:[ACGT]+)?\$' --coords-order tyx -d 2500 -t -S --barcode-name"; do
+        check "markdup $opts" \
+            "$st markdup --no-PG -f st.md.stats $opts mdbc.named.bam - | $st view --no-PG -h -; tail -n +2 st.md.stats" \
+            "$nt markdup --no-PG -f nt.md.stats $opts mdbc.named.bam - | $st view --no-PG -h -; tail -n +2 nt.md.stats"
+    done
 fi
 check "collate grouping" "$st view $short | cut -f1 | sort -u | wc -l" "$nt collate --no-PG -O $short | $st view - | awk -F'\\t' '\$1 != p { print \$1; p = \$1 }' | sort | uniq | wc -l"
 
