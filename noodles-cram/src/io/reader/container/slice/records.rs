@@ -48,7 +48,7 @@ pub struct Records<'c, 'ch: 'c> {
     reference_sequence_context: ReferenceSequenceContext,
     id: u64,
     prev_alignment_start: Option<Position>,
-    resolved_tag_sets: Vec<Vec<(tag_sets::Key, &'ch Encoding<ByteArray>)>>,
+    resolved_tag_sets: Vec<Vec<(tag_sets::Key, TagDecoder<'ch>)>>,
 }
 
 impl<'c, 'ch: 'c> Records<'c, 'ch> {
@@ -64,7 +64,15 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
             _ => None,
         };
 
-        let resolved_tag_sets = resolve_tag_sets(compression_header)?;
+        let resolved_tag_sets = resolve_tag_sets(compression_header)?
+            .into_iter()
+            .map(|tag_set| {
+                tag_set
+                    .into_iter()
+                    .map(|(key, encoding)| (key, TagDecoder::new(encoding, &external_data_readers)))
+                    .collect()
+            })
+            .collect();
 
         Ok(Self {
             compression_header,
@@ -340,11 +348,10 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
 
         record.data.reserve(tag_set.len());
 
-        for (key, encoding) in tag_set {
-            let value = encoding
-                .decode(&mut self.core_data_reader, &mut self.external_data_readers)
-                .and_then(|src| self::data::read_value(src, key.ty()))?;
-
+        for (key, decoder) in tag_set {
+            let src =
+                decoder.decode(&mut self.core_data_reader, &mut self.external_data_readers)?;
+            let value = self::data::read_value(src, key.ty())?;
             record.data.push((key.tag(), value));
         }
 
@@ -654,6 +661,91 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
             Ok(Cow::from(&[]))
         } else {
             Ok(src)
+        }
+    }
+}
+
+/// How a tag's values are read: directly from an external block for the encodings htslib writes,
+/// otherwise through the generic byte array codec.
+enum TagDecoder<'ch> {
+    /// Values of a fixed length (a single-symbol Huffman length) from one external block.
+    FixedLength {
+        len: usize,
+        reader: usize,
+    },
+    /// Values ending at a stop byte in one external block.
+    Stop {
+        stop_byte: u8,
+        reader: usize,
+    },
+    Generic(&'ch Encoding<ByteArray>),
+}
+
+impl<'ch> TagDecoder<'ch> {
+    fn new(encoding: &'ch Encoding<ByteArray>, readers: &ExternalDataReaders<'_>) -> Self {
+        use crate::container::compression_header::encoding::codec::{Byte, Integer};
+
+        match encoding.get() {
+            ByteArray::ByteArrayLength {
+                len_encoding,
+                value_encoding,
+            } => {
+                if let (Integer::Huffman { alphabet, .. }, Byte::External { block_content_id }) =
+                    (len_encoding.get(), value_encoding.get())
+                    && let [len] = alphabet[..]
+                    && let Ok(len) = usize::try_from(len)
+                    && let Some(reader) = readers.index_of(block_content_id)
+                {
+                    return Self::FixedLength { len, reader };
+                }
+            }
+            ByteArray::ByteArrayStop {
+                stop_byte,
+                block_content_id,
+            } => {
+                if let Some(reader) = readers.index_of(block_content_id) {
+                    return Self::Stop {
+                        stop_byte: *stop_byte,
+                        reader,
+                    };
+                }
+            }
+        }
+
+        Self::Generic(encoding)
+    }
+
+    /// Reads a value as [`ByteArray`]'s `decode` does.
+    #[inline]
+    fn decode<'de>(
+        &self,
+        core_data_reader: &mut BitReader<'de>,
+        external_data_readers: &mut ExternalDataReaders<'de>,
+    ) -> io::Result<Cow<'de, [u8]>> {
+        match *self {
+            Self::FixedLength { len, reader } => {
+                let src = external_data_readers.get_mut_by_index(reader);
+                let buf = src
+                    .split_off(..len)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+                Ok(Cow::from(buf))
+            }
+            Self::Stop { stop_byte, reader } => {
+                let src = external_data_readers.get_mut_by_index(reader);
+
+                let Some(i) = src.iter().position(|&b| b == stop_byte) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "missing byte array stop byte",
+                    ));
+                };
+
+                let (buf, rest) = src.split_at(i);
+                *src = &rest[1..];
+
+                Ok(Cow::from(buf))
+            }
+            Self::Generic(encoding) => encoding.decode(core_data_reader, external_data_readers),
         }
     }
 }

@@ -42,6 +42,34 @@ impl<'c> ExternalDataReaders<'c> {
     }
 }
 
+impl<'c> ExternalDataReaders<'c> {
+    /// Returns a stable index of the reader for `id`, for [`Self::get_mut_by_index`].
+    pub(crate) fn index_of(&self, id: &block::ContentId) -> Option<usize> {
+        match *id {
+            i @ 0..LOW_READER_COUNT_I32 => self.low_readers[i as usize].map(|_| i as usize),
+            _ => self
+                .high_readers
+                .binary_search_by_key(id, |(i, _)| *i)
+                .ok()
+                .map(|i| LOW_READER_COUNT + i),
+        }
+    }
+
+    /// Returns the reader at an index from [`Self::index_of`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index is not one `index_of` returned for these readers.
+    pub(crate) fn get_mut_by_index(&mut self, i: usize) -> &mut &'c [u8] {
+        match i.checked_sub(LOW_READER_COUNT) {
+            None => self.low_readers[i]
+                .as_mut()
+                .expect("index_of returns present readers"),
+            Some(j) => &mut self.high_readers[j].1,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

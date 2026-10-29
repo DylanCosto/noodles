@@ -4,8 +4,7 @@ mod avx2;
 use std::io;
 
 use super::{
-    build_symbol_table, order_0, read_alphabet, read_states, renormalize_states, split_off,
-    state_renormalize,
+    order_0, read_alphabet, read_states, renormalize_states, split_off, state_renormalize,
 };
 use crate::{
     codecs::rans_nx16::ALPHABET_SIZE,
@@ -45,11 +44,49 @@ impl Tables {
     }
 }
 
-/// Packs a symbol and its [`build_symbol_table`] step into a [`Tables`] entry.
-fn pack_entry(sym: u8, step: u32) -> u32 {
-    let frequency = step >> 16;
-    let offset = step & 0xffff;
+/// Packs a symbol, its frequency, and a slot's offset into its range as a [`Tables`] entry.
+fn pack_entry(sym: u8, frequency: u32, offset: u32) -> u32 {
     u32::from(sym) | ((frequency.wrapping_sub(1) & 0xfff) << 8) | (offset << 20)
+}
+
+/// Fills `dst` (`1 << bits` entries) with the packed entries of [`super::build_symbol_table`]'s table,
+/// without building its two arrays first.
+fn build_entries(frequencies: &[u32; ALPHABET_SIZE], bits: u32, dst: &mut [u32]) -> io::Result<()> {
+    let total_frequency = 1 << bits;
+    let mut cumulative_frequency: u32 = 0;
+
+    for (sym, &f) in (0..=u8::MAX).zip(frequencies) {
+        let next_cumulative_frequency = cumulative_frequency
+            .checked_add(f)
+            .filter(|&n| n <= total_frequency)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid rANS Nx16 frequency table",
+                )
+            })?;
+
+        let range = cumulative_frequency as usize..next_cumulative_frequency as usize;
+
+        for (offset, entry) in (0..).zip(&mut dst[range]) {
+            *entry = pack_entry(sym, f, offset);
+        }
+
+        cumulative_frequency = next_cumulative_frequency;
+    }
+
+    // As in `build_symbol_table`, slots at or past the total frequency resolve to the last
+    // symbol.
+    let last_frequency = frequencies[usize::from(u8::MAX)];
+    let last_cumulative_frequency = cumulative_frequency - last_frequency;
+
+    for (slot, entry) in
+        (cumulative_frequency..).zip(dst.iter_mut().skip(cumulative_frequency as usize))
+    {
+        *entry = pack_entry(u8::MAX, last_frequency, slot - last_cumulative_frequency);
+    }
+
+    Ok(())
 }
 
 /// Advances a state with a [`Tables`] entry, before renormalization.
@@ -230,20 +267,13 @@ fn read_frequencies_inner(src: &mut &[u8], bits: u32) -> io::Result<Tables> {
     let mut entries = vec![0; (rows.len() + 1) * size];
     let mut offsets = [0; ALPHABET_SIZE];
 
-    let mut symbols = vec![0; size];
-    let mut steps = vec![0; size];
-
     let empty_row = [0; ALPHABET_SIZE];
     let tables = [(None, &empty_row)]
         .into_iter()
         .chain(rows.iter().map(|(context, fs)| (Some(*context), fs)));
 
     for (i, ((context, fs), dst)) in tables.zip(entries.chunks_exact_mut(size)).enumerate() {
-        build_symbol_table(fs, bits, &mut symbols, &mut steps)?;
-
-        for ((entry, &sym), &step) in dst.iter_mut().zip(&symbols).zip(&steps) {
-            *entry = pack_entry(sym, step);
-        }
+        build_entries(fs, bits, dst)?;
 
         if let Some(context) = context {
             // SAFETY: `i * size < (ALPHABET_SIZE + 1) << MAX_BITS`, which fits in a `u32`.
