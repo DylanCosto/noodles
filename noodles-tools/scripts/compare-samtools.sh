@@ -15,6 +15,7 @@ nt=$1
 st=$2
 corpus=$3
 work=${4:-$(mktemp -d)}
+scripts=$(cd "$(dirname "$0")" && pwd)
 
 mkdir -p "$work"
 cd "$work" || exit 2
@@ -108,6 +109,22 @@ check "fixmate -m -c -r -@4" "$st fixmate --no-PG -m -c -r short.name.bam - | $s
 "$st" fixmate -m --no-PG short.name.bam - | "$st" sort --no-PG -o fixed.bam -
 check "markdup" "$st markdup --no-PG fixed.bam - | $st view --no-PG -h -" "$nt markdup --no-PG fixed.bam /dev/stdout | $st view --no-PG -h -"
 check "markdup -c -m s" "$st markdup --no-PG -c -m s fixed.bam - | $st view --no-PG -h -" "$nt markdup --no-PG -c -m s fixed.bam /dev/stdout | $st view --no-PG -h -"
+# markdup -S/-t/-d on synthetic Illumina-style names (the corpus names have no coordinates)
+if command -v python3 >/dev/null; then
+    python3 "$scripts/markdup-test-data.py" 7 > md.sam
+    "$st" sort -n -o md.name.bam md.sam
+    "$st" fixmate -m md.name.bam - | "$st" sort -o md.bam -
+
+    for opts in "-S -t -d 100" "-t -d 100 -m s" "-S -d 2500 -r --duplicate-count" "-S -t -d 100 --use-read-groups --include-fails" "-t --no-multi-dup -d 100"; do
+        check "markdup $opts" \
+            "$st markdup --no-PG -f st.md.stats $opts md.bam - | $st view --no-PG -h -; tail -n +2 st.md.stats" \
+            "$nt markdup --no-PG -f nt.md.stats $opts md.bam - | $st view --no-PG -h -; tail -n +2 nt.md.stats"
+    done
+
+    "$st" markdup --no-PG -S -t -d 100 md.bam md.marked.bam 2>/dev/null
+    check "markdup -c -S -t -d 50 (remarking)" "$st markdup --no-PG -c -S -t -d 50 md.marked.bam - | $st view --no-PG -h -" "$nt markdup --no-PG -c -S -t -d 50 md.marked.bam - | $st view --no-PG -h -"
+    check "markdup --json" "$st markdup --no-PG --json -S -d 100 --use-read-groups md.bam md.st.bam 2>&1 | grep '^ ' | grep -v COMMAND" "$nt markdup --no-PG --json -S -d 100 --use-read-groups md.bam md.nt.bam 2>&1 | grep '^ ' | grep -v COMMAND"
+fi
 check "collate grouping" "$st view $short | cut -f1 | sort -u | wc -l" "$nt collate --no-PG -O $short | $st view - | awk -F'\\t' '\$1 != p { print \$1; p = \$1 }' | sort | uniq | wc -l"
 
 # reads

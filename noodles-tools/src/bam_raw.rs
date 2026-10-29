@@ -108,6 +108,57 @@ where
     Ok(())
 }
 
+/// Returns the byte range of the first auxiliary field with `tag`, including its tag and type.
+pub fn find_field(record: &[u8], tag: [u8; 2]) -> io::Result<Option<Range<usize>>> {
+    let data = data_range(record)?;
+    let mut start = data.start;
+
+    while start < record.len() {
+        let (field_tag, len) = next_field(&record[start..])?;
+
+        if field_tag == tag {
+            return Ok(Some(start..start + len));
+        }
+
+        start += len;
+    }
+
+    Ok(None)
+}
+
+/// Returns the value of the first field with `tag` if it is a string (`Z`) field, `Ok(None)` if
+/// there is no such field, and an error if it has another type.
+pub fn string_field(record: &[u8], tag: [u8; 2]) -> io::Result<Option<&[u8]>> {
+    match find_field(record, tag)? {
+        Some(range) if record[range.start + 2] == b'Z' => {
+            Ok(Some(&record[range.start + 3..range.end - 1]))
+        }
+        Some(_) => Err(invalid("not a string field")),
+        None => Ok(None),
+    }
+}
+
+/// Sets a string (`Z`) field as HTSlib's `bam_aux_update_str` does: an existing field is replaced
+/// in place, a new one is appended, and an existing field of another type is an error.
+pub fn update_string_field(record: &mut Vec<u8>, tag: [u8; 2], value: &[u8]) -> io::Result<()> {
+    const NUL: u8 = 0x00;
+
+    match find_field(record, tag)? {
+        Some(range) if record[range.start + 2] == b'Z' => {
+            record.splice(range.start + 3..range.end - 1, value.iter().copied());
+        }
+        Some(_) => return Err(invalid("not a string field")),
+        None => {
+            record.extend_from_slice(&tag);
+            record.push(b'Z');
+            record.extend_from_slice(value);
+            record.push(NUL);
+        }
+    }
+
+    Ok(())
+}
+
 fn truncated() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, "truncated BAM record")
 }
@@ -175,6 +226,48 @@ mod tests {
 
         let src = encode(&record)?;
         assert!(strip_fields(&src[..src.len() - 1], &mut dst, |_| false).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_string_field() -> io::Result<()> {
+        let record = |data: Vec<(Tag, Value)>| {
+            RecordBuf::builder()
+                .set_name("r0")
+                .set_data(data.into_iter().collect())
+                .build()
+        };
+
+        let nm = (Tag::from(*b"NM"), Value::from(1));
+        let as_ = (Tag::from(*b"AS"), Value::from(9));
+
+        // An existing field is replaced in place.
+        let mut buf = encode(&record(vec![
+            nm.clone(),
+            (Tag::from(*b"dt"), Value::from("LB")),
+            as_.clone(),
+        ]))?;
+        assert_eq!(string_field(&buf, *b"dt")?, Some(&b"LB"[..]));
+        update_string_field(&mut buf, *b"dt", b"SQ!")?;
+        let expected = record(vec![
+            nm.clone(),
+            (Tag::from(*b"dt"), Value::from("SQ!")),
+            as_.clone(),
+        ]);
+        assert_eq!(buf, encode(&expected)?);
+
+        // A new field is appended.
+        let mut buf = encode(&record(vec![nm.clone()]))?;
+        assert_eq!(string_field(&buf, *b"do")?, None);
+        update_string_field(&mut buf, *b"do", b"r1")?;
+        let expected = record(vec![nm.clone(), (Tag::from(*b"do"), Value::from("r1"))]);
+        assert_eq!(buf, encode(&expected)?);
+
+        // A field of another type is an error.
+        let mut buf = encode(&record(vec![nm]))?;
+        assert!(string_field(&buf, *b"NM").is_err());
+        assert!(update_string_field(&mut buf, *b"NM", b"x").is_err());
 
         Ok(())
     }

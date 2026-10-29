@@ -5,14 +5,20 @@
 //! the highest base quality score (plus the `ms` mate score from `fixmate -m`) is kept. Hash
 //! entries are removed only by the read that inserted them, as in samtools.
 //!
-//! Not yet supported: `-S` (supplementary marking), `-t` and `-d` (duplicate chains, optical
-//! duplicates), and barcodes.
+//! With `-t` or `-d`, the duplicates of each kept read form a chain that is checked when its
+//! first read leaves the window: `do` tags are pointed at the kept read, and duplicates close to
+//! each other on the flowcell (from Illumina read names) are retagged as optical. With `-S`,
+//! output goes through a temporary file, and a second pass marks the supplementary, secondary,
+//! and unmapped records of primary duplicates.
+//!
+//! Not yet supported: `--read-coords`/`--coords-order` (coordinates from a regex), barcodes, and
+//! `--move-umi-to-tag`.
 
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
-    io::{self, Write},
-    path::PathBuf,
+    io::{self, BufRead, Read as _, Write},
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, bail};
@@ -33,12 +39,16 @@ use noodles_sam::{
 use crate::{
     alignment::{AlignmentReader, ReadOptions, Rec},
     bam_raw::{self, field, le_u16, le_u32},
+    bgzf_stream::{BgzfReader, BgzfWriter},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     program,
 };
 
 /// Base qualities below this are not scored (`MD_MIN_QUALITY`).
 const MIN_SCORED_QUALITY: u8 = 15;
+
+/// Read name coordinate warnings reported before going quiet (`BMD_WARNING_MAX`).
+const MAX_WARNINGS: u64 = 10;
 
 // Orientations and read sides, the values samtools hashes.
 const O_FF: i8 = 2;
@@ -51,6 +61,11 @@ const R_RI: i8 = 13;
 const MATE_CIGAR: Tag = Tag::new(b'M', b'C');
 const MATE_SCORE: Tag = Tag::new(b'm', b's');
 const DUPLICATE_COUNT: Tag = Tag::new(b'd', b'c');
+
+const ORIGINAL_NAME: [u8; 2] = *b"do";
+const DUPLICATE_TYPE: [u8; 2] = *b"dt";
+const OPTICAL: &[u8] = b"SQ";
+const LIBRARY: &[u8] = b"LB";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
 enum Mode {
@@ -65,7 +80,7 @@ pub struct Args {
     /// Coordinate-sorted input, after `fixmate -m`.
     input: String,
 
-    /// Output file.
+    /// Output file (`-` for stdout).
     output: PathBuf,
 
     /// Remove duplicate reads.
@@ -83,6 +98,31 @@ pub struct Args {
     /// Write statistics to this file (implies -s).
     #[arg(short = 'f')]
     stats_file: Option<PathBuf>,
+
+    /// Write statistics as JSON (implies -s).
+    #[arg(long = "json")]
+    json: bool,
+
+    /// Also mark the supplementary, secondary, and unmapped records of duplicates.
+    #[arg(short = 'S')]
+    supplementary: bool,
+
+    /// Tag duplicates with the name of the read they duplicate (do), and with dt when using -d.
+    #[arg(short = 't')]
+    tag: bool,
+
+    /// Mark duplicates within this many pixels of each other (from Illumina read names) as
+    /// optical (dt:Z:SQ; others dt:Z:LB). 0 disables.
+    #[arg(short = 'd', default_value_t = 0)]
+    optical_distance: i64,
+
+    /// Do not check duplicates of the same read against each other (with -t or -d).
+    #[arg(long = "no-multi-dup")]
+    no_multi_dup: bool,
+
+    /// Prefix for the temporary file -S writes [default: next to the output].
+    #[arg(short = 'T')]
+    temp_prefix: Option<PathBuf>,
 
     /// Clear existing duplicate flags and dt/do tags.
     #[arg(short = 'c')]
@@ -150,6 +190,45 @@ struct Read {
     single_key: Option<Key>,
     duplicate_count: i64,
     read_group: usize,
+    /// The next read in this read's duplicate chain, by ID (`-t`/`-d`).
+    duplicate: Option<u64>,
+    /// The read this one was found to duplicate, by ID.
+    original: Option<u64>,
+    /// Whether this read's chain has been checked.
+    dup_checked: bool,
+}
+
+/// `dup_map_t`: a primary duplicate whose other records `-S` marks too.
+struct DuplicateName {
+    /// The kept read's name, for `do` tags (with `-t`).
+    original: Option<Vec<u8>>,
+    optical: bool,
+    read_group: usize,
+}
+
+/// `check_t`: a duplicate in a chain being checked for optical duplicates.
+struct Check {
+    id: u64,
+    name: Vec<u8>,
+    /// The part of the name (lane and tile) that must match for an optical duplicate.
+    prefix: Vec<u8>,
+    x: i64,
+    y: i64,
+    /// Whether `x`, `y`, and `prefix` were read from the name.
+    has_coordinates: bool,
+    optical: bool,
+    paired: bool,
+    qc_fail: bool,
+    score: i64,
+    mate_score: i64,
+}
+
+/// Flowcell coordinates parsed from a read name.
+struct Coordinates {
+    /// The end of the prefix (lane and tile) that must match.
+    prefix_end: usize,
+    x: i64,
+    y: i64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -162,6 +241,59 @@ struct Stats {
     single: i64,
     duplicate: i64,
     single_duplicate: i64,
+    optical: i64,
+    single_optical: i64,
+    non_primary_duplicate: i64,
+    non_primary_optical: i64,
+}
+
+impl Stats {
+    fn add(mut self, other: &Self) -> Self {
+        self.reading += other.reading;
+        self.writing += other.writing;
+        self.excluded += other.excluded;
+        self.examined += other.examined;
+        self.pair += other.pair;
+        self.single += other.single;
+        self.duplicate += other.duplicate;
+        self.single_duplicate += other.single_duplicate;
+        self.optical += other.optical;
+        self.single_optical += other.single_optical;
+        self.non_primary_duplicate += other.non_primary_duplicate;
+        self.non_primary_optical += other.non_primary_optical;
+        self
+    }
+}
+
+/// Which optical duplicate count a marked duplicate adds to.
+#[derive(Clone, Copy, Debug)]
+enum DuplicateKind {
+    Pair,
+    Single,
+}
+
+/// Where written reads go.
+enum Output {
+    Writer(AlignmentWriter),
+    /// With `-S`, `block_size`-prefixed BAM records in a temporary file, for the second pass.
+    Temp {
+        writer: AlignmentWriter,
+        temp: BgzfWriter<File>,
+    },
+}
+
+impl Output {
+    fn write(&mut self, header: &sam::Header, record: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Writer(writer) => writer.write_raw(header, record),
+            Self::Temp { temp, .. } => {
+                let block_size = u32::try_from(record.len())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+                temp.write_all(&block_size.to_le_bytes())?;
+                temp.write_all(record)
+            }
+        }
+    }
 }
 
 struct Markdup {
@@ -171,7 +303,11 @@ struct Markdup {
     front_id: u64,
     pair_hash: HashMap<Key, u64>,
     single_hash: HashMap<Key, u64>,
+    /// Primary duplicates that `-S` looks up by name.
+    duplicates: HashMap<Vec<u8>, DuplicateName>,
     stats: Vec<Stats>,
+    /// Failed attempts to read coordinates from read names.
+    warnings: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -180,6 +316,11 @@ struct Options {
     max_length: i64,
     mode: Mode,
     duplicate_count: bool,
+    tag: bool,
+    optical_distance: i64,
+    supplementary: bool,
+    /// Whether duplicate chains are built and checked (`-t` or `-d`, without `--no-multi-dup`).
+    check_chain: bool,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -232,18 +373,39 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut writer = AlignmentWriter::create(Some(&args.output), &write_options, &header)?;
     writer.write_header(&header)?;
 
+    let optical_distance = args.optical_distance.max(0);
+
+    let mut out = if args.supplementary {
+        let dir = temp_dir(args.temp_prefix.as_deref(), &args.output);
+        let file = tempfile::tempfile_in(dir)
+            .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
+
+        Output::Temp {
+            writer,
+            temp: BgzfWriter::new(file, output::parse_level(1)?, args.threads),
+        }
+    } else {
+        Output::Writer(writer)
+    };
+
     let mut state = Markdup {
         options: Options {
             remove: args.remove,
             max_length: args.max_length,
             mode: args.mode,
             duplicate_count: args.duplicate_count,
+            tag: args.tag,
+            optical_distance,
+            supplementary: args.supplementary,
+            check_chain: !args.no_multi_dup && (args.tag || optical_distance > 0),
         },
         reads: VecDeque::new(),
         front_id: 0,
         pair_hash: HashMap::new(),
         single_hash: HashMap::new(),
+        duplicates: HashMap::new(),
         stats: vec![Stats::default(); group_count + 1],
+        warnings: 0,
     };
 
     let exclude = if args.include_fails {
@@ -258,7 +420,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut cleared = Vec::new();
 
     reader.for_each(&header.clone(), |rec| {
-        let raw: Vec<u8> = match &rec {
+        let mut raw: Vec<u8> = match &rec {
             Rec::Bam(r) => r.as_ref().to_vec(),
             _ => {
                 encoder.get_mut().clear();
@@ -267,12 +429,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             }
         };
 
-        let mut raw = raw;
-
         if args.clear && flags_of(&raw).is_duplicate() {
             let flags = flags_of(&raw) - Flags::DUPLICATE;
             set_flags(&mut raw, flags);
-            bam_raw::strip_fields(&raw, &mut cleared, |tag| tag == *b"dt" || tag == *b"do")?;
+            bam_raw::strip_fields(&raw, &mut cleared, |tag| {
+                tag == DUPLICATE_TYPE || tag == ORIGINAL_NAME
+            })?;
             std::mem::swap(&mut raw, &mut cleared);
         }
 
@@ -305,9 +467,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             single_key: None,
             duplicate_count: 1,
             read_group,
+            duplicate: None,
+            original: None,
+            dup_checked: false,
         });
 
-        let flags = flags_of(state.reads.back().expect("just pushed").record.as_ref());
+        let flags = flags_of(state.get(id).record.as_ref());
 
         if flags.intersects(exclude) {
             state.stats[read_group].excluded += 1;
@@ -316,15 +481,32 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             state.examine(id, read_group)?;
         }
 
-        state.flush(prev_tid, prev_coord, &header, &mut writer)?;
+        state.flush(prev_tid, prev_coord, &header, &mut out)?;
 
         Ok(())
     })?;
 
-    state.flush_all(&header, &mut writer)?;
+    state.flush_all(&header, &mut out)?;
+
+    let writer = match out {
+        Output::Writer(writer) => writer,
+        Output::Temp { mut writer, temp } => {
+            let file = temp.finish()?;
+            state.mark_non_primary(file, args.threads, &header, &mut writer)?;
+            writer
+        }
+    };
+
     writer.finish(&header)?;
 
-    if args.stats || args.stats_file.is_some() {
+    if state.warnings > 0 {
+        eprintln!(
+            "[markdup] warning, number of failed attempts to get coordinates from read names = {}",
+            state.warnings
+        );
+    }
+
+    if args.stats || args.stats_file.is_some() || args.json {
         let mut out: Box<dyn Write> = match &args.stats_file {
             Some(path) => Box::new(
                 File::create(path).with_context(|| format!("creating {}", path.display()))?,
@@ -333,36 +515,57 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         };
 
         let command_line = std::env::args().collect::<Vec<_>>().join(" ");
+        let total = state.stats.iter().fold(Stats::default(), Stats::add);
+        let group_names: Vec<String> = header
+            .read_groups()
+            .keys()
+            .map(|id| id.to_string())
+            .collect();
 
-        let total = state.stats.iter().fold(Stats::default(), |mut t, s| {
-            t.reading += s.reading;
-            t.writing += s.writing;
-            t.excluded += s.excluded;
-            t.examined += s.examined;
-            t.pair += s.pair;
-            t.single += s.single;
-            t.duplicate += s.duplicate;
-            t.single_duplicate += s.single_duplicate;
-            t
-        });
+        if args.json {
+            write_json_report(
+                &mut out,
+                &command_line,
+                &total,
+                args.use_read_groups,
+                &state.stats,
+                &group_names,
+            )?;
+        } else {
+            write_stats(&mut out, "COMMAND: ", &command_line, &total)?;
+            writeln!(out)?;
 
-        write_stats(&mut out, "COMMAND: ", &command_line, &total)?;
-        writeln!(out)?;
+            if args.use_read_groups {
+                if state.stats[0].reading > 0 {
+                    write_stats(&mut out, "READ GROUP: ", "ungrouped", &state.stats[0])?;
+                    writeln!(out)?;
+                }
 
-        if args.use_read_groups {
-            if state.stats[0].reading > 0 {
-                write_stats(&mut out, "READ GROUP: ", "ungrouped", &state.stats[0])?;
-                writeln!(out)?;
-            }
-
-            for (id, stats) in header.read_groups().keys().zip(&state.stats[1..]) {
-                write_stats(&mut out, "READ GROUP: ", &id.to_string(), stats)?;
-                writeln!(out)?;
+                for (id, stats) in group_names.iter().zip(&state.stats[1..]) {
+                    write_stats(&mut out, "READ GROUP: ", id, stats)?;
+                    writeln!(out)?;
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// The directory for `-S`'s temporary file: the `-T` prefix's, else the output's, else the current
+/// directory (for stdout).
+fn temp_dir<'a>(prefix: Option<&'a Path>, output: &'a Path) -> &'a Path {
+    let is_stdout = output == Path::new("-") || output.starts_with("/dev");
+
+    let dir = match prefix {
+        Some(prefix) if prefix.is_dir() => Some(prefix),
+        Some(prefix) => prefix.parent(),
+        None if is_stdout => None,
+        None => output.parent(),
+    };
+
+    dir.filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 impl Markdup {
@@ -376,44 +579,79 @@ impl Markdup {
             .and_then(|i| self.reads.get_mut(usize::try_from(i).ok()?))
     }
 
+    /// A read that hashes or duplicate chains refer to, which stays buffered until written.
+    fn get(&self, id: u64) -> &Read {
+        self.read(id)
+            .expect("hashed and chained reads are buffered")
+    }
+
+    fn get_mut(&mut self, id: u64) -> &mut Read {
+        self.read_mut(id)
+            .expect("hashed and chained reads are buffered")
+    }
+
+    /// Edits a buffered read's encoded record.
+    fn edit<F>(&mut self, id: u64, f: F) -> io::Result<()>
+    where
+        F: FnOnce(&mut Vec<u8>) -> io::Result<()>,
+    {
+        let read = self.get_mut(id);
+        let mut raw = Vec::from(std::mem::take(&mut read.record));
+        let result = f(&mut raw);
+        read.record = bam::Record::try_from(raw)?;
+        result
+    }
+
+    /// The last read in the duplicate chain starting at `id`.
+    fn chain_end(&self, mut id: u64) -> u64 {
+        while let Some(next) = self.get(id).duplicate {
+            id = next;
+        }
+
+        id
+    }
+
     /// Keys the read and resolves duplicates against earlier reads with the same key.
     fn examine(&mut self, id: u64, read_group: usize) -> anyhow::Result<()> {
         let read_group_key = i32::try_from(read_group).unwrap_or(i32::MAX);
-        let record = &self.read(id).expect("examined read is buffered").record;
+        let chain = self.options.check_chain;
+        let record = &self.get(id).record;
 
         if has_mate(record) {
             let pair_key = make_pair_key(record, self.options.mode, read_group_key)?;
             let single_key = make_single_key(record, read_group_key);
 
             self.stats[read_group].pair += 1;
-            self.read_mut(id).expect("buffered").pos = single_key.this_coord;
+            self.get_mut(id).pos = single_key.this_coord;
 
-            // A paired read replaces a single read at its position, which becomes a duplicate.
+            // A single read at a paired read's position is a duplicate, whatever its score.
             match self.existing(&self.single_hash, &single_key) {
                 None => {
                     self.single_hash.insert(single_key, id);
-                    self.read_mut(id).expect("buffered").single_key = Some(single_key);
+                    self.get_mut(id).single_key = Some(single_key);
                 }
-                Some(other) => {
-                    if !has_mate(&self.read(other).expect("buffered").record) {
-                        self.single_hash.insert(single_key, id);
-                        let other_count = self.read(other).expect("buffered").duplicate_count;
-                        let _ = other_count;
-                        self.read_mut(id).expect("buffered").duplicate_count += 1;
-                        self.mark_duplicate(other);
-                        self.stats[read_group].single_duplicate += 1;
+                Some(other) if !has_mate(&self.get(other).record) => {
+                    if chain {
+                        self.get_mut(id).duplicate = Some(other);
+                        self.get_mut(other).original = Some(id);
                     }
+
+                    self.single_hash.insert(single_key, id);
+                    self.get_mut(id).duplicate_count += 1;
+                    self.mark_duplicate(id, other, read_group, DuplicateKind::Single)?;
+                    self.stats[read_group].single_duplicate += 1;
                 }
+                Some(_) => {}
             }
 
             match self.existing(&self.pair_hash, &pair_key) {
                 None => {
                     self.pair_hash.insert(pair_key, id);
-                    self.read_mut(id).expect("buffered").pair_key = Some(pair_key);
+                    self.get_mut(id).pair_key = Some(pair_key);
                 }
                 Some(other) => {
-                    let old = &self.read(other).expect("buffered").record;
-                    let new = &self.read(id).expect("buffered").record;
+                    let old = &self.get(other).record;
+                    let new = &self.get(id).record;
 
                     let (old_score, new_score) = if flags_of(old.as_ref()).is_qc_fail()
                         != flags_of(new.as_ref()).is_qc_fail()
@@ -440,16 +678,46 @@ impl Markdup {
                         0
                     };
 
-                    if new_score + tie_add > old_score {
-                        let other_count = self.read(other).expect("buffered").duplicate_count;
-                        self.read_mut(id).expect("buffered").duplicate_count += other_count;
-                        self.pair_hash.insert(pair_key, id);
-                        self.mark_duplicate(other);
-                    } else {
-                        self.read_mut(other).expect("buffered").duplicate_count += 1;
-                        self.mark_duplicate(id);
-                    }
+                    let (original, duplicate) = if new_score + tie_add > old_score {
+                        let other_count = self.get(other).duplicate_count;
+                        self.get_mut(id).duplicate_count += other_count;
 
+                        if chain {
+                            match self.get(id).duplicate {
+                                Some(first) => {
+                                    let last = self.chain_end(first);
+                                    self.get_mut(last).duplicate = Some(other);
+                                }
+                                None => self.get_mut(id).duplicate = Some(other),
+                            }
+
+                            self.get_mut(other).original = Some(id);
+                        }
+
+                        self.pair_hash.insert(pair_key, id);
+                        (id, other)
+                    } else {
+                        if chain {
+                            // The new read goes first in the kept read's chain, followed by the
+                            // kept read's duplicates and then the new read's own.
+                            if let Some(other_first) = self.get(other).duplicate {
+                                if let Some(own_first) = self.get(id).duplicate {
+                                    let last = self.chain_end(other_first);
+                                    self.get_mut(last).duplicate = Some(own_first);
+                                }
+
+                                self.get_mut(id).duplicate = Some(other_first);
+                            }
+
+                            self.get_mut(other).duplicate = Some(id);
+                            self.get_mut(id).original = Some(other);
+                        }
+
+                        self.get_mut(other).duplicate_count += 1;
+                        (other, id)
+                    };
+
+                    self.mark_duplicate(original, duplicate, read_group, DuplicateKind::Pair)?;
                     self.stats[read_group].duplicate += 1;
                 }
             }
@@ -457,34 +725,47 @@ impl Markdup {
             let single_key = make_single_key(record, read_group_key);
 
             self.stats[read_group].single += 1;
-            self.read_mut(id).expect("buffered").pos = single_key.this_coord;
+            self.get_mut(id).pos = single_key.this_coord;
 
             match self.existing(&self.single_hash, &single_key) {
                 None => {
                     self.single_hash.insert(single_key, id);
-                    self.read_mut(id).expect("buffered").single_key = Some(single_key);
+                    self.get_mut(id).single_key = Some(single_key);
                 }
                 Some(other) => {
-                    if has_mate(&self.read(other).expect("buffered").record) {
-                        self.read_mut(other).expect("buffered").duplicate_count += 1;
-                        self.mark_duplicate(id);
-                    } else {
-                        let old_score =
-                            read_score(self.read(other).expect("buffered").record.as_ref());
-                        let new_score =
-                            read_score(self.read(id).expect("buffered").record.as_ref());
+                    let other_is_paired = has_mate(&self.get(other).record);
 
-                        if new_score > old_score {
-                            let other_count = self.read(other).expect("buffered").duplicate_count;
-                            self.read_mut(id).expect("buffered").duplicate_count += other_count;
-                            self.single_hash.insert(single_key, id);
-                            self.mark_duplicate(other);
-                        } else {
-                            self.read_mut(other).expect("buffered").duplicate_count += 1;
-                            self.mark_duplicate(id);
+                    let new_wins = !other_is_paired
+                        && read_score(self.get(id).record.as_ref())
+                            > read_score(self.get(other).record.as_ref());
+
+                    let (original, duplicate) = if new_wins {
+                        let other_count = self.get(other).duplicate_count;
+                        self.get_mut(id).duplicate_count += other_count;
+
+                        if chain {
+                            self.get_mut(id).duplicate = Some(other);
+                            self.get_mut(other).original = Some(id);
                         }
-                    }
 
+                        self.single_hash.insert(single_key, id);
+                        (id, other)
+                    } else {
+                        // Against one of a pair, a single read is always the duplicate.
+                        if chain {
+                            if let Some(other_first) = self.get(other).duplicate {
+                                self.get_mut(id).duplicate = Some(other_first);
+                            }
+
+                            self.get_mut(other).duplicate = Some(id);
+                            self.get_mut(id).original = Some(other);
+                        }
+
+                        self.get_mut(other).duplicate_count += 1;
+                        (other, id)
+                    };
+
+                    self.mark_duplicate(original, duplicate, read_group, DuplicateKind::Single)?;
                     self.stats[read_group].single_duplicate += 1;
                 }
             }
@@ -498,12 +779,315 @@ impl Markdup {
         hash.get(key).copied().filter(|&id| self.read(id).is_some())
     }
 
-    fn mark_duplicate(&mut self, id: u64) {
-        let read = self.read_mut(id).expect("duplicate is buffered");
-        let mut raw = std::mem::take(&mut read.record).as_ref().to_vec();
-        let flags = flags_of(&raw) | Flags::DUPLICATE;
-        set_flags(&mut raw, flags);
-        read.record = bam::Record::try_from(raw).expect("flag edits keep records valid");
+    /// `mark_duplicates`: flags `duplicate`, tags it (`-t`, `-d`), and records it for `-S`.
+    fn mark_duplicate(
+        &mut self,
+        original: u64,
+        duplicate: u64,
+        read_group: usize,
+        kind: DuplicateKind,
+    ) -> anyhow::Result<()> {
+        let options = self.options;
+        let incoming_warnings = self.warnings;
+        let original_name = name(self.get(original).record.as_ref()).to_vec();
+        let duplicate_name = name(self.get(duplicate).record.as_ref()).to_vec();
+
+        let is_optical = options.optical_distance > 0
+            && is_optical_duplicate(
+                &original_name,
+                &duplicate_name,
+                options.optical_distance,
+                &mut self.warnings,
+            );
+
+        let mut tag_result = Ok(());
+
+        self.edit(duplicate, |raw| {
+            let flags = flags_of(raw) | Flags::DUPLICATE;
+            set_flags(raw, flags);
+
+            if options.tag {
+                tag_result = bam_raw::update_string_field(raw, ORIGINAL_NAME, &original_name);
+            }
+
+            if options.optical_distance > 0 {
+                let duplicate_type = if is_optical { OPTICAL } else { LIBRARY };
+                // As in samtools, a dt field of another type is left as it is.
+                let _ = bam_raw::update_string_field(raw, DUPLICATE_TYPE, duplicate_type);
+            }
+
+            Ok(())
+        })?;
+
+        tag_result.context("[markdup] error, unable to append 'do' tag.")?;
+
+        if is_optical {
+            let stats = &mut self.stats[read_group];
+
+            match kind {
+                DuplicateKind::Pair => stats.optical += 1,
+                DuplicateKind::Single => stats.single_optical += 1,
+            }
+        }
+
+        if self.warnings == MAX_WARNINGS && incoming_warnings != self.warnings {
+            eprintln!(
+                "[markdup] warning, {} decipher read name warnings.  New warnings will not be \
+                 reported.",
+                self.warnings
+            );
+        }
+
+        if options.supplementary && has_other_records(self.get(duplicate).record.as_ref())? {
+            self.duplicates
+                .entry(duplicate_name)
+                .or_insert_with(|| DuplicateName {
+                    original: options.tag.then_some(original_name),
+                    optical: is_optical,
+                    read_group,
+                });
+        }
+
+        Ok(())
+    }
+
+    /// `optical_retag`: changes a duplicate's type to optical.
+    fn retag_optical(&mut self, id: u64, read_group: usize) -> anyhow::Result<()> {
+        self.edit(id, |raw| {
+            bam_raw::update_string_field(raw, DUPLICATE_TYPE, OPTICAL)
+        })
+        .context("[markdup] error, unable to update 'dt' tag.")?;
+
+        let record = &self.get(id).record;
+        let paired = has_mate(record);
+        let marks_others = self.options.supplementary && has_other_records(record.as_ref())?;
+        let read_name = name(record.as_ref()).to_vec();
+
+        if paired {
+            self.stats[read_group].optical += 1;
+        } else {
+            self.stats[read_group].single_optical += 1;
+        }
+
+        if marks_others {
+            match self.duplicates.get_mut(&read_name) {
+                Some(entry) => entry.optical = true,
+                None => bail!(
+                    "[markdup] error, duplicate name {} not found in hash.",
+                    String::from_utf8_lossy(&read_name)
+                ),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// `find_duplicate_chains`: checks the chain of the read that `id` duplicates (or is).
+    fn check_chain(&mut self, id: u64) -> anyhow::Result<()> {
+        let mut root = id;
+
+        while let Some(original) = self.get(root).original {
+            root = original;
+        }
+
+        let read_group = self.get(root).read_group;
+
+        // A kept read whose name has no coordinates leaves the chain unchecked for optical
+        // duplicates.
+        if let Some(checks) = self.check_chain_against_original(root, read_group)?
+            && self.options.optical_distance > 0
+        {
+            self.check_duplicate_chain(checks, read_group)?;
+        }
+
+        Ok(())
+    }
+
+    /// `check_chain_against_original`: points `do` tags at the kept read, retags duplicates
+    /// optically close to it, and collects the chain for [`Self::check_duplicate_chain`]. Returns
+    /// `None` if the kept read's name has no coordinates.
+    fn check_chain_against_original(
+        &mut self,
+        root: u64,
+        read_group: usize,
+    ) -> anyhow::Result<Option<Vec<Check>>> {
+        let options = self.options;
+        let original_name = name(self.get(root).record.as_ref()).to_vec();
+
+        let original_coordinates = if options.optical_distance > 0 {
+            coordinates(&original_name, &mut self.warnings)
+        } else {
+            None
+        };
+
+        let coordinates_failed = options.optical_distance > 0 && original_coordinates.is_none();
+
+        let mut checks = Vec::new();
+        let mut current = self.get(root).duplicate;
+
+        while let Some(id) = current {
+            self.get_mut(id).dup_checked = true;
+
+            let raw = self.get(id).record.as_ref();
+            let paired = has_mate(&self.get(id).record);
+            let read_name = name(raw).to_vec();
+
+            let mut check = Check {
+                id,
+                name: read_name.clone(),
+                prefix: Vec::new(),
+                x: -1,
+                y: -1,
+                has_coordinates: false,
+                optical: false,
+                paired,
+                qc_fail: flags_of(raw).is_qc_fail(),
+                score: 0,
+                mate_score: 0,
+            };
+
+            if options.tag {
+                let needs_update = match bam_raw::string_field(raw, ORIGINAL_NAME) {
+                    Ok(Some(name)) => name != original_name,
+                    Ok(None) => false,
+                    Err(_) => bail!(
+                        "[markdup] error, 'do' tag has wrong type for read {}.",
+                        String::from_utf8_lossy(&read_name)
+                    ),
+                };
+
+                if needs_update {
+                    self.edit(id, |raw| {
+                        bam_raw::update_string_field(raw, ORIGINAL_NAME, &original_name)
+                    })
+                    .context("[markdup] error, unable to update 'do' tag.")?;
+                }
+            }
+
+            if let Some(original) = &original_coordinates {
+                let raw = self.get(id).record.as_ref();
+                check.optical = matches!(bam_raw::string_field(raw, DUPLICATE_TYPE), Ok(Some(t)) if t == OPTICAL);
+
+                let is_optical = optical_duplicate_partial(
+                    &original_name,
+                    original,
+                    &read_name,
+                    &mut check,
+                    options.optical_distance,
+                    &mut self.warnings,
+                );
+
+                if !check.optical && is_optical {
+                    self.retag_optical(id, read_group)?;
+                    check.optical = true;
+                }
+
+                let record = &self.get(id).record;
+                check.score = read_score(record.as_ref());
+
+                if paired {
+                    check.mate_score = mate_score(record)?;
+                }
+            }
+
+            current = self.get(id).duplicate;
+            checks.push(check);
+        }
+
+        self.get_mut(root).dup_checked = true;
+
+        Ok((!coordinates_failed).then_some(checks))
+    }
+
+    /// `check_duplicate_chain`: checks the duplicates of one kept read against each other, and
+    /// retags the worse of each optically close pair.
+    fn check_duplicate_chain(
+        &mut self,
+        mut checks: Vec<Check>,
+        read_group: usize,
+    ) -> anyhow::Result<()> {
+        let distance = self.options.optical_distance;
+
+        // samtools compares duplicates whose names have no coordinates using whatever its check
+        // list held before (uninitialized fields), so leaving them out is the closest match.
+        checks.retain(|check| check.has_coordinates);
+
+        // `chain_sort`, which compares x as an `int` difference. The sort is stable, as glibc's
+        // `qsort` is when it can allocate.
+        checks.sort_by(|a, b| {
+            a.prefix
+                .len()
+                .cmp(&b.prefix.len())
+                .then_with(|| a.prefix.cmp(&b.prefix))
+                .then_with(|| ((a.x - b.x) as i32).cmp(&0))
+        });
+
+        let len = checks.len();
+        let mut curr = 0;
+
+        while curr + 1 < len {
+            // As in samtools, only a same-length prefix that differs ends the group.
+            let mut end = curr + 1;
+
+            while end < len
+                && !(checks[curr].prefix.len() == checks[end].prefix.len()
+                    && checks[curr].prefix != checks[end].prefix)
+            {
+                end += 1;
+            }
+
+            while curr < end {
+                let mut count = curr + 1;
+
+                while count < end && checks[count].x - checks[curr].x <= distance {
+                    let (current, chk) = (&checks[curr], &checks[count]);
+
+                    if (current.optical && chk.optical) || (current.y - chk.y).abs() > distance {
+                        count += 1;
+                        continue;
+                    }
+
+                    let chk_is_duplicate = if current.paired != chk.paired {
+                        // A single read is the duplicate of a pair.
+                        !chk.paired
+                    } else {
+                        let (current_score, mut chk_score) = if current.qc_fail != chk.qc_fail {
+                            if current.qc_fail { (0, 1) } else { (1, 0) }
+                        } else if current.paired {
+                            (
+                                current.score + current.mate_score,
+                                chk.score + chk.mate_score,
+                            )
+                        } else {
+                            (current.score, chk.score)
+                        };
+
+                        if current_score == chk_score {
+                            if chk.name < current.name {
+                                chk_score += 1;
+                            } else {
+                                chk_score -= 1;
+                            }
+                        }
+
+                        current_score > chk_score
+                    };
+
+                    let retag = if chk_is_duplicate { count } else { curr };
+
+                    if !checks[retag].optical {
+                        self.retag_optical(checks[retag].id, read_group)?;
+                        checks[retag].optical = true;
+                    }
+
+                    count += 1;
+                }
+
+                curr += 1;
+            }
+        }
+
+        Ok(())
     }
 
     /// Writes reads that can no longer gain duplicates: those behind the window.
@@ -512,7 +1096,7 @@ impl Markdup {
         prev_tid: i32,
         prev_coord: i64,
         header: &sam::Header,
-        writer: &mut AlignmentWriter,
+        out: &mut Output,
     ) -> anyhow::Result<()> {
         while let Some(front) = self.reads.front() {
             let in_window = front.pos + self.options.max_length > prev_coord
@@ -523,29 +1107,31 @@ impl Markdup {
                 break;
             }
 
-            self.write_front(header, writer)?;
+            self.write_front(header, out)?;
         }
 
         Ok(())
     }
 
-    fn flush_all(
-        &mut self,
-        header: &sam::Header,
-        writer: &mut AlignmentWriter,
-    ) -> anyhow::Result<()> {
+    fn flush_all(&mut self, header: &sam::Header, out: &mut Output) -> anyhow::Result<()> {
         while !self.reads.is_empty() {
-            self.write_front(header, writer)?;
+            self.write_front(header, out)?;
         }
 
         Ok(())
     }
 
-    fn write_front(
-        &mut self,
-        header: &sam::Header,
-        writer: &mut AlignmentWriter,
-    ) -> anyhow::Result<()> {
+    fn write_front(&mut self, header: &sam::Header, out: &mut Output) -> anyhow::Result<()> {
+        let front = self.reads.front().expect("front exists");
+
+        if self.options.check_chain
+            && !front.dup_checked
+            && (front.original.is_some() || front.duplicate.is_some())
+        {
+            self.check_chain(self.front_id)
+                .context("[markdup] error, duplicate checking failed.")?;
+        }
+
         let read = self.reads.pop_front().expect("front exists");
         self.front_id += 1;
 
@@ -556,9 +1142,9 @@ impl Markdup {
                 let mut raw = Vec::new();
                 bam_raw::strip_fields(read.record.as_ref(), &mut raw, |tag| tag == *b"dc")?;
                 append_integer_tag(&mut raw, DUPLICATE_COUNT, read.duplicate_count);
-                writer.write_raw(header, &raw)?;
+                out.write(header, &raw)?;
             } else {
-                writer.write_raw(header, read.record.as_ref())?;
+                out.write(header, read.record.as_ref())?;
             }
 
             self.stats[read.read_group].writing += 1;
@@ -574,6 +1160,222 @@ impl Markdup {
 
         Ok(())
     }
+
+    /// The `-S` second pass: marks the supplementary, secondary, and unmapped records of primary
+    /// duplicates, and writes every record from the temporary file.
+    fn mark_non_primary(
+        &mut self,
+        mut file: File,
+        threads: usize,
+        header: &sam::Header,
+        writer: &mut AlignmentWriter,
+    ) -> anyhow::Result<()> {
+        use std::io::Seek as _;
+
+        file.rewind()?;
+
+        let mut reader = BgzfReader::new(file, threads);
+        let mut raw = Vec::new();
+        let mut buf = [0; size_of::<u32>()];
+
+        while !reader.fill_buf()?.is_empty() {
+            reader.read_exact(&mut buf)?;
+            let block_size = usize::try_from(u32::from_le_bytes(buf))?;
+            raw.resize(block_size, 0);
+            reader.read_exact(&mut raw)?;
+
+            let flags = flags_of(&raw);
+
+            if flags.intersects(Flags::SUPPLEMENTARY | Flags::UNMAPPED | Flags::SECONDARY)
+                && let Some(entry) = self.duplicates.get(name(&raw))
+            {
+                let (original, optical, read_group) =
+                    (entry.original.clone(), entry.optical, entry.read_group);
+
+                set_flags(&mut raw, flags | Flags::DUPLICATE);
+                self.stats[read_group].non_primary_duplicate += 1;
+
+                if self.options.tag
+                    && let Some(original) = original
+                {
+                    bam_raw::update_string_field(&mut raw, ORIGINAL_NAME, &original)
+                        .context("[markdup] error, unable to append supplementary 'do' tag.")?;
+                }
+
+                if self.options.optical_distance > 0 {
+                    let duplicate_type = if optical { OPTICAL } else { LIBRARY };
+                    let _ = bam_raw::update_string_field(&mut raw, DUPLICATE_TYPE, duplicate_type);
+
+                    if optical {
+                        self.stats[read_group].non_primary_optical += 1;
+                    }
+                }
+            }
+
+            let is_duplicate = flags_of(&raw).is_duplicate();
+
+            if !self.options.remove || !is_duplicate {
+                if self.options.duplicate_count && is_duplicate {
+                    let mut stripped = Vec::new();
+                    bam_raw::strip_fields(&raw, &mut stripped, |tag| tag == *b"dc")?;
+                    writer.write_raw(header, &stripped)?;
+                } else {
+                    writer.write_raw(header, &raw)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Whether a duplicate may have records that `-S` marks: it has an `SA` or `XA` tag, or an
+/// unmapped mate.
+fn has_other_records(record: &[u8]) -> io::Result<bool> {
+    Ok(flags_of(record).is_mate_unmapped()
+        || bam_raw::find_field(record, *b"SA")?.is_some()
+        || bam_raw::find_field(record, *b"XA")?.is_some())
+}
+
+/// Counts a coordinate warning, printing the first few.
+fn warn(warnings: &mut u64, message: std::fmt::Arguments<'_>) {
+    *warnings += 1;
+
+    if *warnings <= MAX_WARNINGS {
+        eprintln!("[markdup] warning, {message}");
+    }
+}
+
+/// `get_coordinates_colons`: the x and y coordinates from an Illumina-style read name
+/// (`machine:run:flowcell:lane:tile:x:y`, with an optional `:UMI`, or older forms with 3 or 4
+/// colons).
+fn coordinates(name: &[u8], warnings: &mut u64) -> Option<Coordinates> {
+    let mut separators = 0;
+    let (mut x_start, mut y_start) = (0, 0);
+
+    for (i, &b) in name.iter().enumerate() {
+        if b == b':' {
+            separators += 1;
+
+            match separators {
+                2 => x_start = i + 1,
+                3 => y_start = i + 1,
+                // HiSeq-style names
+                4 => {
+                    x_start = y_start;
+                    y_start = i + 1;
+                }
+                // Newer Illumina names
+                5 => x_start = i + 1,
+                6 => y_start = i + 1,
+                _ => {}
+            }
+        }
+    }
+
+    let display = String::from_utf8_lossy(name);
+
+    if !matches!(separators, 3 | 4 | 6 | 7) {
+        warn(
+            warnings,
+            format_args!("cannot decipher read name {display} for optical duplicate marking."),
+        );
+        return None;
+    }
+
+    let Some(x) = strtol(&name[x_start..]) else {
+        warn(
+            warnings,
+            format_args!("cannot decipher x coordinate in {display} ."),
+        );
+        return None;
+    };
+
+    let Some(y) = strtol(&name[y_start..]) else {
+        warn(
+            warnings,
+            format_args!("cannot decipher y coordinate in {display} ."),
+        );
+        return None;
+    };
+
+    Some(Coordinates {
+        prefix_end: x_start,
+        x,
+        y,
+    })
+}
+
+/// C's `strtol(s, &end, 10)`, or `None` if it reads no digits. Out-of-range values saturate.
+fn strtol(s: &[u8]) -> Option<i64> {
+    let s = s.trim_ascii_start();
+
+    let (negative, digits) = match s.first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+
+    let len = digits.iter().take_while(|b| b.is_ascii_digit()).count();
+
+    if len == 0 {
+        return None;
+    }
+
+    let n = digits[..len].iter().fold(0i64, |n, &d| {
+        n.saturating_mul(10).saturating_add(i64::from(d - b'0'))
+    });
+
+    Some(if negative { n.saturating_neg() } else { n })
+}
+
+/// Whether two coordinates are within `distance` of each other on both axes, given matching
+/// prefixes.
+fn is_close(original: &Coordinates, x: i64, y: i64, distance: i64) -> bool {
+    (original.x - x).abs() <= distance && (original.y - y).abs() <= distance
+}
+
+/// `is_optical_duplicate`
+fn is_optical_duplicate(
+    original: &[u8],
+    duplicate: &[u8],
+    distance: i64,
+    warnings: &mut u64,
+) -> bool {
+    let Some(o) = coordinates(original, warnings) else {
+        return false;
+    };
+
+    let Some(d) = coordinates(duplicate, warnings) else {
+        return false;
+    };
+
+    original[..o.prefix_end] == duplicate[..d.prefix_end] && is_close(&o, d.x, d.y, distance)
+}
+
+/// `optical_duplicate_partial`: like [`is_optical_duplicate`] with the original's coordinates
+/// already parsed, also recording the duplicate's coordinates in `check`.
+fn optical_duplicate_partial(
+    original_name: &[u8],
+    original: &Coordinates,
+    duplicate: &[u8],
+    check: &mut Check,
+    distance: i64,
+    warnings: &mut u64,
+) -> bool {
+    let Some(d) = coordinates(duplicate, warnings) else {
+        return false;
+    };
+
+    let is_optical = original_name[..original.prefix_end] == duplicate[..d.prefix_end]
+        && is_close(original, d.x, d.y, distance);
+
+    check.x = d.x;
+    check.y = d.y;
+    check.has_coordinates = true;
+    check.prefix = duplicate[..d.prefix_end].to_vec();
+
+    is_optical
 }
 
 fn i32_field(record: &[u8], range: std::ops::Range<usize>) -> i32 {
@@ -1007,38 +1809,165 @@ fn estimate_library_size(paired_reads: i64, paired_duplicate_reads: i64, optical
 
 /// `write_stats`. The library size is estimated (possibly warning) before the title is written.
 fn write_stats<W: Write>(out: &mut W, title: &str, name: &str, stats: &Stats) -> io::Result<()> {
-    let library_size = estimate_library_size(stats.pair, stats.duplicate, 0);
+    let library_size = estimate_library_size(stats.pair, stats.duplicate, stats.optical);
 
     writeln!(out, "{title}{name}")?;
 
-    writeln!(out, "READ: {}", stats.reading)?;
-    writeln!(out, "WRITTEN: {}", stats.writing)?;
-    writeln!(out, "EXCLUDED: {}", stats.excluded)?;
-    writeln!(out, "EXAMINED: {}", stats.examined)?;
-    writeln!(out, "PAIRED: {}", stats.pair)?;
-    writeln!(out, "SINGLE: {}", stats.single)?;
-    writeln!(out, "DUPLICATE PAIR: {}", stats.duplicate)?;
-    writeln!(out, "DUPLICATE SINGLE: {}", stats.single_duplicate)?;
-    writeln!(out, "DUPLICATE PAIR OPTICAL: 0")?;
-    writeln!(out, "DUPLICATE SINGLE OPTICAL: 0")?;
-    writeln!(out, "DUPLICATE NON PRIMARY: 0")?;
-    writeln!(out, "DUPLICATE NON PRIMARY OPTICAL: 0")?;
-    writeln!(
-        out,
-        "DUPLICATE PRIMARY TOTAL: {}",
-        stats.single_duplicate + stats.duplicate
-    )?;
-    writeln!(
-        out,
-        "DUPLICATE TOTAL: {}",
-        stats.single_duplicate + stats.duplicate
-    )?;
-    writeln!(out, "ESTIMATED_LIBRARY_SIZE: {library_size}")
+    for (label, value) in stat_fields(stats, library_size) {
+        writeln!(out, "{label}: {value}")?;
+    }
+
+    Ok(())
+}
+
+/// The reported statistics, in samtools' order.
+fn stat_fields(stats: &Stats, library_size: i64) -> [(&'static str, i64); 15] {
+    let primary_total = stats.single_duplicate + stats.duplicate;
+
+    [
+        ("READ", stats.reading),
+        ("WRITTEN", stats.writing),
+        ("EXCLUDED", stats.excluded),
+        ("EXAMINED", stats.examined),
+        ("PAIRED", stats.pair),
+        ("SINGLE", stats.single),
+        ("DUPLICATE PAIR", stats.duplicate),
+        ("DUPLICATE SINGLE", stats.single_duplicate),
+        ("DUPLICATE PAIR OPTICAL", stats.optical),
+        ("DUPLICATE SINGLE OPTICAL", stats.single_optical),
+        ("DUPLICATE NON PRIMARY", stats.non_primary_duplicate),
+        ("DUPLICATE NON PRIMARY OPTICAL", stats.non_primary_optical),
+        ("DUPLICATE PRIMARY TOTAL", primary_total),
+        (
+            "DUPLICATE TOTAL",
+            primary_total + stats.non_primary_duplicate,
+        ),
+        ("ESTIMATED_LIBRARY_SIZE", library_size),
+    ]
+}
+
+/// `write_json_stats`: one block of fields at `indent`, without a trailing newline.
+fn write_json_stats<W: Write>(
+    out: &mut W,
+    indent: &str,
+    group_name: Option<&str>,
+    stats: &Stats,
+) -> io::Result<()> {
+    let library_size = estimate_library_size(stats.pair, stats.duplicate, stats.optical);
+
+    if let Some(name) = group_name {
+        writeln!(out, "{indent}\"READ GROUP\": \"{name}\",")?;
+    }
+
+    let fields = stat_fields(stats, library_size);
+
+    for (i, (label, value)) in fields.iter().enumerate() {
+        let separator = if i + 1 < fields.len() { ",\n" } else { "" };
+        write!(out, "{indent}\"{label}\": {value}{separator}")?;
+    }
+
+    Ok(())
+}
+
+/// The `--json` report. As in samtools, names are written without escaping.
+fn write_json_report<W: Write>(
+    out: &mut W,
+    command_line: &str,
+    total: &Stats,
+    use_read_groups: bool,
+    group_stats: &[Stats],
+    group_names: &[String],
+) -> io::Result<()> {
+    const INDENT_1: &str = "    ";
+    const INDENT_2: &str = "        ";
+    const INDENT_3: &str = "            ";
+
+    writeln!(out, "{{")?;
+    writeln!(out, "{INDENT_1}\"COMMAND\": \"{command_line}\",")?;
+    write_json_stats(out, INDENT_1, None, total)?;
+    writeln!(out, "{}", if use_read_groups { "," } else { "" })?;
+
+    if use_read_groups {
+        writeln!(out, "{INDENT_1}\"READ GROUPS\": [")?;
+
+        if group_stats[0].reading > 0 {
+            writeln!(out, "{INDENT_2}{{")?;
+            write_json_stats(out, INDENT_3, Some("ungrouped"), &group_stats[0])?;
+            writeln!(out)?;
+            writeln!(out, "{INDENT_2}}},")?;
+        }
+
+        for (i, (name, stats)) in group_names.iter().zip(&group_stats[1..]).enumerate() {
+            writeln!(out, "{INDENT_2}{{")?;
+            write_json_stats(out, INDENT_3, Some(name), stats)?;
+            writeln!(out)?;
+            let separator = if i + 1 < group_names.len() { "," } else { "" };
+            writeln!(out, "{INDENT_2}}}{separator}")?;
+        }
+
+        writeln!(out, "{INDENT_1}]")?;
+    }
+
+    writeln!(out, "}}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_coordinates() {
+        let mut warnings = 0;
+
+        let c = coordinates(b"M1:7:FC1:1:1101:1234:5678", &mut warnings).expect("parsed");
+        assert_eq!((c.prefix_end, c.x, c.y), (16, 1234, 5678));
+
+        let c = coordinates(b"M1:7:FC1:1:1101:1234:5678:ACGT", &mut warnings).expect("parsed");
+        assert_eq!((c.prefix_end, c.x, c.y), (16, 1234, 5678));
+
+        // HiSeq style: machine:lane:tile:x:y
+        let c = coordinates(b"HS:1:1101:12:34", &mut warnings).expect("parsed");
+        assert_eq!((c.prefix_end, c.x, c.y), (10, 12, 34));
+
+        assert_eq!(warnings, 0);
+        assert!(coordinates(b"read1", &mut warnings).is_none());
+        assert!(coordinates(b"a:b:c:x:y", &mut warnings).is_none());
+        assert_eq!(warnings, 2);
+    }
+
+    #[test]
+    fn test_is_optical_duplicate() {
+        let mut warnings = 0;
+        let original = b"M:7:FC:1:1101:1000:2000";
+
+        assert!(is_optical_duplicate(
+            original,
+            b"M:7:FC:1:1101:1100:1900",
+            100,
+            &mut warnings
+        ));
+        assert!(!is_optical_duplicate(
+            original,
+            b"M:7:FC:1:1101:1101:2000",
+            100,
+            &mut warnings
+        ));
+        assert!(!is_optical_duplicate(
+            original,
+            b"M:7:FC:1:1102:1000:2000",
+            100,
+            &mut warnings
+        ));
+        assert_eq!(warnings, 0);
+    }
+
+    #[test]
+    fn test_strtol() {
+        assert_eq!(strtol(b"123:4"), Some(123));
+        assert_eq!(strtol(b" -5x"), Some(-5));
+        assert_eq!(strtol(b"x1"), None);
+        assert_eq!(strtol(b"99999999999999999999"), Some(i64::MAX));
+    }
 
     #[test]
     fn test_unclipped_other_positions() {
