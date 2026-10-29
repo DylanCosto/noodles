@@ -89,34 +89,35 @@ libdeflate. "short" is 1M synthetic 150 bp paired reads, "tagged" 250k reads wit
 
 | Operation | samtools (s) | ntools (s) | Speedup |
 |---|---:|---:|---:|
-| view BAM->SAM, short | 0.381 | 0.346 | 1.10x |
-| view BAM->SAM, long | 2.129 | 1.699 | 1.25x |
-| view BAM->SAM, long, -@4 | 0.568 | 0.347 | 1.64x |
-| view BAM->SAM, long, -@8 | 0.300 | 0.234 | 1.28x |
-| view CRAM->SAM, short | 0.880 | 1.513 | 0.58x |
-| view CRAM->SAM, long | 2.891 | 3.361 | 0.86x |
-| view CRAM->SAM, long, -@8 | 0.570 | 0.453 | 1.26x |
-| view CRAM->BAM, long, -@8 | 2.132 | 1.441 | 1.48x |
-| view BAM->BAM, long, -@4 | 3.372 | 2.357 | 1.43x |
-| view -c -q 30, short | 0.144 | 0.150 | 0.96x |
-| flagstat, long, -@4 | 0.330 | 0.340 | 0.97x |
+| view BAM->SAM, short | 0.388 | 0.367 | 1.06x |
+| view BAM->SAM, long | 2.129 | 1.707 | 1.25x |
+| view BAM->SAM, long, -@4 | 0.569 | 0.350 | 1.63x |
+| view BAM->SAM, long, -@8 | 0.301 | 0.236 | 1.28x |
+| view CRAM->SAM, short | 0.887 | 1.073 | 0.83x |
+| view CRAM->SAM, long | 2.908 | 2.571 | 1.13x |
+| view CRAM->SAM, long, -@8 | 0.569 | 0.355 | 1.60x |
+| view CRAM->BAM, long, -@8 | 2.119 | 1.414 | 1.50x |
+| view BAM->BAM, long, -@4 | 3.368 | 2.348 | 1.43x |
+| view -c -q 30, short | 0.145 | 0.149 | 0.97x |
+| flagstat, long, -@4 | 0.330 | 0.341 | 0.97x |
 | index, long, -@4 | 0.333 | 0.341 | 0.98x |
-| sort, short, -@4 | 0.994 | 0.579 | 1.72x |
-| sort -n, short, -@4 | 1.063 | 0.574 | 1.85x |
-| collate -Ou, short, -@4 | 2.107 | 0.382 | 5.52x |
-| fixmate -m, short | 3.409 | 3.340 | 1.02x |
-| fixmate -m, short, -@4 | 0.891 | 0.457 | 1.95x |
-| markdup, short | 3.812 | 2.408 | 1.58x |
-| markdup, short, -@4 | 0.912 | 0.700 | 1.30x |
-| fastq, short | 0.606 | 0.626 | 0.97x |
-| depth, short | 0.283 | 0.319 | 0.89x |
-| coverage, short | 1.134 | 0.403 | 2.81x |
+| sort, short, -@4 | 0.991 | 0.577 | 1.72x |
+| sort -n, short, -@4 | 1.063 | 0.576 | 1.85x |
+| collate -Ou, short, -@4 | 2.109 | 0.380 | 5.55x |
+| fixmate -m, short | 3.416 | 3.353 | 1.02x |
+| fixmate -m, short, -@4 | 0.888 | 0.444 | 2.00x |
+| markdup, short | 3.822 | 2.400 | 1.59x |
+| markdup, short, -@4 | 0.912 | 0.695 | 1.31x |
+| fastq, short | 0.606 | 0.663 | 0.91x |
+| depth, short | 0.284 | 0.316 | 0.90x |
+| coverage, short | 1.143 | 0.406 | 2.82x |
 | faidx 1024 regions | 0.018 | 0.020 | 0.90x |
 
-Where ntools is slower, it is single-threaded: per-thread CRAM decoding still trails HTSlib,
-whose rANS decoder uses SIMD. Rows near 1.0x (flagstat, index, counting) are bound by BGZF
-decompression, which both tools do with libdeflate. With threads, ntools parallelizes more of
-the work than samtools does, so the gap reverses.
+Where ntools is slower, it is single-threaded. Short-read CRAM decoding still trails HTSlib in
+per-record tag decoding and allocation; its rANS decoding (AVX2) now keeps pace with HTSlib's.
+Rows near 1.0x (flagstat, index, counting) are bound by BGZF decompression, which both tools do
+with libdeflate. With threads, ntools parallelizes more of the work than samtools does, so the
+gap reverses.
 
 ## Library changes in this fork
 
@@ -127,6 +128,10 @@ ntools relies on these changes to the noodles crates, which downstream tools get
 - CRAM: unmapped records decode with a mapping quality of 0, as in HTSlib.
 - CRAM: sequences are reconstructed in bulk (`Record::with_sequence`), and tag blocks are found
   without hashing.
-- BAM: `Record` exposes its encoded bytes (`AsRef<[u8]>`, `TryFrom<Vec<u8>>`) for copying
-  records without re-encoding.
+- CRAM: `Record::encode_bam_record` encodes a decoded record as raw BAM directly, so CRAM input
+  takes the same raw BAM paths as BAM input.
+- CRAM: 32-state order-1 rANS Nx16 streams (quality scores) decode with AVX2 when the CPU has
+  it, falling back to the scalar decoder otherwise.
+- BAM: `Record` exposes its encoded bytes (`AsRef<[u8]>`, `TryFrom<Vec<u8>>`,
+  `From<Record> for Vec<u8>`) for copying records without re-encoding.
 - SAM: integer arrays are formatted through a buffer, which speeds up long-read tags (`MM`/`ML`).
