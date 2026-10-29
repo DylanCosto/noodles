@@ -27,6 +27,10 @@ enum Command {
     Flagstat(commands::flagstat::Args),
     /// Report per-reference mapped and unmapped counts.
     Idxstats(commands::idxstats::Args),
+    /// Build a BAI, CSI, or CRAI index.
+    Index(commands::index::Args),
+    /// Index a FASTA file or extract regions from it.
+    Faidx(commands::faidx::Args),
 }
 
 fn main() -> ExitCode {
@@ -36,6 +40,8 @@ fn main() -> ExitCode {
         Command::View(args) => commands::view::run(args),
         Command::Flagstat(args) => commands::flagstat::run(args),
         Command::Idxstats(args) => commands::idxstats::run(args),
+        Command::Index(args) => commands::index::run(args),
+        Command::Faidx(args) => commands::faidx::run(args),
     };
 
     match result {

@@ -121,9 +121,7 @@ impl Filter {
         }
 
         if self.min_mapping_quality > 0 {
-            let mapq = record
-                .mapping_quality()?
-                .unwrap_or(MISSING_MAPPING_QUALITY);
+            let mapq = record.mapping_quality()?.unwrap_or(MISSING_MAPPING_QUALITY);
 
             if mapq < self.min_mapping_quality {
                 return Ok(false);
@@ -154,12 +152,18 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     if args.count {
         let mut n = 0u64;
-        visit(&mut reader, path.as_deref(), &header, &args.regions, |rec| {
-            if filter.matches(&rec)? {
-                n += 1;
-            }
-            Ok(())
-        })?;
+        visit(
+            &mut reader,
+            path.as_deref(),
+            &header,
+            &args.regions,
+            |rec| {
+                if filter.matches(&rec)? {
+                    n += 1;
+                }
+                Ok(())
+            },
+        )?;
 
         let mut stdout = io::stdout().lock();
         writeln!(stdout, "{n}")?;
@@ -184,12 +188,18 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     if !args.header_only {
-        visit(&mut reader, path.as_deref(), &header, &args.regions, |rec| {
-            if filter.matches(&rec)? {
-                writer.write(&header, &rec)?;
-            }
-            Ok(())
-        })?;
+        visit(
+            &mut reader,
+            path.as_deref(),
+            &header,
+            &args.regions,
+            |rec| {
+                if filter.matches(&rec)? {
+                    writer.write(&header, &rec)?;
+                }
+                Ok(())
+            },
+        )?;
     }
 
     writer.finish(&header)?;
