@@ -118,6 +118,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         min_base_quality: args.min_base_quality,
         include_deletions: args.include_deletions,
         track_quality: false,
+        include_skips: false,
     };
 
     let domain = Domain::new(&args, &header)?;

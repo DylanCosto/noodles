@@ -113,6 +113,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         min_base_quality: args.min_base_quality,
         include_deletions: false,
         track_quality: true,
+        include_skips: false,
     });
 
     let in_region = |id: usize, position: usize| match &region {

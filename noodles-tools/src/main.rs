@@ -70,6 +70,8 @@ enum Command {
     Markdup(commands::markdup::Args),
     /// Write a SAM sequence dictionary for a FASTA file.
     Dict(commands::dict::Args),
+    /// Sum read depth over BED regions.
+    Bedcov(commands::bedcov::Args),
 }
 
 fn main() -> ExitCode {
@@ -97,6 +99,7 @@ fn main() -> ExitCode {
         Command::Fixmate(args) => commands::fixmate::run(args).map(|()| ExitCode::SUCCESS),
         Command::Markdup(args) => commands::markdup::run(args).map(|()| ExitCode::SUCCESS),
         Command::Dict(args) => commands::dict::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Bedcov(args) => commands::bedcov::run(args).map(|()| ExitCode::SUCCESS),
     };
 
     match result {

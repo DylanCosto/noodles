@@ -1,5 +1,6 @@
 //! Subcommands.
 
+pub mod bedcov;
 pub mod cat;
 pub mod collate;
 pub mod coverage;

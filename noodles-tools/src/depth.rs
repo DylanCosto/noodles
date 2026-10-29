@@ -27,6 +27,8 @@ pub struct CountOptions {
     pub include_deletions: bool,
     /// Sum base qualities into [`Cell::quality_sum`] (for coverage).
     pub track_quality: bool,
+    /// Count reference skips (`N`), as samtools bedcov does by default.
+    pub include_skips: bool,
 }
 
 /// Depth at one position, and the summed base qualities of the bases counted there.
@@ -112,6 +114,7 @@ impl DepthWindow {
             min_base_quality,
             include_deletions,
             track_quality,
+            include_skips,
         } = self.options;
 
         let needs_quality = min_base_quality > 0 || track_quality;
@@ -202,7 +205,15 @@ impl DepthWindow {
 
                     reference_position += len;
                 }
-                Kind::Skip => reference_position += len,
+                Kind::Skip => {
+                    if include_skips {
+                        for cell in self.cells.range_mut(offset..offset + len) {
+                            cell.depth += 1;
+                        }
+                    }
+
+                    reference_position += len;
+                }
                 Kind::Insertion | Kind::SoftClip => read_position += len,
                 Kind::HardClip | Kind::Pad => {}
             }
