@@ -64,6 +64,28 @@ impl<'r, 'c: 'r> Iter<'r, 'c> {
     }
 }
 
+impl<'r: 'c, 'c: 'r> Iter<'r, 'c> {
+    /// Appends the remaining bases to `dst`: the same bases as iterating, with each run of
+    /// reference or feature bases copied at once.
+    pub(super) fn extend_into(mut self, dst: &mut Vec<u8>) {
+        dst.reserve(self.size_hint().0);
+
+        loop {
+            if let State::Prepare(bases, ..) | State::Bases(bases) | State::Finish(bases) =
+                &mut self.state
+            {
+                dst.extend_from_slice(bases.as_slice());
+                *bases = [].iter();
+            }
+
+            match self.next() {
+                Some(base) => dst.push(base),
+                None => break,
+            }
+        }
+    }
+}
+
 enum State<'r, 'c: 'r> {
     Next,
     Prepare(slice::Iter<'c, u8>, Position, &'r Feature<'c>),
@@ -284,6 +306,63 @@ mod tests {
 
         let actual: Vec<_> = iter.collect();
         assert_eq!(actual, b"CACATGATT");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_extend_into() -> Result<(), Box<dyn std::error::Error>> {
+        let reference_sequence = b"CGTCYCGTAACACTAGgtcaACGT";
+
+        let features = [
+            Feature::Bases {
+                position: Position::try_from(2)?,
+                bases: Cow::from(b"AT"),
+            },
+            Feature::Substitution {
+                position: Position::try_from(5)?,
+                code: 0b01,
+            },
+            Feature::Insertion {
+                position: Position::try_from(7)?,
+                bases: Cow::from(b"GGG"),
+            },
+            Feature::Deletion {
+                position: Position::try_from(11)?,
+                len: 2,
+            },
+            Feature::ReadBase {
+                position: Position::try_from(12)?,
+                base: b'N',
+                quality_score: 0,
+            },
+            Feature::Substitution {
+                position: Position::try_from(15)?,
+                code: 0b10,
+            },
+            Feature::SoftClip {
+                position: Position::try_from(19)?,
+                bases: Cow::from(b"TT"),
+            },
+        ];
+
+        for (start, read_length) in [(1, 20), (2, 20)] {
+            let start = Position::try_from(start)?;
+            let new = || {
+                Iter::new(
+                    Some(reference_sequence),
+                    SubstitutionMatrix::default(),
+                    &features,
+                    start,
+                    read_length,
+                )
+            };
+            let expected: Vec<_> = new().collect();
+            let mut actual = b"prefix".to_vec();
+            new().extend_into(&mut actual);
+            assert_eq!(&actual[..6], b"prefix");
+            assert_eq!(actual[6..], expected[..]);
+        }
 
         Ok(())
     }

@@ -56,6 +56,97 @@ pub struct Record<'c> {
 }
 
 impl Record<'_> {
+    /// The read bases as reconstructed from the reference sequence and read features, or `None`
+    /// if they are stored as is (unmapped records and records with missing sequences).
+    fn reconstructed_sequence(&self) -> Option<Sequence<'_, '_>> {
+        if self.bam_flags.is_unmapped() || self.cram_flags.sequence_is_missing() {
+            return None;
+        }
+
+        let (reference_sequence, alignment_start) = match self.reference_sequence.as_ref() {
+            Some(ReferenceSequence::Embedded {
+                reference_start,
+                sequence,
+            }) => {
+                let alignment_start = usize::from(self.alignment_start.unwrap());
+                let offset = usize::from(*reference_start);
+                let offset_alignment_start = Position::new(alignment_start - offset + 1).unwrap();
+                (Some(*sequence), offset_alignment_start)
+            }
+            Some(ReferenceSequence::External { sequence, .. }) => {
+                (Some((**sequence).as_ref()), self.alignment_start.unwrap())
+            }
+            None => (None, Position::MIN),
+        };
+
+        Some(Sequence::new(
+            reference_sequence,
+            self.substitution_matrix.clone(),
+            &self.features,
+            alignment_start,
+            self.read_length,
+        ))
+    }
+
+    /// Converts this record to an alignment record buffer.
+    ///
+    /// This is equivalent to [`sam::alignment::RecordBuf::try_from_alignment_record`] but copies
+    /// the sequence and quality scores in runs instead of base by base.
+    pub(crate) fn try_into_alignment_record_buf(
+        &self,
+        header: &sam::Header,
+    ) -> io::Result<sam::alignment::RecordBuf> {
+        use sam::alignment::Record as _;
+
+        let mut record_buf = sam::alignment::RecordBuf::default();
+
+        if let Some(name) = self.name() {
+            *record_buf.name_mut() = Some(name.into());
+        }
+
+        *record_buf.flags_mut() = self.flags()?;
+        *record_buf.reference_sequence_id_mut() = self.reference_sequence_id(header).transpose()?;
+        *record_buf.alignment_start_mut() = self.alignment_start;
+        *record_buf.mapping_quality_mut() = self.mapping_quality;
+
+        let cigar = record_buf.cigar_mut().as_mut();
+
+        for result in self.cigar().iter() {
+            cigar.push(result?);
+        }
+
+        *record_buf.mate_reference_sequence_id_mut() =
+            self.mate_reference_sequence_id(header).transpose()?;
+        *record_buf.mate_alignment_start_mut() = self.mate_alignment_start;
+        *record_buf.template_length_mut() = self.template_length;
+
+        let sequence = record_buf.sequence_mut().as_mut();
+
+        match self.reconstructed_sequence() {
+            Some(reconstructed) => reconstructed.extend_into(sequence),
+            None => sequence.extend_from_slice(&self.sequence),
+        }
+
+        let quality_scores = record_buf.quality_scores_mut().as_mut();
+
+        if self.bam_flags.is_unmapped() || self.cram_flags.quality_scores_are_stored_as_array() {
+            quality_scores.extend_from_slice(&self.quality_scores);
+        } else {
+            for result in self.quality_scores().iter() {
+                quality_scores.push(result?);
+            }
+        }
+
+        let data = record_buf.data_mut();
+
+        for result in self.data().iter() {
+            let (tag, value) = result?;
+            data.insert(tag, value.try_into()?);
+        }
+
+        Ok(record_buf)
+    }
+
     fn alignment_span(&self) -> usize {
         calculate_alignment_span(self.read_length, &self.features)
     }
@@ -144,33 +235,9 @@ impl sam::alignment::Record for Record<'_> {
     }
 
     fn sequence(&self) -> Box<dyn sam::alignment::record::Sequence + '_> {
-        if self.bam_flags.is_unmapped() || self.cram_flags.sequence_is_missing() {
-            Box::new(Bases(&self.sequence[..]))
-        } else {
-            let (reference_sequence, alignment_start) = match self.reference_sequence.as_ref() {
-                Some(ReferenceSequence::Embedded {
-                    reference_start,
-                    sequence,
-                }) => {
-                    let alignment_start = usize::from(self.alignment_start.unwrap());
-                    let offset = usize::from(*reference_start);
-                    let offset_alignment_start =
-                        Position::new(alignment_start - offset + 1).unwrap();
-                    (Some(*sequence), offset_alignment_start)
-                }
-                Some(ReferenceSequence::External { sequence, .. }) => {
-                    (Some((**sequence).as_ref()), self.alignment_start.unwrap())
-                }
-                None => (None, Position::MIN),
-            };
-
-            Box::new(Sequence::new(
-                reference_sequence,
-                self.substitution_matrix.clone(),
-                &self.features,
-                alignment_start,
-                self.read_length,
-            ))
+        match self.reconstructed_sequence() {
+            Some(sequence) => Box::new(sequence),
+            None => Box::new(Bases(&self.sequence[..])),
         }
     }
 
@@ -280,6 +347,89 @@ pub(crate) fn calculate_alignment_span(read_length: usize, features: &[Feature])
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_try_into_alignment_record_buf() -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::Arc;
+
+        use noodles_fasta as fasta;
+
+        let header = sam::Header::default();
+        let reference = Arc::new(fasta::record::Sequence::from(
+            b"ACGTACGTacgtNNACGTACGT".to_vec(),
+        ));
+
+        let features = vec![
+            Feature::SoftClip {
+                position: Position::try_from(1)?,
+                bases: Cow::from(b"TT"),
+            },
+            Feature::Substitution {
+                position: Position::try_from(4)?,
+                code: 0b01,
+            },
+            Feature::Scores {
+                position: Position::try_from(5)?,
+                quality_scores: Cow::from(&[30, 31]),
+            },
+            Feature::Insertion {
+                position: Position::try_from(7)?,
+                bases: Cow::from(b"GG"),
+            },
+            Feature::Deletion {
+                position: Position::try_from(10)?,
+                len: 3,
+            },
+            Feature::QualityScore {
+                position: Position::try_from(11)?,
+                quality_score: 40,
+            },
+        ];
+
+        let mapped = Record {
+            name: Some(Cow::from(&b"r0"[..])),
+            bam_flags: sam::alignment::record::Flags::empty(),
+            reference_sequence: Some(ReferenceSequence::External {
+                sequence: reference.clone(),
+            }),
+            alignment_start: Some(Position::try_from(3)?),
+            reference_sequence_id: Some(0),
+            mapping_quality: MappingQuality::new(60),
+            read_length: 14,
+            features: features.clone(),
+            ..Default::default()
+        };
+
+        let with_stored_scores = Record {
+            cram_flags: Flags::QUALITY_SCORES_ARE_STORED_AS_ARRAY,
+            quality_scores: Cow::from((0..14).collect::<Vec<u8>>()),
+            ..mapped.clone()
+        };
+
+        let embedded = Record {
+            reference_sequence: Some(ReferenceSequence::Embedded {
+                reference_start: Position::try_from(2)?,
+                sequence: &b"CGTACGTacgtNNACGTACGT"[..],
+            }),
+            ..mapped.clone()
+        };
+
+        let unmapped = Record {
+            bam_flags: sam::alignment::record::Flags::UNMAPPED,
+            sequence: Cow::from(&b"ACGTN"[..]),
+            quality_scores: Cow::from(&[1, 2, 3, 4, 5][..]),
+            read_length: 5,
+            features: Vec::new(),
+            ..Default::default()
+        };
+
+        for record in [mapped, with_stored_scores, embedded, unmapped] {
+            let expected = sam::alignment::RecordBuf::try_from_alignment_record(&header, &record)?;
+            assert_eq!(record.try_into_alignment_record_buf(&header)?, expected);
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn test_calculate_alignment_span() -> Result<(), noodles_core::position::TryFromIntError> {

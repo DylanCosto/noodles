@@ -59,12 +59,7 @@ where
                     .and_then(|records| {
                         records
                             .into_iter()
-                            .map(|record| {
-                                sam::alignment::RecordBuf::try_from_alignment_record(
-                                    self.header,
-                                    &record,
-                                )
-                            })
+                            .map(|record| record.try_into_alignment_record_buf(self.header))
                             .collect::<io::Result<Vec<_>>>()
                     })
             })

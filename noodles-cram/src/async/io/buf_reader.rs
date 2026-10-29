@@ -87,9 +87,7 @@ where
                     &external_data_srcs,
                 )?
                 .into_iter()
-                .map(|record| {
-                    sam::alignment::RecordBuf::try_from_alignment_record(header, &record)
-                });
+                .map(|record| record.try_into_alignment_record_buf(header));
 
             records.extend(record_bufs);
         }
