@@ -200,6 +200,9 @@ check "mpileup long ins/del options" "$st mpileup --reverse-del --no-output-ins 
 if [ -f md.bam ]; then
     check "mpileup overlapping pairs -A -Q 0 -d 3" "$st mpileup -A -Q 0 -d 3 md.bam 2>/dev/null" "$nt mpileup -A -Q 0 -d 3 md.bam 2>/dev/null"
     check "mpileup -C 50 -E -x two files" "$st mpileup -C 50 -E -x -f $ref md.bam md.bam 2>/dev/null" "$nt mpileup -C 50 -E -x -f $ref md.bam md.bam 2>/dev/null"
+    # Indexed, with several sequences: one chromosome per thread
+    "$st" index md.bam
+    check "mpileup by chromosome -aa -@4" "$st mpileup -aa -A md.bam 2>/dev/null" "$nt mpileup -@ 4 -aa -A md.bam 2>/dev/null"
 fi
 
 echo "$failures difference(s)"

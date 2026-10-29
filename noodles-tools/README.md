@@ -38,7 +38,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `addreplacerg` | `addreplacerg` | `-r` (repeatable, `\t` escapes), `-R`, `-m overwrite_all\|orphan_only`, `-w` |
 | `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-S`, `-t`, `-d` (optical duplicates), `-T`, `-s/-f`, `--json`, `--no-multi-dup`, `--include-fails`, `--use-read-groups`, `--duplicate-count` |
 | `stats` | `stats` | all sections; `-r`, `-t`, regions, `-f/-F/-d`, `-c`, `-i`, `-m`, `-q`, `-l`, `-I`, `-S/-P`, `-p`, `-g`, `-x`, `--GC-depth`, `--ref-stats`; per-cycle counts use `-@` threads |
-| `mpileup` | `mpileup` | text pileup with BAQ (`-B`, `-E`), overlap removal (`-x`), `-f`, `-r`, `-l`, `-a/-aa`, `-q/-Q`, `-d`, `-A`, `-C`, `-G`, `-R`, `-6`, `--rf/--ff`, `-b`, `-X`, `-s`, `-O`, `--output-BP-5`, `--output-QNAME`, `--output-extra`, `--output-sep/-empty`, `--reverse-del`, `--no-output-ins/-del/-ends`; reads and BAQ use `-@` threads |
+| `mpileup` | `mpileup` | text pileup with BAQ (`-B`, `-E`), overlap removal (`-x`), `-f`, `-r`, `-l`, `-a/-aa`, `-q/-Q`, `-d`, `-A`, `-C`, `-G`, `-R`, `-6`, `--rf/--ff`, `-b`, `-X`, `-s`, `-O`, `--output-BP-5`, `--output-QNAME`, `--output-extra`, `--output-sep/-empty`, `--reverse-del`, `--no-output-ins/-del/-ends`; reads and BAQ use `-@` threads, and indexed inputs with several sequences pile up one chromosome per thread |
 
 `-@ N` adds worker threads throughout. Beyond BGZF compression and decompression, which is what
 samtools mostly uses its threads for, ntools also formats SAM text, decodes CRAM containers,

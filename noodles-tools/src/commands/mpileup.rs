@@ -704,7 +704,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         args.max_depth as usize
     };
 
-    let conf = Arc::new(Conf {
+    let conf = Conf {
         min_mq: args.min_mq,
         capq_thres: args.adjust_mq,
         rflag_require: args.required_flags.map_or(0, |f| f.bits()),
@@ -718,12 +718,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         bed: bed.clone(),
         all: args.all,
         exclude_rg,
-    });
+    };
 
-    let references = Arc::new(ReferenceCache {
+    let references = ReferenceCache {
         fasta,
         cache: Mutex::new(Vec::new()),
-    });
+    };
 
     let sink: Box<dyn Write> = match &args.output {
         Some(path) => Box::new(
@@ -746,32 +746,78 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         all: args.all,
     };
 
-    thread::scope(|scope| -> anyhow::Result<()> {
-        let mut sources = Vec::with_capacity(inputs.len());
-        let mut header_rxs = Vec::with_capacity(inputs.len());
+    let context = PileupContext {
+        inputs: &inputs,
+        indexes: indexes.as_deref(),
+        read_options: &read_options,
+        conf: &conf,
+        references: &references,
+        options: &options,
+        bed: bed.as_deref(),
+        max_depth,
+        overlaps: !args.no_overlaps,
+        workers: args.threads,
+    };
 
-        for (i, input) in inputs.iter().enumerate() {
+    match whole_chromosomes(&args, &inputs, indexes.as_deref(), &read_options)? {
+        Some((headers, names)) => {
+            report_samples(&headers, args.ignore_rg);
+            pileup_by_chromosome(&context, &names, args.threads, &mut out)?;
+        }
+        None => pileup_region(
+            &context,
+            args.region.as_deref(),
+            Some(args.ignore_rg),
+            &mut out,
+        )?,
+    }
+
+    out.flush()?;
+
+    Ok(())
+}
+
+/// What the pileup of one region needs.
+struct PileupContext<'a> {
+    inputs: &'a [String],
+    indexes: Option<&'a [String]>,
+    read_options: &'a ReadOptions,
+    conf: &'a Conf,
+    references: &'a ReferenceCache,
+    options: &'a OutputOptions,
+    bed: Option<&'a Bed>,
+    max_depth: usize,
+    overlaps: bool,
+    /// Threads for BAQ in each reader.
+    workers: usize,
+}
+
+/// Runs the pileup of `region` (a samtools region, or every read) and writes it to `out`.
+/// `report` reports the number of samples, ignoring read groups if set.
+fn pileup_region<W: Write>(
+    context: &PileupContext<'_>,
+    region: Option<&str>,
+    report: Option<bool>,
+    out: &mut W,
+) -> anyhow::Result<()> {
+    thread::scope(|scope| -> anyhow::Result<()> {
+        let mut sources = Vec::with_capacity(context.inputs.len());
+        let mut header_rxs = Vec::with_capacity(context.inputs.len());
+
+        for (i, input) in context.inputs.iter().enumerate() {
             let (tx, rx) = crossbeam_channel::bounded(QUEUE_DEPTH);
             let (header_tx, header_rx) = crossbeam_channel::bounded(1);
-            let conf = Arc::clone(&conf);
-            let references = Arc::clone(&references);
-            let read_options = ReadOptions {
-                threads: read_options.threads,
-                reference: read_options.reference.clone(),
-            };
-            let index = indexes.as_ref().map(|indexes| PathBuf::from(&indexes[i]));
-            let region = args.region.clone();
-            let workers = args.threads;
+            let index = context.indexes.map(|indexes| PathBuf::from(&indexes[i]));
 
             scope.spawn(move || {
                 let result = read_input(
                     input,
-                    &read_options,
-                    region.as_deref(),
+                    context.read_options,
+                    region,
                     index.as_deref(),
-                    &conf,
-                    &references,
-                    workers,
+                    context.conf,
+                    context.references,
+                    context.workers,
                     &header_tx,
                     &tx,
                 );
@@ -784,14 +830,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
             header_rxs.push(header_rx);
             sources.push(Source {
-                pileup: Pileup::new(max_depth, !args.no_overlaps),
+                pileup: Pileup::new(context.max_depth, context.overlaps),
                 batches: rx,
                 pending: Vec::new().into_iter(),
             });
         }
 
         // Names and lengths come from the first file's header, as in samtools.
-        let mut headers = Vec::with_capacity(inputs.len());
+        let mut headers = Vec::with_capacity(context.inputs.len());
 
         for (rx, source) in header_rxs.iter().zip(&mut sources) {
             match rx.recv().ok().flatten() {
@@ -816,33 +862,203 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .map(|rs| rs.length().get() as i64)
             .collect();
 
-        report_samples(&headers, args.ignore_rg);
+        if let Some(ignore_rg) = report {
+            report_samples(&headers, ignore_rg);
+        }
 
-        // -r: the requested region, 0-based and half-open, of the first file.
-        let region = match &args.region {
+        // The requested region, 0-based and half-open, of the first file.
+        let region = match region {
             Some(raw) => Some(parse_region(raw, &names)?),
             None => None,
         };
 
         let result = mpileup(
             &mut sources,
-            &options,
+            context.options,
             &names,
             &lengths,
-            &references,
-            bed.as_deref(),
+            context.references,
+            context.bed,
             region,
-            &mut out,
+            out,
         );
 
         // Stop the readers if the pileup ended early.
         drop(sources);
         result
-    })?;
+    })
+}
 
-    out.flush()?;
+/// The output a chromosome keeps in memory before spilling the rest to a temporary file.
+const SPILL_THRESHOLD: usize = 64 << 20;
 
-    Ok(())
+/// The inputs' headers and the reference sequence names, for [`pileup_by_chromosome`].
+type Chromosomes = (Vec<sam::Header>, Vec<Vec<u8>>);
+
+/// Returns the headers and reference sequence names if the pileup can run one chromosome at a
+/// time on several threads: every input is indexed, no region is given, and there are several
+/// sequences, all with names that are valid regions.
+///
+/// Chromosomes are independent in the pileup (reads, overlapping mates, and the depth limit
+/// never span two), and a whole-chromosome region gives exactly that chromosome's part of the
+/// output, also with `-a`/`-aa`. So the output is the same as reading the inputs through.
+fn whole_chromosomes(
+    args: &Args,
+    inputs: &[String],
+    indexes: Option<&[String]>,
+    read_options: &ReadOptions,
+) -> anyhow::Result<Option<Chromosomes>> {
+    use crate::alignment::AlignmentIndex;
+
+    if args.threads == 0 || args.region.is_some() {
+        return Ok(None);
+    }
+
+    let mut headers = Vec::with_capacity(inputs.len());
+
+    for (i, input) in inputs.iter().enumerate() {
+        if input == "-" {
+            return Ok(None);
+        }
+
+        let (mut reader, path) = AlignmentReader::open(input, read_options)?;
+        let header = reader.read_header()?;
+
+        let Some(path) = path else {
+            return Ok(None);
+        };
+
+        let explicit = indexes.map(|indexes| Path::new(&indexes[i]));
+
+        if AlignmentIndex::read(reader.format(), &path, explicit).is_err() {
+            return Ok(None);
+        }
+
+        headers.push(header);
+    }
+
+    let names: Vec<Vec<u8>> = headers[0]
+        .reference_sequences()
+        .keys()
+        .map(|name| name.to_vec())
+        .collect();
+
+    if names.len() < 2
+        || names
+            .iter()
+            .any(|name| name.contains(&b':') || name.is_empty())
+    {
+        return Ok(None);
+    }
+
+    Ok(Some((headers, names)))
+}
+
+/// Runs the pileup of each chromosome as a whole-chromosome region, `jobs` at a time, and writes
+/// their output in order. Chromosomes ahead of the one being written keep their output in
+/// memory, then in a temporary file.
+fn pileup_by_chromosome<W: Write>(
+    context: &PileupContext<'_>,
+    names: &[Vec<u8>],
+    jobs: usize,
+    out: &mut W,
+) -> anyhow::Result<()> {
+    let regions: Vec<String> = names
+        .iter()
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect();
+
+    let jobs = jobs.max(1);
+
+    // With fewer chromosomes than threads, each one realigns on several.
+    let active = jobs.min(regions.len());
+    let workers = if jobs / active > 1 { jobs / active } else { 0 };
+
+    let read_options = ReadOptions {
+        threads: 0,
+        reference: context.read_options.reference.clone(),
+    };
+
+    let job_context = PileupContext {
+        read_options: &read_options,
+        workers,
+        ..*context
+    };
+    let job_context = &job_context;
+
+    thread::scope(|scope| -> anyhow::Result<()> {
+        let mut pending = std::collections::VecDeque::new();
+        let mut spawned = 0;
+
+        for i in 0..regions.len() {
+            while spawned < regions.len() && spawned < i + jobs {
+                let region = &regions[spawned];
+
+                pending.push_back(scope.spawn(move || -> anyhow::Result<SpillWriter> {
+                    let mut writer = SpillWriter::default();
+                    pileup_region(job_context, Some(region), None, &mut writer)?;
+                    Ok(writer)
+                }));
+
+                spawned += 1;
+            }
+
+            let handle = pending.pop_front().expect("spawned ahead");
+            let output = handle.join().expect("pileup thread panicked")?;
+            output.copy_to(out)?;
+        }
+
+        Ok(())
+    })
+}
+
+/// Output kept in memory up to [`SPILL_THRESHOLD`], then in a temporary file.
+#[derive(Default)]
+struct SpillWriter {
+    memory: Vec<u8>,
+    file: Option<BufWriter<File>>,
+}
+
+impl SpillWriter {
+    /// Writes everything to `out`, in order.
+    fn copy_to<W: Write>(self, out: &mut W) -> anyhow::Result<()> {
+        use std::io::Seek as _;
+
+        out.write_all(&self.memory)?;
+
+        if let Some(file) = self.file {
+            let mut file = file.into_inner().map_err(io::IntoInnerError::into_error)?;
+            file.rewind()?;
+            io::copy(&mut file, out)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Write for SpillWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Some(file) = &mut self.file {
+            return file.write(buf);
+        }
+
+        if self.memory.len() + buf.len() > SPILL_THRESHOLD {
+            let mut file = BufWriter::with_capacity(1 << 20, tempfile::tempfile()?);
+            file.write_all(buf)?;
+            self.file = Some(file);
+        } else {
+            self.memory.extend_from_slice(buf);
+        }
+
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.file {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Reports the number of samples, as samtools does (read group samples, or one per file).
