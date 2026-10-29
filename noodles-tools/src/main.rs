@@ -6,6 +6,8 @@ mod commands;
 mod flags;
 mod output;
 mod program;
+mod runs;
+mod sort_order;
 mod source;
 
 use std::{io, process::ExitCode};
@@ -31,6 +33,10 @@ enum Command {
     Index(commands::index::Args),
     /// Index a FASTA file or extract regions from it.
     Faidx(commands::faidx::Args),
+    /// Sort alignments by coordinate or read name.
+    Sort(commands::sort::Args),
+    /// Merge sorted BAM files.
+    Merge(commands::merge::Args),
 }
 
 fn main() -> ExitCode {
@@ -42,6 +48,8 @@ fn main() -> ExitCode {
         Command::Idxstats(args) => commands::idxstats::run(args),
         Command::Index(args) => commands::index::run(args),
         Command::Faidx(args) => commands::faidx::run(args),
+        Command::Sort(args) => commands::sort::run(args),
+        Command::Merge(args) => commands::merge::run(args),
     };
 
     match result {

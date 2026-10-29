@@ -104,10 +104,22 @@ impl AlignmentWriter {
     /// `header` must have the same reference sequences as the header the record was read with.
     pub fn write(&mut self, header: &sam::Header, record: &Rec<'_>) -> io::Result<()> {
         match (self, record) {
-            (Self::Bam(w), Rec::Bam(r)) => write_raw_bam_record(w.get_mut(), r),
+            (Self::Bam(w), Rec::Bam(r)) => crate::runs::write_raw_record(w.get_mut(), r.as_ref()),
             (Self::Sam(w), _) => w.write_alignment_record(header, record.as_dyn()),
             (Self::Bam(w), _) => w.write_alignment_record(header, record.as_dyn()),
             (Self::Cram(w), _) => w.write_alignment_record(header, record.as_dyn()),
+        }
+    }
+
+    /// Writes an encoded BAM record (without `block_size`) whose reference sequence IDs are
+    /// relative to `header`. BAM output copies it; other formats decode it first.
+    pub fn write_raw(&mut self, header: &sam::Header, record: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Bam(w) => crate::runs::write_raw_record(w.get_mut(), record),
+            _ => {
+                let record = bam::Record::try_from(record.to_vec())?;
+                self.write(header, &Rec::Bam(&record))
+            }
         }
     }
 
@@ -122,18 +134,6 @@ impl AlignmentWriter {
             }
         }
     }
-}
-
-/// Writes a BAM record's `block_size` and raw bytes.
-pub fn write_raw_bam_record<W>(writer: &mut W, record: &bam::Record) -> io::Result<()>
-where
-    W: Write,
-{
-    let buf = record.as_ref();
-    let block_size =
-        u32::try_from(buf.len()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    writer.write_all(&block_size.to_le_bytes())?;
-    writer.write_all(buf)
 }
 
 /// Parses a samtools compression level (`0`–`9`).
