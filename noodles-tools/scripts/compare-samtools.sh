@@ -237,6 +237,17 @@ if command -v python3 >/dev/null; then
     done
 fi
 
+# ampliconclip, with primer pairs every 350 bp (and a few overlapping ones)
+awk 'BEGIN { print "# primers"; for (s = 0; s < 300000; s += 350) { printf "chrS\t%d\t%d\tamp%d_LEFT\t60\t+\n", s, s + 22, s; printf "chrS\t%d\t%d\tamp%d_RIGHT\t60\t-\n", s + 328, s + 350, s; if (s % 2450 == 0) printf "chrS\t%d\t%d\talt%d\t1\t+\n", s + 5, s + 30, s } }' > primers.bed
+for opts in "" "--hard-clip --original" "--both-ends --strand --keep-tag" "--both-ends --hard-clip --fail --fail-len 145 --filter-len 140" "--clipped --no-excluded --tolerance 0 --unmap-len 130"; do
+    check "ampliconclip $opts" \
+        "$st ampliconclip --no-PG -b primers.bed $opts -O sam -f st.amp.stats mp.short.bam; tail -n +2 st.amp.stats" \
+        "$nt ampliconclip --no-PG -b primers.bed $opts -O sam -f nt.amp.stats mp.short.bam; tail -n +2 nt.amp.stats"
+done
+check "ampliconclip --primer-counts" \
+    "$st ampliconclip --no-PG -b primers.bed --strand --primer-counts /dev/stdout -o /dev/null mp.short.bam" \
+    "$nt ampliconclip --no-PG -b primers.bed --strand --primer-counts /dev/stdout -o /dev/null mp.short.bam"
+
 # head, flags, samples
 check "head" "$st head $tagged" "$nt head $tagged"
 check "head -n 5 -h 2" "$st head -n 5 -h 2 $long" "$nt head -n 5 -h 2 $long"

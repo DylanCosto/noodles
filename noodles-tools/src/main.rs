@@ -82,6 +82,8 @@ enum Command {
     Bedcov(commands::bedcov::Args),
     /// Add or replace read group tags and header lines.
     Addreplacerg(commands::addreplacerg::Args),
+    /// Clip primer regions from reads.
+    Ampliconclip(commands::ampliconclip::Args),
     /// Print the header and first records as SAM.
     Head(commands::head::Args),
     /// Convert between numeric and textual flags.
@@ -121,6 +123,9 @@ fn main() -> ExitCode {
         Command::Bedcov(args) => commands::bedcov::run(args).map(|()| ExitCode::SUCCESS),
         Command::Addreplacerg(args) => {
             commands::addreplacerg::run(args).map(|()| ExitCode::SUCCESS)
+        }
+        Command::Ampliconclip(args) => {
+            commands::ampliconclip::run(args).map(|()| ExitCode::SUCCESS)
         }
         Command::Head(args) => commands::head::run(args).map(|()| ExitCode::SUCCESS),
         Command::Flags(args) => commands::flags::run(args),

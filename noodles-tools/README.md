@@ -40,6 +40,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `stats` | `stats` | all sections; `-r`, `-t`, regions, `-f/-F/-d`, `-c`, `-i`, `-m`, `-q`, `-l`, `-I`, `-S/-P`, `-p`, `-g`, `-x`, `--GC-depth`, `--ref-stats`; per-cycle counts use `-@` threads |
 | `mpileup` | `mpileup` | text pileup with BAQ (`-B`, `-E`), overlap removal (`-x`), `-f`, `-r`, `-l`, `-a/-aa`, `-q/-Q`, `-d`, `-A`, `-C`, `-G`, `-R`, `-6`, `--rf/--ff`, `-b`, `-X`, `-s`, `-O`, `--output-BP-5`, `--output-QNAME`, `--output-extra`, `--output-sep/-empty`, `--reverse-del`, `--no-output-ins/-del/-ends`, `-M` (base modifications from MM/ML, also in insertions unless `--no-output-ins-mods`); reads and BAQ use `-@` threads, and indexed inputs with several sequences pile up one chromosome per thread |
 | `calmd` | `calmd` | `-e`, `-r` (BAQ), `-A`, `-E`, `-n`, `-C`, `-d`, `-q`, `-N`, `-Q`, `-b/-u`; records are processed on `-@` threads |
+| `ampliconclip` | `ampliconclip` | soft or `--hard-clip`, `--both-ends`, `--strand`, `--tolerance`, `--original`, `--keep-tag`, `--clipped`, `--fail`, `--filter-len/--fail-len/--unmap-len`, `--no-excluded`, `--rejects-file`, `--primer-counts`, `-f` |
 | `head` | `head` | `-h` (header lines), `-n` (records) |
 | `flags` | `flags` | numbers and flag names, both ways |
 | `samples` | `samples` | `-h`, `-i`, `-T`, `-f/-F` (matching references), `-X`, `-o`, paths from stdin |
@@ -86,6 +87,8 @@ Intentional differences:
 - Header lines are written grouped by type (`@HD`, `@SQ`, `@RG`, `@PG`, `@CO`). HTSlib keeps
   the input's line order and appends new lines at the end, so `addreplacerg` places a new `@RG`
   line before existing `@PG` lines where samtools places it after them.
+- `ampliconclip` recalculates the BAM bin of clipped records; samtools keeps the original bin.
+  It keeps samtools' quirks otherwise, such as the read name in the `OA` tag's reference field.
 - `markdup`: with `-d`, duplicates whose names have no coordinates are not compared with each
   other; samtools compares them using uninitialized memory, so a chain mixing parseable and
   unparseable names can come out differently. `--read-coords` and `--barcode-rgx` take Rust

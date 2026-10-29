@@ -1,6 +1,7 @@
 //! Subcommands.
 
 pub mod addreplacerg;
+pub mod ampliconclip;
 pub mod bedcov;
 pub mod calmd;
 pub mod cat;
