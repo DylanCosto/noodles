@@ -35,7 +35,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `fixmate` | `fixmate` | `-m`, `-c`, `-r`, `-p`, `-z`; parallel with `-@` |
 | `dict` | `dict` | `-a`, `-s`, `-u`, `-H`, `-o` |
 | `bedcov` | `bedcov` | `-c`, `-d`, `-j`, `-Q`, `-g/-G`, `-H`; several inputs |
-| `addreplacerg` | `addreplacerg` | `-r` (repeatable, `\\t` escapes), `-R`, `-m overwrite_all\|orphan_only`, `-w` |
+| `addreplacerg` | `addreplacerg` | `-r` (repeatable, `\t` escapes), `-R`, `-m overwrite_all\|orphan_only`, `-w` |
 | `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-s/-f`, `--include-fails`, `--use-read-groups`, `--duplicate-count` |
 
 `-@ N` adds worker threads throughout. Beyond BGZF compression and decompression, which is what

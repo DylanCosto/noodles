@@ -92,7 +92,7 @@ fn write_raw_sequence<W>(writer: &mut W, sequence: &[u8]) -> io::Result<()>
 where
     W: Write,
 {
-    if sequence.iter().all(|&b| is_valid_base(b)) {
+    if all_valid_bases(sequence) {
         writer.write_all(sequence)
     } else {
         Err(io::Error::from(io::ErrorKind::InvalidInput))
@@ -117,7 +117,21 @@ where
 
 // § 1.4 "The alignment section: mandatory fields" (2024-11-06): `[A-Za-z=.]+`.
 fn is_valid_base(b: u8) -> bool {
-    matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'=' | b'.')
+    // Branch free, so that `all_valid_bases` vectorizes: setting bit 5 lowercases letters.
+    let is_letter = (b | 0x20).wrapping_sub(b'a') < 26;
+    is_letter | (b == b'=') | (b == b'.')
+}
+
+/// Checks bases in fixed-size chunks without short-circuiting within a chunk, which lets the
+/// check vectorize while still stopping early on invalid input.
+fn all_valid_bases(sequence: &[u8]) -> bool {
+    const CHUNK_LEN: usize = 64;
+
+    sequence.chunks(CHUNK_LEN).all(|chunk| {
+        chunk
+            .iter()
+            .fold(true, |valid, &b| valid & is_valid_base(b))
+    })
 }
 
 #[cfg(test)]

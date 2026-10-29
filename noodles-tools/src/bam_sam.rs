@@ -205,7 +205,11 @@ fn try_format(names: &Names, record: &[u8], dst: &mut Vec<u8>) -> Option<()> {
         }
         dst.push(b'*');
     } else {
-        if quality_scores.iter().any(|&q| q > MAX_QUALITY_SCORE) {
+        // Folded rather than short-circuited, so that the check vectorizes.
+        if quality_scores
+            .iter()
+            .fold(false, |any, &q| any | (q > MAX_QUALITY_SCORE))
+        {
             return None;
         }
         let start = dst.len();
@@ -298,7 +302,8 @@ fn write_data(dst: &mut Vec<u8>, mut src: &[u8]) -> Option<()> {
                 // Written as a range test so that the check over long strings (e.g., `MM`)
                 // vectorizes.
                 let valid = if ty == b'Z' {
-                    s.iter().all(|&c| (b' '..=b'~').contains(&c))
+                    s.iter()
+                        .fold(true, |valid, &c| valid & (b' '..=b'~').contains(&c))
                 } else {
                     s.len() % 2 == 0 && s.iter().all(|c| matches!(c, b'0'..=b'9' | b'A'..=b'F'))
                 };

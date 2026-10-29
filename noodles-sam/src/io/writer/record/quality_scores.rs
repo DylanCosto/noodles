@@ -43,7 +43,7 @@ where
 
     let mut buf = [0; CHUNK_SIZE];
 
-    if quality_scores.iter().all(|&n| is_valid_score(n)) {
+    if all_bytes(quality_scores, is_valid_score) {
         for chunk in quality_scores.chunks(CHUNK_SIZE) {
             for (&s, d) in chunk.iter().zip(&mut buf) {
                 *d = encode(s);
@@ -70,7 +70,7 @@ where
     match offset {
         0 => write_raw_quality_scores(writer, quality_scores)?,
         OFFSET => {
-            if quality_scores.iter().all(|&n| is_valid_encoded_score(n)) {
+            if all_bytes(quality_scores, is_valid_encoded_score) {
                 writer.write_all(quality_scores)?;
             } else {
                 return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -111,6 +111,18 @@ where
     }
 
     Ok(())
+}
+
+/// Checks bytes in fixed-size chunks without short-circuiting within a chunk, which lets the
+/// check vectorize while still stopping early on invalid input.
+fn all_bytes<F>(buf: &[u8], is_valid: F) -> bool
+where
+    F: Fn(u8) -> bool,
+{
+    const CHUNK_LEN: usize = 64;
+
+    buf.chunks(CHUNK_LEN)
+        .all(|chunk| chunk.iter().fold(true, |valid, &b| valid & is_valid(b)))
 }
 
 fn is_valid_score(score: u8) -> bool {
