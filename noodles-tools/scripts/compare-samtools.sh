@@ -169,6 +169,19 @@ check "stats -t -g 3 -p" "$st stats -t targets.txt -g 3 -p $short | $strip_stats
 check "stats regions --ref-stats" "$st stats --ref-stats -r $ref $short $regions | $strip_stats" "$nt stats --ref-stats -r $ref $short $regions | $strip_stats"
 check "stats -d -q 20 -i 500 -c 5,200,5 -x" "$st stats -d -q 20 -i 500 -c 5,200,5 -x $short | $strip_stats" "$nt stats -d -q 20 -i 500 -c 5,200,5 -x $short | $strip_stats"
 
+# Barcode tags with separators, length mismatches, and invalid characters
+"$st" view -h "$short" | head -40000 | awk 'BEGIN { OFS = "\t"; srand(3); b = "ACGTN" } /^@/ { print; next } {
+    bc = ""; q = ""
+    for (i = 0; i < 8; i++) { bc = bc substr(b, int(rand() * 5) + 1, 1); q = q sprintf("%c", 35 + int(rand() * 40)) }
+    r = rand()
+    if (r < 0.5) { $0 = $0 "\tBC:Z:" bc "-" substr(bc, 1, 6) "\tQT:Z:" q "!" substr(q, 1, 6) }
+    else if (r < 0.6) { $0 = $0 "\tBC:Z:" substr(bc, 1, 5) "\tQT:Z:" substr(q, 1, 4) }
+    else if (r < 0.65) { $0 = $0 "\tBC:Z:" bc "+X" }
+    if (rand() < 0.4) { $0 = $0 "\tRX:Z:" bc "\tQX:Z:" q }
+    if (rand() < 0.2) { $0 = $0 "\tCR:Z:" substr(bc, 1, 4) }
+    print }' > barcodes.sam
+check "stats barcodes" "$st stats barcodes.sam 2>/dev/null | $strip_stats" "$nt stats barcodes.sam 2>/dev/null | $strip_stats"
+
 if [ -f md.marked.bam ]; then
     check "stats -I a (marked)" "$st stats -I a md.marked.bam | $strip_stats" "$nt stats -I a md.marked.bam | $strip_stats"
 fi

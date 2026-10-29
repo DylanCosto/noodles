@@ -586,7 +586,50 @@ struct Stats {
     last_read_flush: u32,
 
     reference_stats: Option<ReferenceStats>,
+    barcodes: Vec<Barcode>,
+    /// Barcode errors reported so far (`error_number`).
+    barcode_errors: u32,
 }
+
+/// `barcode_info_t` and its counts: a barcode tag and its quality tag.
+struct Barcode {
+    tag: [u8; 2],
+    quality_tag: [u8; 2],
+    /// The barcode length, from the first barcode seen; 0 until then.
+    len: usize,
+    /// The position of a separator (a character other than A, C, G, T, or N), if any.
+    separator: Option<usize>,
+    max_qual: Option<usize>,
+    counts: Vec<BaseCounts>,
+    /// `[position * QUALITY_BINS + quality]`
+    quals: Vec<u64>,
+}
+
+impl Barcode {
+    fn new(tag: [u8; 2], quality_tag: [u8; 2]) -> Self {
+        Self {
+            tag,
+            quality_tag,
+            len: 0,
+            separator: None,
+            max_qual: None,
+            counts: Vec::new(),
+            quals: Vec::new(),
+        }
+    }
+
+    /// The (segment, cycle) a position is reported as: positions after a separator form a
+    /// second segment.
+    fn segment(&self, i: usize) -> (usize, usize) {
+        match self.separator {
+            Some(sep) if i >= sep => (2, i - sep),
+            _ => (1, i + 1),
+        }
+    }
+}
+
+/// The maximum barcode errors reported (`ERROR_LIMIT`).
+const BARCODE_ERROR_LIMIT: u32 = 200;
 
 /// The fixed fields and parts of an encoded BAM record.
 struct Bam<'a> {
@@ -1105,6 +1148,13 @@ impl Stats {
             last_pair_tid: -2,
             last_read_flush: 0,
             reference_stats: None,
+            barcodes: vec![
+                Barcode::new(*b"BC", *b"QT"),
+                Barcode::new(*b"CR", *b"CY"),
+                Barcode::new(*b"OX", *b"BZ"),
+                Barcode::new(*b"RX", *b"QX"),
+            ],
+            barcode_errors: 0,
         };
 
         stats.realloc_rseq_buffer(info);
@@ -1933,6 +1983,10 @@ impl Stats {
             }
         }
 
+        if order == READ_ORDER_FIRST {
+            self.collect_barcode_stats(bam);
+        }
+
         if bam.has(Flags::UNMAPPED) {
             self.nreads_unmapped += 1;
         } else {
@@ -1958,6 +2012,101 @@ impl Stats {
         }
 
         gc_count
+    }
+
+    /// `collect_barcode_stats`
+    fn collect_barcode_stats(&mut self, bam: &Bam<'_>) {
+        // `bam_aux2Z`: the value of a Z or H field.
+        let text = |tag: [u8; 2]| -> Option<&[u8]> {
+            let range = bam_raw::find_field(bam.raw, tag).ok()??;
+            matches!(bam.raw[range.start + 2], b'Z' | b'H')
+                .then(|| &bam.raw[range.start + 3..range.end - 1])
+        };
+
+        let name = String::from_utf8_lossy(bam.name);
+
+        for barcode in &mut self.barcodes {
+            let Some(sequence) = text(barcode.tag) else {
+                continue;
+            };
+
+            // An empty barcode counts as none.
+            if sequence.is_empty() {
+                continue;
+            }
+
+            if barcode.len == 0 {
+                barcode.len = sequence.len();
+                barcode.counts = vec![BaseCounts::default(); sequence.len()];
+                barcode.quals = vec![0; sequence.len() * QUALITY_BINS];
+            }
+
+            let tag = String::from_utf8_lossy(&barcode.tag);
+
+            if sequence.len() > barcode.len {
+                eprintln!("Barcodes with tag {tag} differ in length at sequence '{name}'");
+                continue;
+            }
+
+            let mut error = false;
+
+            for (i, &b) in sequence.iter().enumerate() {
+                let counts = &mut barcode.counts[i];
+
+                match b {
+                    b'A' => counts.a += 1,
+                    b'C' => counts.c += 1,
+                    b'G' => counts.g += 1,
+                    b'T' => counts.t += 1,
+                    b'N' => counts.n += 1,
+                    _ => match barcode.separator {
+                        Some(sep) if sep != i => {
+                            if self.barcode_errors < BARCODE_ERROR_LIMIT {
+                                eprintln!(
+                                    "Barcode separator for tag {tag} is in a different position or wrong barcode content('{}') at sequence '{name}'",
+                                    String::from_utf8_lossy(sequence)
+                                );
+                                self.barcode_errors += 1;
+                            }
+
+                            error = true;
+                        }
+                        Some(_) => {}
+                        None => barcode.separator = Some(i),
+                    },
+                }
+
+                if error {
+                    break;
+                }
+            }
+
+            if error {
+                continue;
+            }
+
+            let Some(qualities) = text(barcode.quality_tag) else {
+                continue;
+            };
+
+            if qualities.len() == sequence.len() {
+                for (i, &c) in qualities.iter().enumerate() {
+                    if let Some(qual) = c.checked_sub(b'!').map(usize::from) {
+                        barcode.quals[i * QUALITY_BINS + qual] += 1;
+                        barcode.max_qual = barcode.max_qual.max(Some(qual));
+                    }
+                }
+            } else {
+                if self.barcode_errors < BARCODE_ERROR_LIMIT {
+                    eprintln!(
+                        "{tag} length and {} length don't match for sequence '{name}'",
+                        String::from_utf8_lossy(&barcode.quality_tag)
+                    );
+                }
+
+                self.barcode_errors += 1;
+            }
+        }
     }
 
     /// `is_in_regions`
@@ -3063,6 +3212,62 @@ impl Stats {
                 "{total_label}\t{}\t{}\t{}\t{}\t{}",
                 totals.a, totals.c, totals.g, totals.t, totals.n
             )?;
+        }
+
+        for barcode in &self.barcodes {
+            if barcode.len == 0 {
+                continue;
+            }
+
+            let (tag, quality_tag) = (
+                String::from_utf8_lossy(&barcode.tag),
+                String::from_utf8_lossy(&barcode.quality_tag),
+            );
+
+            writeln!(
+                out,
+                "# ACGT content per cycle for barcodes. Use `grep ^{tag}C | cut -f 2-` to extract this part. The columns are: cycle; A,C,G,T base counts as a percentage of all A/C/G/T bases [%]; and N counts as a percentage of all A/C/G/T bases [%]"
+            )?;
+
+            for (i, c) in barcode.counts.iter().enumerate() {
+                if barcode.separator == Some(i) {
+                    continue;
+                }
+
+                let sum = c.a + c.c + c.g + c.t;
+
+                if sum > 0 {
+                    let (segment, cycle) = barcode.segment(i);
+                    let label = format!("{tag}C{segment}");
+                    write_percent_row(out, &label, cycle, &[c.a, c.c, c.g, c.t, c.n], sum)?;
+                }
+            }
+
+            writeln!(
+                out,
+                "# Barcode Qualities. Use `grep ^{quality_tag}Q | cut -f 2-` to extract this part."
+            )?;
+            writeln!(
+                out,
+                "# Columns correspond to qualities and rows to barcode cycles. First column is the cycle number."
+            )?;
+
+            for i in 0..barcode.len {
+                if barcode.separator == Some(i) {
+                    continue;
+                }
+
+                let (segment, cycle) = barcode.segment(i);
+                write!(out, "{quality_tag}Q{segment}\t{cycle}")?;
+
+                if let Some(max_qual) = barcode.max_qual {
+                    for &n in &barcode.quals[i * QUALITY_BINS..=i * QUALITY_BINS + max_qual] {
+                        write!(out, "\t{n}")?;
+                    }
+                }
+
+                writeln!(out)?;
+            }
         }
 
         writeln!(
