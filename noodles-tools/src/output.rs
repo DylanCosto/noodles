@@ -64,7 +64,7 @@ impl AlignmentWriter {
             Some(path) if path != Path::new("-") => Box::new(
                 File::create(path).with_context(|| format!("creating {}", path.display()))?,
             ),
-            _ => Box::new(io::stdout()),
+            _ => raw_stdout()?,
         };
 
         Ok(match options.format {
@@ -134,6 +134,25 @@ impl AlignmentWriter {
             }
         }
     }
+}
+
+/// Returns stdout without Rust's line buffering, which scans every write for newlines; callers
+/// buffer output themselves.
+#[cfg(unix)]
+fn raw_stdout() -> anyhow::Result<Sink> {
+    use std::os::fd::AsFd;
+
+    let fd = io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .context("duplicating stdout")?;
+
+    Ok(Box::new(File::from(fd)))
+}
+
+#[cfg(not(unix))]
+fn raw_stdout() -> anyhow::Result<Sink> {
+    Ok(Box::new(io::stdout()))
 }
 
 /// Parses a samtools compression level (`0`–`9`).

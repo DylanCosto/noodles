@@ -270,12 +270,7 @@ where
     let len = count;
     let buf = src.split_off(..len).ok_or_else(unexpected_eof)?;
 
-    for &n in buf {
-        writer.write_all(&[ARRAY_ITEM_SEPARATOR])?;
-        num::write_i8(writer, n as i8)?;
-    }
-
-    Ok(())
+    write_integer_array_values(writer, buf.iter().map(|&n| n as i8))
 }
 
 fn write_u8_array_field<W>(
@@ -292,12 +287,7 @@ where
     let len = count;
     let buf = src.split_off(..len).ok_or_else(unexpected_eof)?;
 
-    for &n in buf {
-        writer.write_all(&[ARRAY_ITEM_SEPARATOR])?;
-        num::write_u8(writer, n)?;
-    }
-
-    Ok(())
+    write_integer_array_values(writer, buf.iter().copied())
 }
 
 fn write_i16_array_field<W>(
@@ -318,14 +308,10 @@ where
         unreachable!();
     };
 
-    for chunk in chunks {
-        writer.write_all(&[ARRAY_ITEM_SEPARATOR])?;
-
-        let n = i16::from_le_bytes(*chunk);
-        num::write_i16(writer, n)?;
-    }
-
-    Ok(())
+    write_integer_array_values(
+        writer,
+        chunks.iter().map(|chunk| i16::from_le_bytes(*chunk)),
+    )
 }
 
 fn write_u16_array_field<W>(
@@ -346,14 +332,10 @@ where
         unreachable!();
     };
 
-    for chunk in chunks {
-        writer.write_all(&[ARRAY_ITEM_SEPARATOR])?;
-
-        let n = u16::from_le_bytes(*chunk);
-        num::write_u16(writer, n)?;
-    }
-
-    Ok(())
+    write_integer_array_values(
+        writer,
+        chunks.iter().map(|chunk| u16::from_le_bytes(*chunk)),
+    )
 }
 
 fn write_i32_array_field<W>(
@@ -374,14 +356,10 @@ where
         unreachable!();
     };
 
-    for chunk in chunks {
-        writer.write_all(&[ARRAY_ITEM_SEPARATOR])?;
-
-        let n = i32::from_le_bytes(*chunk);
-        num::write_i32(writer, n)?;
-    }
-
-    Ok(())
+    write_integer_array_values(
+        writer,
+        chunks.iter().map(|chunk| i32::from_le_bytes(*chunk)),
+    )
 }
 
 fn write_u32_array_field<W>(
@@ -402,14 +380,10 @@ where
         unreachable!();
     };
 
-    for chunk in chunks {
-        writer.write_all(&[ARRAY_ITEM_SEPARATOR])?;
-
-        let n = u32::from_le_bytes(*chunk);
-        num::write_u32(writer, n)?;
-    }
-
-    Ok(())
+    write_integer_array_values(
+        writer,
+        chunks.iter().map(|chunk| u32::from_le_bytes(*chunk)),
+    )
 }
 
 fn write_f32_array_field<W>(
@@ -443,6 +417,33 @@ where
     }
 
     Ok(())
+}
+
+/// Writes `,`-prefixed integers through a stack buffer, so an array costs a few writes rather than
+/// two per element.
+fn write_integer_array_values<W, T, I>(writer: &mut W, values: I) -> io::Result<()>
+where
+    W: Write,
+    T: lexical_core::ToLexical,
+    I: IntoIterator<Item = T>,
+{
+    const BUF_LEN: usize = 4096;
+
+    let mut buf = [0; BUF_LEN];
+    let mut len = 0;
+
+    for n in values {
+        if len + 1 + T::FORMATTED_SIZE_DECIMAL > BUF_LEN {
+            writer.write_all(&buf[..len])?;
+            len = 0;
+        }
+
+        buf[len] = ARRAY_ITEM_SEPARATOR;
+        len += 1;
+        len += lexical_core::write(n, &mut buf[len..]).len();
+    }
+
+    writer.write_all(&buf[..len])
 }
 
 fn write_array_field_prefix<W>(writer: &mut W, tag: Tag, subtype: u8) -> io::Result<()>
@@ -724,6 +725,30 @@ mod tests {
             write_f32_array_field(&mut buf, &mut &src[..], tag, 1),
             Err(e) if e.kind() == io::ErrorKind::InvalidInput
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_array_field_longer_than_the_format_buffer() -> io::Result<()> {
+        let values: Vec<u32> = (0..2000).map(|i| i * 1_000_003).collect();
+
+        let mut src = vec![b'I'];
+        src.extend(u32::try_from(values.len()).unwrap().to_le_bytes());
+        for n in &values {
+            src.extend(n.to_le_bytes());
+        }
+
+        let mut buf = Vec::new();
+        write_array_field(&mut buf, &mut &src[..], [b'Z', b'Z'])?;
+
+        let mut expected = b"\tZZ:B:I".to_vec();
+        for n in &values {
+            expected.extend(format!(",{n}").as_bytes());
+        }
+
+        assert!(expected.len() > 4096);
+        assert_eq!(buf, expected);
 
         Ok(())
     }
