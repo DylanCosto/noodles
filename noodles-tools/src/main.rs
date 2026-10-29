@@ -12,6 +12,7 @@ mod parallel_sam;
 mod program;
 mod regions;
 mod runs;
+mod sequence;
 mod sort_order;
 mod source;
 
@@ -42,6 +43,10 @@ enum Command {
     Sort(commands::sort::Args),
     /// Merge sorted BAM files.
     Merge(commands::merge::Args),
+    /// Convert alignments to FASTQ.
+    Fastq(commands::fastq::Args),
+    /// Convert alignments to FASTA.
+    Fasta(commands::fastq::Args),
 }
 
 fn main() -> ExitCode {
@@ -55,6 +60,8 @@ fn main() -> ExitCode {
         Command::Faidx(args) => commands::faidx::run(args),
         Command::Sort(args) => commands::sort::run(args),
         Command::Merge(args) => commands::merge::run(args),
+        Command::Fastq(args) => commands::fastq::run(args, commands::fastq::ReadFormat::Fastq),
+        Command::Fasta(args) => commands::fastq::run(args, commands::fastq::ReadFormat::Fasta),
     };
 
     match result {

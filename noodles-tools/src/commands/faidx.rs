@@ -11,6 +11,8 @@ use anyhow::Context;
 use noodles_core::Region;
 use noodles_fasta::{self as fasta, fai};
 
+use crate::sequence::reverse_complement;
+
 #[derive(Debug, clap::Args)]
 pub struct Args {
     /// FASTA file.
@@ -133,49 +135,4 @@ fn build_index(src: &Path) -> anyhow::Result<()> {
     writer.get_mut().flush()?;
 
     Ok(())
-}
-
-/// Reverse complements IUPAC nucleotides in place, preserving case, as samtools does.
-fn reverse_complement(sequence: &mut [u8]) {
-    sequence.reverse();
-
-    for base in sequence {
-        *base = complement(*base);
-    }
-}
-
-fn complement(base: u8) -> u8 {
-    let c = match base.to_ascii_uppercase() {
-        b'A' => b'T',
-        b'C' => b'G',
-        b'G' => b'C',
-        b'T' | b'U' => b'A',
-        b'R' => b'Y',
-        b'Y' => b'R',
-        b'K' => b'M',
-        b'M' => b'K',
-        b'B' => b'V',
-        b'V' => b'B',
-        b'D' => b'H',
-        b'H' => b'D',
-        other => other,
-    };
-
-    if base.is_ascii_lowercase() {
-        c.to_ascii_lowercase()
-    } else {
-        c
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_reverse_complement() {
-        let mut s = b"ACGTNacgtnRY".to_vec();
-        reverse_complement(&mut s);
-        assert_eq!(s, b"RYnacgtNACGT");
-    }
 }

@@ -53,7 +53,7 @@ pub struct WriteOptions {
     pub reference: Option<PathBuf>,
 }
 
-type Sink = Box<dyn Write + Send>;
+pub type Sink = Box<dyn Write + Send>;
 
 /// An open alignment writer.
 pub enum AlignmentWriter {
@@ -204,7 +204,7 @@ impl AlignmentWriter {
 /// Returns stdout without Rust's line buffering, which scans every write for newlines; callers
 /// buffer output themselves.
 #[cfg(unix)]
-fn raw_stdout() -> anyhow::Result<Sink> {
+pub fn raw_stdout() -> anyhow::Result<Sink> {
     use std::os::fd::AsFd;
 
     let fd = io::stdout()
@@ -216,7 +216,7 @@ fn raw_stdout() -> anyhow::Result<Sink> {
 }
 
 #[cfg(not(unix))]
-fn raw_stdout() -> anyhow::Result<Sink> {
+pub fn raw_stdout() -> anyhow::Result<Sink> {
     Ok(Box::new(io::stdout()))
 }
 
