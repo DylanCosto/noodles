@@ -5,6 +5,7 @@ mod bam_blocks;
 mod bam_raw;
 mod bgzf_stream;
 mod commands;
+mod depth;
 mod filter;
 mod flags;
 mod output;
@@ -54,6 +55,10 @@ enum Command {
     Reheader(commands::reheader::Args),
     /// Concatenate BAM files without recompressing records.
     Cat(commands::cat::Args),
+    /// Report per-position read depth.
+    Depth(commands::depth::Args),
+    /// Summarize coverage per reference sequence.
+    Coverage(commands::coverage::Args),
 }
 
 fn main() -> ExitCode {
@@ -74,6 +79,8 @@ fn main() -> ExitCode {
         Command::Quickcheck(args) => commands::quickcheck::run(args),
         Command::Reheader(args) => commands::reheader::run(args).map(|()| ExitCode::SUCCESS),
         Command::Cat(args) => commands::cat::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Depth(args) => commands::depth::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Coverage(args) => commands::coverage::run(args).map(|()| ExitCode::SUCCESS),
     };
 
     match result {
