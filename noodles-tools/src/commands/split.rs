@@ -18,8 +18,11 @@ use crate::{
     program,
 };
 
-/// samtools' default output name: input basename, group index, and format extension.
+/// samtools' default output name when splitting by read group: basename, index, extension.
 const DEFAULT_FORMAT: &str = "%*_%#.%.";
+
+/// samtools' default output name when splitting by tag: basename, tag value, extension.
+const DEFAULT_TAG_FORMAT: &str = "%*_%!.%.";
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -30,9 +33,14 @@ pub struct Args {
     #[arg(short = 'u')]
     unaccounted: Option<PathBuf>,
 
-    /// Output name format: %* input basename, %# group index, %! group ID, %. extension, %%.
-    #[arg(short = 'f', default_value = DEFAULT_FORMAT)]
-    format: String,
+    /// Output name format: %* input basename, %# group index, %! group ID or tag value,
+    /// %. extension, %% [default: %*_%#.%., or %*_%!.%. with -d].
+    #[arg(short = 'f')]
+    format: Option<String>,
+
+    /// Zero-pad %# to this many digits.
+    #[arg(short = 'p', default_value_t = 0)]
+    pad: usize,
 
     /// Split by the value of this tag instead of by read group.
     #[arg(short = 'd')]
@@ -43,7 +51,12 @@ pub struct Args {
     max_split: usize,
 
     /// Output format.
-    #[arg(short = 'O', long = "output-fmt", ignore_case = true, default_value = "bam")]
+    #[arg(
+        short = 'O',
+        long = "output-fmt",
+        ignore_case = true,
+        default_value = "bam"
+    )]
     output_format: OutputFormat,
 
     /// Print the name of each output file to stderr.
@@ -101,6 +114,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     };
 
     let splitting_by_read_group = args.tag.is_none();
+    let format = args.format.clone().unwrap_or_else(|| {
+        if splitting_by_read_group {
+            DEFAULT_FORMAT.to_owned()
+        } else {
+            DEFAULT_TAG_FORMAT.to_owned()
+        }
+    });
+    let pad = args.pad;
     let basename = basename(&args.input);
     let extension = extension(args.output_format);
 
@@ -110,8 +131,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     if splitting_by_read_group {
         for (i, id) in header.read_groups().keys().enumerate() {
             let group_header = read_group_header(&header, id);
-            let path = output_path(&args.format, &basename, i, id.as_ref(), extension)?;
-            groups.push(open_group(&path, group_header, &write_options, args.verbose)?);
+            let path = output_path(&format, &basename, i, pad, id.as_ref(), extension)?;
+            groups.push(open_group(
+                &path,
+                group_header,
+                &write_options,
+                args.verbose,
+            )?);
             ids.insert(id.clone(), i);
         }
     }
@@ -125,7 +151,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         None => None,
     };
 
-    reader.for_each(&header.clone(), |record| {
+    reader.for_each(&header, |record| {
         let value = match record.as_dyn().data().get(&tag).transpose()? {
             Some(Value::String(s)) => Some(BString::from(s.as_bytes())),
             Some(Value::Character(c)) => Some(BString::from(vec![c])),
@@ -147,8 +173,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     }
 
                     let i = groups.len();
-                    let path = output_path(&args.format, &basename, i, &value, extension)?;
-                    groups.push(open_group(&path, header.clone(), &write_options, args.verbose)?);
+                    let path = output_path(&format, &basename, i, pad, &value, extension)?;
+                    groups.push(open_group(
+                        &path,
+                        header.clone(),
+                        &write_options,
+                        args.verbose,
+                    )?);
                     ids.insert(value, i);
                     Some(i)
                 }
@@ -163,8 +194,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 group.writer.write(&group.header, &record)?;
             }
             (None, Some(writer)) => writer.write(&header, &record)?,
+            // samtools' message and exit status.
             (None, None) => bail!(
-                "a read has no {} tag (or an unknown value); use -u to keep such reads",
+                "Read \"{}\" has no {} tag.",
+                record
+                    .as_dyn()
+                    .name()
+                    .map_or_else(|| "*".into(), |name| name.to_string()),
                 String::from_utf8_lossy(tag.as_ref())
             ),
         }
@@ -210,6 +246,7 @@ fn output_path(
     format: &str,
     basename: &str,
     index: usize,
+    pad: usize,
     id: &[u8],
     extension: &str,
 ) -> anyhow::Result<PathBuf> {
@@ -225,7 +262,7 @@ fn output_path(
         match chars.next() {
             Some('%') => name.push('%'),
             Some('*') => name.push_str(basename),
-            Some('#') => name.push_str(&index.to_string()),
+            Some('#') => name.push_str(&format!("{index:0pad$}")),
             Some('!') => name.push_str(&String::from_utf8_lossy(id)),
             Some('.') => name.push_str(extension),
             Some(other) => bail!("invalid format specifier: %{other}"),
@@ -263,14 +300,18 @@ mod tests {
     #[test]
     fn test_output_path() -> anyhow::Result<()> {
         assert_eq!(
-            output_path(DEFAULT_FORMAT, "in", 2, b"rg2", "bam")?,
+            output_path(DEFAULT_FORMAT, "in", 2, 0, b"rg2", "bam")?,
             PathBuf::from("in_2.bam")
         );
         assert_eq!(
-            output_path("x/%!-%%.%.", "in", 0, b"A", "sam")?,
+            output_path(DEFAULT_FORMAT, "in", 2, 3, b"rg2", "bam")?,
+            PathBuf::from("in_002.bam")
+        );
+        assert_eq!(
+            output_path("x/%!-%%.%.", "in", 0, 0, b"A", "sam")?,
             PathBuf::from("x/A-%.sam")
         );
-        assert!(output_path("%q", "in", 0, b"A", "sam").is_err());
+        assert!(output_path("%q", "in", 0, 0, b"A", "sam").is_err());
         Ok(())
     }
 

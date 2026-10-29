@@ -60,6 +60,8 @@ enum Command {
     Depth(commands::depth::Args),
     /// Summarize coverage per reference sequence.
     Coverage(commands::coverage::Args),
+    /// Write one file per read group or tag value.
+    Split(commands::split::Args),
 }
 
 fn main() -> ExitCode {
@@ -82,6 +84,7 @@ fn main() -> ExitCode {
         Command::Cat(args) => commands::cat::run(args).map(|()| ExitCode::SUCCESS),
         Command::Depth(args) => commands::depth::run(args).map(|()| ExitCode::SUCCESS),
         Command::Coverage(args) => commands::coverage::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Split(args) => commands::split::run(args).map(|()| ExitCode::SUCCESS),
     };
 
     match result {
