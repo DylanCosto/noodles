@@ -71,5 +71,8 @@ row "markdup, short" "markdup $work/fixed.bam $work/x.bam" "markdup $work/fixed.
 row "markdup, short, -@4" "markdup -@4 $work/fixed.bam $work/x.bam" "markdup -@ 4 $work/fixed.bam $work/x.bam"
 row "fastq, short" "fastq $short" "fastq $short"
 row "depth, short" "depth $short" "depth $short"
+row "stats, short" "stats $short" "stats $short"
+row "stats, short, -@4" "stats -@ 4 $short" "stats -@ 4 $short"
+row "stats, long, -@8" "stats -@ 8 $long" "stats -@ 8 $long"
 row "coverage, short" "coverage $short" "coverage $short"
 row "faidx 1024 regions" "faidx -r $corpus/fasta-regions.1024.txt $corpus/fragmented-reference.fa" "faidx -r $corpus/fasta-regions.1024.txt $corpus/fragmented-reference.fa"

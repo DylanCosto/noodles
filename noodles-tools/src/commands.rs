@@ -19,4 +19,5 @@ pub mod quickcheck;
 pub mod reheader;
 pub mod sort;
 pub mod split;
+pub mod stats;
 pub mod view;

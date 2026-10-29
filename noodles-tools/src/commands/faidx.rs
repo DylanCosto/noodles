@@ -134,7 +134,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
 /// Reads the bases of the 1-based closed interval `[start, end]` into `sequence`, reading the
 /// whole span at once and dropping line endings, as samtools does.
-fn read_bases(
+pub(crate) fn read_bases(
     file: &File,
     record: &fai::Record,
     start: usize,

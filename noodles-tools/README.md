@@ -37,6 +37,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `bedcov` | `bedcov` | `-c`, `-d`, `-j`, `-Q`, `-g/-G`, `-H`; several inputs |
 | `addreplacerg` | `addreplacerg` | `-r` (repeatable, `\t` escapes), `-R`, `-m overwrite_all\|orphan_only`, `-w` |
 | `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-S`, `-t`, `-d` (optical duplicates), `-T`, `-s/-f`, `--json`, `--no-multi-dup`, `--include-fails`, `--use-read-groups`, `--duplicate-count` |
+| `stats` | `stats` | all sections; `-r`, `-t`, regions, `-f/-F/-d`, `-c`, `-i`, `-m`, `-q`, `-l`, `-I`, `-S/-P`, `-p`, `-g`, `-x`, `--GC-depth`, `--ref-stats`; per-cycle counts use `-@` threads |
 
 `-@ N` adds worker threads throughout. Beyond BGZF compression and decompression, which is what
 samtools mostly uses its threads for, ntools also formats SAM text, decodes CRAM containers,
@@ -92,29 +93,32 @@ libdeflate. "short" is 1M synthetic 150 bp paired reads, "tagged" 250k reads wit
 
 | Operation | samtools (s) | ntools (s) | Speedup |
 |---|---:|---:|---:|
-| view BAM->SAM, short | 0.388 | 0.367 | 1.06x |
-| view BAM->SAM, long | 2.129 | 1.707 | 1.25x |
-| view BAM->SAM, long, -@4 | 0.569 | 0.350 | 1.63x |
-| view BAM->SAM, long, -@8 | 0.301 | 0.236 | 1.28x |
-| view CRAM->SAM, short | 0.887 | 1.073 | 0.83x |
-| view CRAM->SAM, long | 2.908 | 2.571 | 1.13x |
-| view CRAM->SAM, long, -@8 | 0.569 | 0.355 | 1.60x |
-| view CRAM->BAM, long, -@8 | 2.119 | 1.414 | 1.50x |
-| view BAM->BAM, long, -@4 | 3.368 | 2.348 | 1.43x |
-| view -c -q 30, short | 0.145 | 0.149 | 0.97x |
-| flagstat, long, -@4 | 0.330 | 0.341 | 0.97x |
-| index, long, -@4 | 0.333 | 0.341 | 0.98x |
-| sort, short, -@4 | 0.991 | 0.577 | 1.72x |
-| sort -n, short, -@4 | 1.063 | 0.576 | 1.85x |
-| collate -Ou, short, -@4 | 2.109 | 0.380 | 5.55x |
-| fixmate -m, short | 3.416 | 3.353 | 1.02x |
-| fixmate -m, short, -@4 | 0.888 | 0.444 | 2.00x |
-| markdup, short | 3.822 | 2.400 | 1.59x |
-| markdup, short, -@4 | 0.912 | 0.695 | 1.31x |
-| fastq, short | 0.606 | 0.663 | 0.91x |
-| depth, short | 0.284 | 0.316 | 0.90x |
-| coverage, short | 1.143 | 0.406 | 2.82x |
-| faidx 1024 regions | 0.018 | 0.020 | 0.90x |
+| view BAM->SAM, short | 0.381 | 0.352 | 1.08x |
+| view BAM->SAM, long | 2.140 | 1.711 | 1.25x |
+| view BAM->SAM, long, -@4 | 0.572 | 0.348 | 1.64x |
+| view BAM->SAM, long, -@8 | 0.299 | 0.235 | 1.27x |
+| view CRAM->SAM, short | 0.888 | 1.063 | 0.84x |
+| view CRAM->SAM, long | 2.884 | 2.562 | 1.13x |
+| view CRAM->SAM, long, -@8 | 0.568 | 0.354 | 1.60x |
+| view CRAM->BAM, long, -@8 | 2.133 | 1.405 | 1.52x |
+| view BAM->BAM, long, -@4 | 3.367 | 2.364 | 1.42x |
+| view -c -q 30, short | 0.145 | 0.148 | 0.98x |
+| flagstat, long, -@4 | 0.331 | 0.339 | 0.98x |
+| index, long, -@4 | 0.333 | 0.340 | 0.98x |
+| sort, short, -@4 | 0.997 | 0.586 | 1.70x |
+| sort -n, short, -@4 | 1.070 | 0.579 | 1.85x |
+| collate -Ou, short, -@4 | 2.087 | 0.370 | 5.64x |
+| fixmate -m, short | 3.509 | 3.363 | 1.04x |
+| fixmate -m, short, -@4 | 0.888 | 0.472 | 1.88x |
+| markdup, short | 3.822 | 2.401 | 1.59x |
+| markdup, short, -@4 | 0.911 | 0.725 | 1.26x |
+| fastq, short | 0.607 | 0.649 | 0.94x |
+| depth, short | 0.284 | 0.315 | 0.90x |
+| stats, short | 1.658 | 1.085 | 1.53x |
+| stats, short, -@4 | 1.584 | 0.661 | 2.40x |
+| stats, long, -@8 | 5.674 | 1.484 | 3.82x |
+| coverage, short | 1.143 | 0.446 | 2.56x |
+| faidx 1024 regions | 0.018 | 0.022 | 0.82x |
 
 Where ntools is slower, it is single-threaded. Short-read CRAM decoding still trails HTSlib in
 per-record tag decoding and allocation; its rANS decoding (AVX2) now keeps pace with HTSlib's.

@@ -156,5 +156,22 @@ check "bedcov -c -d 5" "$st bedcov -c -d 5 q.bed $short" "$nt bedcov -c -d 5 q.b
 check "bedcov long -j" "$st bedcov -j $(head -30 "$corpus/long/queries.100.bed" > lq.bed; echo lq.bed) $long" "$nt bedcov -j lq.bed $long"
 check "addreplacerg records" "$st addreplacerg --no-PG -r 'ID:z\tSM:z' multi.bam | grep -v '^@'" "$nt addreplacerg --no-PG -r 'ID:z\tSM:z' multi.bam | grep -v '^@'"
 
+# stats, without the version and command lines
+strip_stats="grep -v '^# This file was produced\|^# The command line'"
+awk 'BEGIN { OFS = "\t" } { print $1, $2 + 1, $3 }' "$corpus/short/queries.100.bed" | sort -k1,1 -k2,2n > targets.txt
+check "stats" "$st stats $short | $strip_stats" "$nt stats $short | $strip_stats"
+check "stats -r -@4" "$st stats -r $ref $short | $strip_stats" "$nt stats -@ 4 -r $ref $short | $strip_stats"
+check "stats long -r -@8" "$st stats -r $long_ref $long | $strip_stats" "$nt stats -@ 8 -r $long_ref $long | $strip_stats"
+check "stats tagged" "$st stats $tagged | $strip_stats" "$nt stats $tagged | $strip_stats"
+check "stats CRAM" "$st stats --reference $ref $corpus/short/input.3.1.cram | $strip_stats" "$nt stats --reference $ref $corpus/short/input.3.1.cram | $strip_stats"
+check "stats unsorted" "$st stats short.name.bam | $strip_stats" "$nt stats short.name.bam | $strip_stats"
+check "stats -t -g 3 -p" "$st stats -t targets.txt -g 3 -p $short | $strip_stats" "$nt stats -t targets.txt -g 3 -p $short | $strip_stats"
+check "stats regions --ref-stats" "$st stats --ref-stats -r $ref $short $regions | $strip_stats" "$nt stats --ref-stats -r $ref $short $regions | $strip_stats"
+check "stats -d -q 20 -i 500 -c 5,200,5 -x" "$st stats -d -q 20 -i 500 -c 5,200,5 -x $short | $strip_stats" "$nt stats -d -q 20 -i 500 -c 5,200,5 -x $short | $strip_stats"
+
+if [ -f md.marked.bam ]; then
+    check "stats -I a (marked)" "$st stats -I a md.marked.bam | $strip_stats" "$nt stats -I a md.marked.bam | $strip_stats"
+fi
+
 echo "$failures difference(s)"
 [ "$failures" -eq 0 ]

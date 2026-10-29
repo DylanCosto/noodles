@@ -68,6 +68,8 @@ enum Command {
     Fixmate(commands::fixmate::Args),
     /// Mark duplicate alignments.
     Markdup(commands::markdup::Args),
+    /// Alignment statistics for plot-bamstats.
+    Stats(commands::stats::Args),
     /// Write a SAM sequence dictionary for a FASTA file.
     Dict(commands::dict::Args),
     /// Sum read depth over BED regions.
@@ -100,6 +102,7 @@ fn main() -> ExitCode {
         Command::Collate(args) => commands::collate::run(args).map(|()| ExitCode::SUCCESS),
         Command::Fixmate(args) => commands::fixmate::run(args).map(|()| ExitCode::SUCCESS),
         Command::Markdup(args) => commands::markdup::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Stats(args) => commands::stats::run(args).map(|()| ExitCode::SUCCESS),
         Command::Dict(args) => commands::dict::run(args).map(|()| ExitCode::SUCCESS),
         Command::Bedcov(args) => commands::bedcov::run(args).map(|()| ExitCode::SUCCESS),
         Command::Addreplacerg(args) => {
