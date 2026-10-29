@@ -242,7 +242,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     if !args.header_only {
         let parallel_kind = writer.preformatted_kind();
 
-        if let (AlignmentReader::Cram(cram_reader, repository), true, Some(kind)) =
+        if let (AlignmentReader::Cram(cram_reader, repository, _), true, Some(kind)) =
             (&mut reader, can_parallelize, parallel_kind)
         {
             write_cram_in_parallel(
@@ -387,7 +387,8 @@ fn count(
 ) -> anyhow::Result<u64> {
     let mut n = 0u64;
 
-    if let (AlignmentReader::Cram(cram_reader, repository), true) = (&mut *reader, can_parallelize)
+    if let (AlignmentReader::Cram(cram_reader, repository, _), true) =
+        (&mut *reader, can_parallelize)
     {
         parallel_cram::decode(
             cram_reader,

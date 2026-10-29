@@ -91,8 +91,22 @@ type BamReader = bam::io::Reader<BgzfReader<BufReader<Stream>>>;
 pub enum AlignmentReader {
     Sam(sam::io::Reader<Box<dyn BufRead + Send>>),
     Bam(BamReader),
-    /// A CRAM reader and the reference repository it decodes with.
-    Cram(cram::io::Reader<BufReader<Stream>>, fasta::Repository),
+    /// A CRAM reader, the reference repository it decodes with, and where the reference comes
+    /// from.
+    Cram(
+        cram::io::Reader<BufReader<Stream>>,
+        fasta::Repository,
+        ReferenceSource,
+    ),
+}
+
+/// Where a CRAM reader's reference sequences come from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceSource {
+    /// A FASTA file given with `--reference`.
+    Given,
+    /// The FASTA file named by the header's `@SQ` `UR` fields, as HTSlib finds it.
+    Header,
 }
 
 impl AlignmentReader {
@@ -128,11 +142,18 @@ impl AlignmentReader {
             }
             (Format::Cram, _) => {
                 let repository = reference_repository(options.reference.as_deref())?;
+                let source = if options.reference.is_some() {
+                    ReferenceSource::Given
+                } else {
+                    ReferenceSource::Header
+                };
+
                 Self::Cram(
                     cram::io::reader::Builder::default()
                         .set_reference_sequence_repository(repository.clone())
                         .build_from_reader(reader),
                     repository,
+                    source,
                 )
             }
         })
@@ -142,17 +163,26 @@ impl AlignmentReader {
         match self {
             Self::Sam(_) => Format::Sam,
             Self::Bam(_) => Format::Bam,
-            Self::Cram(_, _) => Format::Cram,
+            Self::Cram(..) => Format::Cram,
         }
     }
 
     pub fn read_header(&mut self) -> anyhow::Result<sam::Header> {
-        match self {
+        let header = match self {
             Self::Sam(r) => r.read_header(),
             Self::Bam(r) => r.read_header(),
-            Self::Cram(r, _) => r.read_header(),
+            Self::Cram(r, _, _) => r.read_header(),
         }
-        .context("reading header")
+        .context("reading header")?;
+
+        if let Self::Cram(r, repository, ReferenceSource::Header) = self
+            && let Some(path) = header_reference(&header)
+        {
+            *repository = reference_repository(Some(&path))?;
+            r.set_reference_sequence_repository(repository.clone());
+        }
+
+        Ok(header)
     }
 
     /// Calls `f` with every record in file order.
@@ -160,20 +190,32 @@ impl AlignmentReader {
     where
         F: FnMut(Rec<'_>) -> anyhow::Result<()>,
     {
+        self.for_each_while(header, |rec| f(rec).map(|()| true))
+    }
+
+    /// Calls `f` with records in file order until it returns `false`.
+    pub fn for_each_while<F>(&mut self, header: &sam::Header, mut f: F) -> anyhow::Result<()>
+    where
+        F: FnMut(Rec<'_>) -> anyhow::Result<bool>,
+    {
         match self {
             Self::Bam(reader) => {
                 let mut record = bam::Record::default();
                 while reader.read_record(&mut record)? != 0 {
-                    f(Rec::Bam(&record))?;
+                    if !f(Rec::Bam(&record))? {
+                        return Ok(());
+                    }
                 }
             }
             Self::Sam(reader) => {
                 let mut record = sam::Record::default();
                 while reader.read_record(&mut record)? != 0 {
-                    f(Rec::Sam(&record))?;
+                    if !f(Rec::Sam(&record))? {
+                        return Ok(());
+                    }
                 }
             }
-            Self::Cram(reader, repository) => {
+            Self::Cram(reader, repository, _) => {
                 // Decoding containers directly avoids converting each record to a `RecordBuf`, and
                 // encoding records as BAM lets callers use their raw BAM paths.
                 let mut container = cram::io::reader::Container::default();
@@ -196,7 +238,9 @@ impl AlignmentReader {
 
                         for record in &records {
                             encode_cram_record(header, record, &mut bam_record)?;
-                            f(Rec::Bam(&bam_record))?;
+                            if !f(Rec::Bam(&bam_record))? {
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -280,7 +324,7 @@ impl AlignmentReader {
                     }
                 }
             }
-            (Self::Cram(reader, _), AlignmentIndex::Cram(index)) => {
+            (Self::Cram(reader, _, _), AlignmentIndex::Cram(index)) => {
                 for query in &queries {
                     match query {
                         Query::Unmapped => {
@@ -412,6 +456,26 @@ fn read_bam_index(path: &Path, index: Option<&Path>) -> anyhow::Result<bam::Inde
 
 fn parse_region(s: &str) -> anyhow::Result<Region> {
     s.parse().with_context(|| format!("invalid region: {s}"))
+}
+
+/// The local FASTA file a CRAM header's `@SQ` lines name in their `UR` fields (the first that
+/// exists, with an index), as HTSlib uses them when no reference is given.
+fn header_reference(header: &sam::Header) -> Option<PathBuf> {
+    use sam::header::record::value::map::reference_sequence::tag::URI;
+
+    header
+        .reference_sequences()
+        .values()
+        .filter_map(|reference_sequence| reference_sequence.other_fields().get(&URI))
+        .map(|uri| {
+            let uri = uri.to_string();
+            PathBuf::from(uri.strip_prefix("file://").unwrap_or(&uri))
+        })
+        .find(|path| {
+            let mut index = path.clone().into_os_string();
+            index.push(".fai");
+            path.is_file() && Path::new(&index).is_file()
+        })
 }
 
 /// Builds a reference sequence repository from an indexed FASTA, or an empty one.

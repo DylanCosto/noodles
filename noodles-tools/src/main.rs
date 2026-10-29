@@ -9,6 +9,7 @@ mod commands;
 mod depth;
 mod filter;
 mod flags;
+mod khash;
 mod output;
 mod parallel_cram;
 mod parallel_sam;
@@ -81,6 +82,12 @@ enum Command {
     Bedcov(commands::bedcov::Args),
     /// Add or replace read group tags and header lines.
     Addreplacerg(commands::addreplacerg::Args),
+    /// Print the header and first records as SAM.
+    Head(commands::head::Args),
+    /// Convert between numeric and textual flags.
+    Flags(commands::flags::Args),
+    /// List the samples (read group SM values) of alignment files.
+    Samples(commands::samples::Args),
 }
 
 fn main() -> ExitCode {
@@ -115,6 +122,9 @@ fn main() -> ExitCode {
         Command::Addreplacerg(args) => {
             commands::addreplacerg::run(args).map(|()| ExitCode::SUCCESS)
         }
+        Command::Head(args) => commands::head::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Flags(args) => commands::flags::run(args),
+        Command::Samples(args) => commands::samples::run(args),
     };
 
     match result {

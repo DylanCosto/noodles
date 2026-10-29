@@ -237,6 +237,17 @@ if command -v python3 >/dev/null; then
     done
 fi
 
+# head, flags, samples
+check "head" "$st head $tagged" "$nt head $tagged"
+check "head -n 5 -h 2" "$st head -n 5 -h 2 $long" "$nt head -n 5 -h 2 $long"
+check "head CRAM (reference from @SQ UR)" "$st head -h 0 -n 1000 $corpus/short/input.3.1.cram" "$nt head -h 0 -n 1000 $corpus/short/input.3.1.cram"
+check "flags" "$st flags 99 0x10 010 PAIRED,read1 12abc 70000 ''" "$nt flags 99 0x10 010 PAIRED,read1 12abc 70000 ''"
+# Many read groups, so samples come out in khash order after several resizes
+awk 'BEGIN { print "@HD\tVN:1.6"; print "@SQ\tSN:c\tLN:100"; for (i = 0; i < 600; i++) printf "@RG\tID:r%d\tSM:s%d\tLB:l%d\n", i, (i * 7919) % 451, i % 3 }' > rg.sam
+"$st" view -b -o rg.bam rg.sam
+check "samples" "$st samples rg.bam $short $tagged" "$nt samples rg.bam $short $tagged"
+check "samples -h -i -T LB -f" "$st samples -h -i -T LB -f $ref rg.bam $short $corpus/short/input.3.1.cram" "$nt samples -h -i -T LB -f $ref rg.bam $short $corpus/short/input.3.1.cram"
+
 # calmd
 check "calmd" "$st calmd --no-PG mp.short.bam $ref 2>/dev/null" "$nt calmd --no-PG mp.short.bam $ref 2>/dev/null"
 check "calmd -e -r -A -E -@4" "$st calmd --no-PG -e -r -A -E mp.short.bam $ref 2>/dev/null" "$nt calmd --no-PG -@ 4 -e -r -A -E mp.short.bam $ref 2>/dev/null"

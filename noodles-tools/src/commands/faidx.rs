@@ -186,7 +186,7 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     file.read_exact(buf)
 }
 
-fn build_index(src: &Path) -> anyhow::Result<()> {
+pub(crate) fn build_index(src: &Path) -> anyhow::Result<()> {
     let index = fasta::fs::index(src).with_context(|| format!("indexing {}", src.display()))?;
 
     let mut dst = src.as_os_str().to_owned();
