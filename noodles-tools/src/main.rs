@@ -1,13 +1,16 @@
 //! `ntools`: a samtools-compatible command-line toolkit built on noodles.
 
 mod alignment;
+mod bam_raw;
 mod bgzf_stream;
 mod commands;
+mod filter;
 mod flags;
 mod output;
 mod parallel_cram;
 mod parallel_sam;
 mod program;
+mod regions;
 mod runs;
 mod sort_order;
 mod source;

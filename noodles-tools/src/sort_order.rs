@@ -5,17 +5,7 @@
 
 use std::cmp::Ordering;
 
-/// Offsets into an encoded BAM record (excluding `block_size`).
-mod field {
-    use std::ops::Range;
-
-    pub const REFERENCE_SEQUENCE_ID: Range<usize> = 0..4;
-    pub const POSITION: Range<usize> = 4..8;
-    pub const NAME_LENGTH: usize = 8;
-    pub const FLAGS: Range<usize> = 14..16;
-    pub const MATE_REFERENCE_SEQUENCE_ID: Range<usize> = 20..24;
-    pub const NAME: usize = 32;
-}
+use crate::bam_raw::{field, le_u16, le_u32};
 
 const REVERSE_COMPLEMENTED: u16 = 0x10;
 /// READ1 and READ2 bits; samtools orders same-name records by these.
@@ -71,8 +61,7 @@ pub fn name(record: &[u8]) -> &[u8] {
 }
 
 pub fn flags(record: &[u8]) -> u16 {
-    let buf = &record[field::FLAGS];
-    u16::from_le_bytes([buf[0], buf[1]])
+    le_u16(&record[field::FLAGS])
 }
 
 /// Rewrites the reference and mate reference sequence IDs through `map` (index: input ID).
@@ -88,10 +77,6 @@ pub fn remap_reference_sequence_ids(record: &mut [u8], map: &[i32]) {
             record[range].copy_from_slice(&map[i].to_le_bytes());
         }
     }
-}
-
-fn le_u32(buf: &[u8]) -> u32 {
-    u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
 }
 
 /// samtools' natural string comparison (`strnum_cmp`): digit runs compare numerically, ignoring

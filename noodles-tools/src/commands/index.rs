@@ -47,41 +47,56 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let src = args
-        .input
-        .to_str()
-        .context("input path is not valid UTF-8")?;
-    let input = Input::open(src)?;
+    let kind = if args.csi {
+        IndexKind::Csi
+    } else {
+        IndexKind::Default
+    };
 
-    match input.format {
+    index_file(&args.input, args.output, kind, args.threads)
+}
+
+/// Which index to build for BAM; CRAM always gets CRAI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexKind {
+    /// BAI for BAM.
+    Default,
+    Csi,
+}
+
+/// Indexes a BAM or CRAM file, writing next to it (`in.bam.bai`) unless `output` is given.
+pub fn index_file(
+    input: &Path,
+    output: Option<PathBuf>,
+    kind: IndexKind,
+    threads: usize,
+) -> anyhow::Result<()> {
+    let src = input.to_str().context("input path is not valid UTF-8")?;
+    let opened = Input::open(src)?;
+
+    match opened.format {
         Format::Bam => {
-            let format = if args.csi {
-                bam::index::Format::Csi
-            } else {
-                bam::index::Format::Bai
+            let (format, extension) = match kind {
+                IndexKind::Csi => (bam::index::Format::Csi, "csi"),
+                IndexKind::Default => (bam::index::Format::Bai, "bai"),
             };
 
-            let extension = if args.csi { "csi" } else { "bai" };
-            let dst = args
-                .output
-                .unwrap_or_else(|| with_appended_extension(&args.input, extension));
+            let dst = output.unwrap_or_else(|| with_appended_extension(input, extension));
 
-            let index = index_bam(input.reader, format, args.threads)
-                .with_context(|| format!("indexing {}", args.input.display()))?;
+            let index = index_bam(opened.reader, format, threads)
+                .with_context(|| format!("indexing {}", input.display()))?;
 
             write_bam_index(&dst, &index)
         }
         Format::Cram => {
-            let dst = args
-                .output
-                .unwrap_or_else(|| with_appended_extension(&args.input, "crai"));
-
-            if args.csi {
+            if kind == IndexKind::Csi {
                 bail!("CRAM files are indexed with CRAI, not CSI");
             }
 
-            let index = cram::fs::index(&args.input)
-                .with_context(|| format!("indexing {}", args.input.display()))?;
+            let dst = output.unwrap_or_else(|| with_appended_extension(input, "crai"));
+
+            let index =
+                cram::fs::index(input).with_context(|| format!("indexing {}", input.display()))?;
 
             let file = File::create(&dst).with_context(|| format!("creating {}", dst.display()))?;
             let mut writer = crai::io::Writer::new(file);

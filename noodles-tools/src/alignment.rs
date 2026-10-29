@@ -20,6 +20,7 @@ use noodles_sam::{
 
 use crate::{
     bgzf_stream::BgzfReader,
+    regions::{RegionSet, record_interval, region_string},
     source::{Compression, Format, Input, Stream},
 };
 
@@ -203,60 +204,89 @@ impl AlignmentReader {
         Ok(())
     }
 
-    /// Calls `f` with the records overlapping each region, region by region, as samtools does
-    /// without `-M`. A record overlapping several regions is visited once per region.
-    pub fn for_each_in_regions<F>(
+    /// Calls `f` with the records of each indexed query, in query order.
+    ///
+    /// `index` names an index file explicitly (`-X`); otherwise the index next to `path` is used.
+    pub fn for_each_in_queries<F>(
         &mut self,
         path: &Path,
+        index: Option<&Path>,
         header: &sam::Header,
-        regions: &[String],
+        queries: &Queries<'_>,
         mut f: F,
     ) -> anyhow::Result<()>
     where
         F: FnMut(Rec<'_>) -> anyhow::Result<()>,
     {
+        let queries = queries.to_list(header)?;
+
+        // In a region set, a record is visited only while querying the first merged interval it
+        // overlaps, so each record is visited once and in file order.
+        let mut visit = |record: Rec<'_>, query: &Query| -> anyhow::Result<()> {
+            if let Query::Interval {
+                set,
+                reference_sequence_id,
+                index,
+                ..
+            } = query
+            {
+                match record_interval(record.as_dyn(), header)? {
+                    Some((id, start, end))
+                        if id == *reference_sequence_id
+                            && set.first_overlap(id, start, end) == Some(*index) => {}
+                    _ => return Ok(()),
+                }
+            }
+
+            f(record)
+        };
+
         match self {
             Self::Bam(reader) => {
-                let index = bam::fs::read_associated_index(path)
-                    .with_context(|| format!("reading index for {}", path.display()))?;
+                let index = read_bam_index(path, index)?;
 
-                for raw_region in regions {
-                    if raw_region == UNMAPPED_REGION {
-                        for result in reader.query_unmapped(&index)? {
-                            let record = result?;
-                            f(Rec::Bam(&record))?;
+                for query in &queries {
+                    match query {
+                        Query::Unmapped => {
+                            for result in reader.query_unmapped(&index)? {
+                                let record = result?;
+                                visit(Rec::Bam(&record), query)?;
+                            }
                         }
-                        continue;
-                    }
+                        Query::Region(region) | Query::Interval { region, .. } => {
+                            let mut query_reader = reader.query(header, &index, region)?;
+                            let mut record = bam::Record::default();
 
-                    let region = parse_region(raw_region)?;
-                    let mut query = reader.query(header, &index, &region)?;
-                    let mut record = bam::Record::default();
-
-                    while query.read_record(&mut record)? != 0 {
-                        f(Rec::Bam(&record))?;
+                            while query_reader.read_record(&mut record)? != 0 {
+                                visit(Rec::Bam(&record), query)?;
+                            }
+                        }
                     }
                 }
             }
             Self::Cram(reader, _) => {
-                let index = cram::fs::read_associated_index(path)
-                    .with_context(|| format!("reading index for {}", path.display()))?;
+                let index = match index {
+                    Some(index) => cram::crai::fs::read(index),
+                    None => cram::fs::read_associated_index(path),
+                }
+                .with_context(|| format!("reading index for {}", path.display()))?;
 
-                for raw_region in regions {
-                    if raw_region == UNMAPPED_REGION {
-                        for result in reader.query_unmapped(header, &index)? {
-                            let record = result?;
-                            f(Rec::Buf(&record))?;
+                for query in &queries {
+                    match query {
+                        Query::Unmapped => {
+                            for result in reader.query_unmapped(header, &index)? {
+                                let record = result?;
+                                visit(Rec::Buf(&record), query)?;
+                            }
                         }
-                        continue;
-                    }
+                        Query::Region(region) | Query::Interval { region, .. } => {
+                            let mut query_reader = reader.query(header, &index, region)?;
+                            let mut record = RecordBuf::default();
 
-                    let region = parse_region(raw_region)?;
-                    let mut query = reader.query(header, &index, &region)?;
-                    let mut record = RecordBuf::default();
-
-                    while query.read_record_buf(&mut record)? != 0 {
-                        f(Rec::Buf(&record))?;
+                            while query_reader.read_record_buf(&mut record)? != 0 {
+                                visit(Rec::Buf(&record), query)?;
+                            }
+                        }
                     }
                 }
             }
@@ -265,6 +295,72 @@ impl AlignmentReader {
 
         Ok(())
     }
+}
+
+/// What to query through an index.
+pub enum Queries<'a> {
+    /// samtools regions, queried in the order given. Without `-M`, a record overlapping several
+    /// regions is visited once per region.
+    Regions(&'a [String]),
+    /// Merged intervals (`-M`, `-L`), visiting each overlapping record once, in file order.
+    Set(&'a RegionSet),
+}
+
+enum Query<'a> {
+    Unmapped,
+    Region(Region),
+    Interval {
+        region: Region,
+        set: &'a RegionSet,
+        reference_sequence_id: usize,
+        index: usize,
+    },
+}
+
+impl<'a> Queries<'a> {
+    fn to_list(&self, header: &sam::Header) -> anyhow::Result<Vec<Query<'a>>> {
+        match *self {
+            Self::Regions(raw_regions) => raw_regions
+                .iter()
+                .map(|raw| {
+                    if raw == UNMAPPED_REGION {
+                        Ok(Query::Unmapped)
+                    } else {
+                        parse_region(raw).map(Query::Region)
+                    }
+                })
+                .collect(),
+            Self::Set(set) => {
+                let mut queries = Vec::new();
+
+                for (id, name) in header.reference_sequences().keys().enumerate() {
+                    for (i, &(start, end)) in set.intervals(id).iter().enumerate() {
+                        queries.push(Query::Interval {
+                            region: region_string(name, start, end)?,
+                            set,
+                            reference_sequence_id: id,
+                            index: i,
+                        });
+                    }
+                }
+
+                Ok(queries)
+            }
+        }
+    }
+}
+
+/// Reads an explicit BAI or CSI index (by extension), or the one associated with `path`.
+fn read_bam_index(path: &Path, index: Option<&Path>) -> anyhow::Result<bam::Index> {
+    let result = match index {
+        Some(index) if index.extension().is_some_and(|ext| ext == "csi") => {
+            noodles_csi::fs::read(index).map(bam::Index::Csi)
+        }
+        Some(index) => bam::bai::fs::read(index).map(bam::Index::Bai),
+        None => bam::fs::read_associated_index(path),
+    };
+
+    result.with_context(|| format!("reading index for {}", path.display()))
 }
 
 fn parse_region(s: &str) -> anyhow::Result<Region> {
