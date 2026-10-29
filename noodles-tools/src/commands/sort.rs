@@ -137,7 +137,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         reference: args.reference,
     };
 
-    let mut writer = AlignmentWriter::create(args.output.as_deref(), &write_options)?;
+    let mut writer = AlignmentWriter::create(args.output.as_deref(), &write_options, &header)?;
     writer.write_header(&header)?;
 
     if spill_paths.is_empty() {

@@ -171,7 +171,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         reference: args.reference,
     };
 
-    let mut writer = AlignmentWriter::create(Some(&output), &write_options)?;
+    let mut writer = AlignmentWriter::create(Some(&output), &write_options, &header)?;
     writer.write_header(&header)?;
 
     runs::merge(&mut sources, order, |record| {

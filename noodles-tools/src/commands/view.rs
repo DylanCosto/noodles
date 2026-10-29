@@ -181,7 +181,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         reference: args.reference.clone(),
     };
 
-    let mut writer = AlignmentWriter::create(args.output.as_deref(), &write_options)?;
+    let mut writer = AlignmentWriter::create(args.output.as_deref(), &write_options, &header)?;
 
     if format != OutputFormat::Sam || args.with_header || args.header_only {
         writer.write_header(&header)?;

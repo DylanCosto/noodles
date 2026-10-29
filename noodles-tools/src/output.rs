@@ -12,7 +12,12 @@ use noodles_bgzf::io::writer::CompressionLevel;
 use noodles_cram as cram;
 use noodles_sam::{self as sam, alignment::io::Write as _};
 
-use crate::{alignment::Rec, alignment::reference_repository, bgzf_stream::BgzfWriter};
+use crate::{
+    alignment::{Rec, reference_repository},
+    bgzf_stream::BgzfWriter,
+    parallel_sam::ParallelSamWriter,
+    runs::write_raw_record,
+};
 
 const SAM_BUFFER_CAPACITY: usize = 1 << 17;
 
@@ -42,7 +47,7 @@ pub struct WriteOptions {
     pub format: OutputFormat,
     /// The BGZF compression level for BAM output.
     pub level: CompressionLevel,
-    /// Additional compression threads.
+    /// Additional threads for BGZF compression, or for formatting SAM.
     pub threads: usize,
     /// A FASTA reference for CRAM encoding.
     pub reference: Option<PathBuf>,
@@ -53,13 +58,23 @@ type Sink = Box<dyn Write + Send>;
 /// An open alignment writer.
 pub enum AlignmentWriter {
     Sam(sam::io::Writer<BufWriter<Sink>>),
+    /// SAM formatted on worker threads. Records that are not raw BAM are encoded first.
+    ParallelSam {
+        writer: ParallelSamWriter,
+        encoder: bam::io::Writer<Vec<u8>>,
+    },
     Bam(bam::io::Writer<BgzfWriter<Sink>>),
     Cram(Box<cram::io::Writer<Sink>>),
 }
 
 impl AlignmentWriter {
-    /// Creates a writer to `dst`, or to stdout when `dst` is `None` or `-`.
-    pub fn create(dst: Option<&Path>, options: &WriteOptions) -> anyhow::Result<Self> {
+    /// Creates a writer to `dst`, or to stdout when `dst` is `None` or `-`, for records with
+    /// reference sequence IDs relative to `header`.
+    pub fn create(
+        dst: Option<&Path>,
+        options: &WriteOptions,
+        header: &sam::Header,
+    ) -> anyhow::Result<Self> {
         let sink: Sink = match dst {
             Some(path) if path != Path::new("-") => Box::new(
                 File::create(path).with_context(|| format!("creating {}", path.display()))?,
@@ -68,6 +83,10 @@ impl AlignmentWriter {
         };
 
         Ok(match options.format {
+            OutputFormat::Sam if options.threads > 0 => Self::ParallelSam {
+                writer: ParallelSamWriter::new(sink, header, options.threads),
+                encoder: bam::io::Writer::from(Vec::new()),
+            },
             OutputFormat::Sam => Self::Sam(sam::io::Writer::new(BufWriter::with_capacity(
                 SAM_BUFFER_CAPACITY,
                 sink,
@@ -95,6 +114,11 @@ impl AlignmentWriter {
     pub fn write_header(&mut self, header: &sam::Header) -> io::Result<()> {
         match self {
             Self::Sam(w) => w.write_header(header),
+            Self::ParallelSam { writer, .. } => {
+                let mut text = sam::io::Writer::new(Vec::new());
+                text.write_header(header)?;
+                writer.write_text(text.into_inner())
+            }
             Self::Bam(w) => w.write_header(header),
             Self::Cram(w) => w.write_header(header),
         }
@@ -104,7 +128,13 @@ impl AlignmentWriter {
     /// `header` must have the same reference sequences as the header the record was read with.
     pub fn write(&mut self, header: &sam::Header, record: &Rec<'_>) -> io::Result<()> {
         match (self, record) {
-            (Self::Bam(w), Rec::Bam(r)) => crate::runs::write_raw_record(w.get_mut(), r.as_ref()),
+            (Self::Bam(w), Rec::Bam(r)) => write_raw_record(w.get_mut(), r.as_ref()),
+            (Self::ParallelSam { writer, .. }, Rec::Bam(r)) => writer.push(r.as_ref()),
+            (Self::ParallelSam { writer, encoder }, _) => {
+                encoder.get_mut().clear();
+                encoder.write_alignment_record(header, record.as_dyn())?;
+                writer.push(&encoder.get_ref()[size_of::<u32>()..])
+            }
             (Self::Sam(w), _) => w.write_alignment_record(header, record.as_dyn()),
             (Self::Bam(w), _) => w.write_alignment_record(header, record.as_dyn()),
             (Self::Cram(w), _) => w.write_alignment_record(header, record.as_dyn()),
@@ -115,7 +145,8 @@ impl AlignmentWriter {
     /// relative to `header`. BAM output copies it; other formats decode it first.
     pub fn write_raw(&mut self, header: &sam::Header, record: &[u8]) -> io::Result<()> {
         match self {
-            Self::Bam(w) => crate::runs::write_raw_record(w.get_mut(), record),
+            Self::Bam(w) => write_raw_record(w.get_mut(), record),
+            Self::ParallelSam { writer, .. } => writer.push(record),
             _ => {
                 let record = bam::Record::try_from(record.to_vec())?;
                 self.write(header, &Rec::Bam(&record))
@@ -127,6 +158,7 @@ impl AlignmentWriter {
     pub fn finish(self, header: &sam::Header) -> io::Result<()> {
         match self {
             Self::Sam(w) => w.into_inner().flush(),
+            Self::ParallelSam { writer, .. } => writer.finish(),
             Self::Bam(w) => w.into_inner().finish()?.flush(),
             Self::Cram(mut w) => {
                 w.finish(header)?;
