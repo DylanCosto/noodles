@@ -4,7 +4,7 @@
 
 use std::sync::LazyLock;
 
-use crate::pileup::Read;
+use crate::Read;
 
 const EI: f64 = 0.25;
 const EM: f64 = 0.333_333_333_33;
@@ -309,7 +309,7 @@ fn probaln_glocal(
     true
 }
 
-/// Why BAQ was not applied.
+/// Why BAQ was not computed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BaqSkipped {
     /// Unmapped, empty, or with no matches or with reference skips (htslib returns -1).
@@ -322,6 +322,18 @@ pub enum BaqSkipped {
 
 /// `sam_prob_realn(b, ref, ref_len, BAQ_APPLY | BAQ_EXTEND [| BAQ_REDO])`: caps base qualities
 /// by their extended BAQ and records the adjustment in a ZQ tag.
+impl std::error::Error for BaqSkipped {}
+
+impl std::fmt::Display for BaqSkipped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotApplicable => "BAQ does not apply to this read",
+            Self::Tagged => "the read already has BAQ tags",
+            Self::Invalid => "invalid BAQ input",
+        })
+    }
+}
+
 /// `sam_prob_realn`'s `BAQ_APPLY`, `BAQ_EXTEND`, and `BAQ_REDO` flags.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BaqMode {
@@ -343,7 +355,7 @@ pub fn prob_realn(read: &mut Read, reference: &[u8], mode: BaqMode) -> Result<()
         extend,
         redo,
     } = mode;
-    let l_qseq = read.l_seq;
+    let l_qseq = read.sequence_len();
 
     let mut params = Params {
         d: 0.001,
@@ -356,19 +368,19 @@ pub fn prob_realn(read: &mut Read, reference: &[u8], mode: BaqMode) -> Result<()
         params.e = 1e-1;
     }
 
-    if read.flag & 0x4 != 0 || l_qseq == 0 || read.qual()[0] == 0xff {
+    if read.flags() & 0x4 != 0 || l_qseq == 0 || read.quality_scores()[0] == 0xff {
         return Err(BaqSkipped::NotApplicable);
     }
 
     // `realn_check_tag`: a Z field as long as the sequence.
     let is_valid = |read: &Read, tag: [u8; 2]| {
-        read.find_tag(tag)
-            .is_some_and(|(start, end)| read.raw[start + 2] == b'Z' && end - start - 4 == l_qseq)
+        read.tag_range(tag)
+            .is_some_and(|r| read.raw[r.start + 2] == b'Z' && r.end - r.start - 4 == l_qseq)
     };
 
-    let mut bq = read.find_tag(*b"BQ").is_some();
+    let mut bq = read.tag_range(*b"BQ").is_some();
     let fix_bq = bq && !redo && !is_valid(read, *b"BQ");
-    let mut zq = read.find_tag(*b"ZQ").is_some();
+    let mut zq = read.tag_range(*b"ZQ").is_some();
 
     if zq && !is_valid(read, *b"ZQ") {
         return Err(BaqSkipped::Invalid);
@@ -398,10 +410,10 @@ pub fn prob_realn(read: &mut Read, reference: &[u8], mode: BaqMode) -> Result<()
 
         if zq {
             // ZQ to BQ
-            let (start, _) = read.find_tag(*b"ZQ").expect("ZQ is present");
+            let start = read.tag_range(*b"ZQ").expect("ZQ is present").start;
             let values: Vec<u8> = read.raw[start + 3..start + 3 + l_qseq].to_vec();
 
-            for (q, &z) in read.qual_mut().iter_mut().zip(&values) {
+            for (q, &z) in read.quality_scores_mut().iter_mut().zip(&values) {
                 *q = (i32::from(*q) + i32::from(z) - 64) as u8;
             }
 
@@ -409,10 +421,10 @@ pub fn prob_realn(read: &mut Read, reference: &[u8], mode: BaqMode) -> Result<()
             return Err(BaqSkipped::Tagged);
         }
 
-        let (start, _) = read.find_tag(*b"BQ").expect("BQ is present");
+        let start = read.tag_range(*b"BQ").expect("BQ is present").start;
         let values: Vec<u8> = read.raw[start + 3..start + 3 + l_qseq].to_vec();
 
-        for (q, &b) in read.qual_mut().iter_mut().zip(&values) {
+        for (q, &b) in read.quality_scores_mut().iter_mut().zip(&values) {
             *q = if u32::from(*q) + 64 < u32::from(b) {
                 0
             } else {
@@ -425,10 +437,10 @@ pub fn prob_realn(read: &mut Read, reference: &[u8], mode: BaqMode) -> Result<()
     }
 
     // The start and end of the alignment
-    let (mut x, mut y) = (read.pos, 0i64);
+    let (mut x, mut y) = (read.position(), 0i64);
     let (mut yb, mut ye, mut xb, mut xe) = (-1i64, -1i64, -1i64, -1i64);
 
-    for &op in &read.cigar {
+    for &op in read.cigar() {
         let (kind, l) = (op & 0xf, i64::from(op >> 4));
 
         match kind {
@@ -502,7 +514,7 @@ pub fn prob_realn(read: &mut Read, reference: &[u8], mode: BaqMode) -> Result<()
         tref.push(SEQ_NT16_INT[usize::from(SEQ_NT16_TABLE[usize::from(reference[i as usize])])]);
     }
 
-    let qual: Vec<u8> = read.qual().to_vec();
+    let qual: Vec<u8> = read.quality_scores().to_vec();
     let mut state = vec![0i32; l_qseq];
     let mut q = vec![0u8; l_qseq];
 
@@ -520,13 +532,13 @@ pub fn prob_realn(read: &mut Read, reference: &[u8], mode: BaqMode) -> Result<()
     let mut bq = qual.clone();
 
     if extend {
-        extended_baq(&read.cigar, read.pos, xb, &state, &q, &mut bq);
+        extended_baq(read.cigar(), read.position(), xb, &state, &q, &mut bq);
 
         for (b, &q) in bq.iter_mut().zip(&qual) {
             *b = 64 + q.saturating_sub(*b);
         }
     } else {
-        capped_baq(&read.cigar, read.pos, xb, &state, &q, &mut bq);
+        capped_baq(read.cigar(), read.position(), xb, &state, &q, &mut bq);
 
         for (b, &q) in bq.iter_mut().zip(&qual) {
             *b = q.wrapping_sub(*b).wrapping_add(64);
@@ -534,7 +546,7 @@ pub fn prob_realn(read: &mut Read, reference: &[u8], mode: BaqMode) -> Result<()
     }
 
     if apply {
-        for (q, &b) in read.qual_mut().iter_mut().zip(&bq) {
+        for (q, &b) in read.quality_scores_mut().iter_mut().zip(&bq) {
             *q = q.wrapping_sub(b.wrapping_sub(64));
         }
 
@@ -684,12 +696,12 @@ fn extended_baq(cigar: &[u32], pos: i64, xb: i64, state: &[i32], q: &[u8], bq: &
 pub fn cap_mapq(read: &Read, reference: &[u8], thres: i32) -> Option<i32> {
     let thres = if thres < 0 { 40 } else { thres };
     let ref_len = reference.len() as i64;
-    let qual = read.qual();
+    let qual = read.quality_scores();
 
     let (mut mm, mut q, mut len, mut clip_q) = (0i32, 0i32, 0i32, 0i32);
-    let (mut x, mut y) = (read.pos, 0usize);
+    let (mut x, mut y) = (read.position(), 0usize);
 
-    'cigar: for &op in &read.cigar {
+    'cigar: for &op in read.cigar() {
         let (kind, l) = (op & 0xf, (op >> 4) as usize);
 
         match kind {

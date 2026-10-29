@@ -226,7 +226,7 @@ impl Subsample {
 }
 
 /// khash's `__ac_X31_hash_string`.
-pub fn x31_hash(s: &[u8]) -> u32 {
+fn x31_hash(s: &[u8]) -> u32 {
     let Some((&first, rest)) = s.split_first() else {
         return 0;
     };
@@ -237,7 +237,7 @@ pub fn x31_hash(s: &[u8]) -> u32 {
 }
 
 /// khash's `__ac_Wang_hash`.
-pub fn wang_hash(mut key: u32) -> u32 {
+fn wang_hash(mut key: u32) -> u32 {
     key = key.wrapping_add(!(key << 15));
     key ^= key >> 10;
     key = key.wrapping_add(key << 3);

@@ -30,6 +30,7 @@ noodles-core = { path = "../noodles-core" }
 noodles-cram = { path = "../noodles-cram" }
 noodles-csi = { path = "../noodles-csi" }
 noodles-fasta = { path = "../noodles-fasta" }
+noodles-pileup = { path = "../noodles-pileup" }
 noodles-sam = { path = "../noodles-sam" }
 noodles-util = { path = "../noodles-util", features = ["alignment"] }
 tempfile = "3.10.0"

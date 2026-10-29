@@ -124,6 +124,7 @@ if command -v python3 >/dev/null; then
     "$st" markdup --no-PG -S -t -d 100 md.bam md.marked.bam 2>/dev/null
     check "markdup -c -S -t -d 50 (remarking)" "$st markdup --no-PG -c -S -t -d 50 md.marked.bam - | $st view --no-PG -h -" "$nt markdup --no-PG -c -S -t -d 50 md.marked.bam - | $st view --no-PG -h -"
     check "markdup --json" "$st markdup --no-PG --json -S -d 100 --use-read-groups md.bam md.st.bam 2>&1 | grep '^ ' | grep -v COMMAND" "$nt markdup --no-PG --json -S -d 100 --use-read-groups md.bam md.nt.bam 2>&1 | grep '^ ' | grep -v COMMAND"
+
 fi
 check "collate grouping" "$st view $short | cut -f1 | sort -u | wc -l" "$nt collate --no-PG -O $short | $st view - | awk -F'\\t' '\$1 != p { print \$1; p = \$1 }' | sort | uniq | wc -l"
 
@@ -203,6 +204,18 @@ if [ -f md.bam ]; then
     # Indexed, with several sequences: one chromosome per thread
     "$st" index md.bam
     check "mpileup by chromosome -aa -@4" "$st mpileup -aa -A md.bam 2>/dev/null" "$nt mpileup -@ 4 -aa -A md.bam 2>/dev/null"
+fi
+
+# mpileup base modifications (MM/ML), on long reads and synthetic edge cases
+check "mpileup long -M" "$st mpileup -M mp.long.bam 2>/dev/null" "$nt mpileup -M mp.long.bam 2>/dev/null"
+
+if command -v python3 >/dev/null; then
+    python3 "$scripts/basemod-test-data.py" mods.fa 7 > mods.sam
+    "$st" view -b -o mods.bam mods.sam
+
+    for opts in "-M" "-M -f mods.fa -B -aa" "-M --no-output-ins-mods --reverse-del" "-M --no-output-ins -Q 0"; do
+        check "mpileup $opts (synthetic mods)" "$st mpileup $opts mods.bam 2>/dev/null" "$nt mpileup $opts mods.bam 2>/dev/null"
+    done
 fi
 
 # calmd

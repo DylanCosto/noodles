@@ -1,15 +1,13 @@
 //! htslib's pileup engine (`bam_plp_*` in `sam.c`, 1.24): reads are buffered in coordinate
 //! order and resolved against each reference position in turn, with the same CIGAR resolution,
-//! maximum depth rule, and overlapping mate quality adjustment, so that `mpileup` sees the same
-//! reads and qualities at every position as samtools does.
+//! maximum depth rule, and overlapping mate quality adjustment as htslib.
 
-use std::{collections::HashMap, io};
-
-use anyhow::bail;
+use std::{collections::HashMap, error, fmt};
 
 use crate::{
-    bam_raw::{self, field, le_u16, le_u32},
-    filter::{wang_hash, x31_hash},
+    Read,
+    hash::{wang_hash, x31_hash},
+    mods::{self, BaseMods},
 };
 
 const CIGAR_MATCH: u32 = 0;
@@ -26,7 +24,6 @@ const FLAG_PAIRED: u16 = 0x1;
 const FLAG_PROPER_PAIR: u16 = 0x2;
 const FLAG_UNMAPPED: u16 = 0x4;
 const FLAG_MATE_UNMAPPED: u16 = 0x8;
-const FLAG_REVERSE: u16 = 0x10;
 
 fn is_match(op: u32) -> bool {
     matches!(
@@ -35,157 +32,54 @@ fn is_match(op: u32) -> bool {
     )
 }
 
-/// An alignment record being piled up: its encoded BAM bytes (whose qualities and tags may be
-/// adjusted) and its decoded fixed fields.
-#[derive(Clone, Debug)]
-pub struct Read {
-    pub raw: Vec<u8>,
-    pub tid: i32,
-    pub pos: i64,
-    pub flag: u16,
-    pub mtid: i32,
-    pub mpos: i64,
-    pub isize: i32,
-    pub l_seq: usize,
-    /// The CIGAR ops, from the CG tag when the record has a `kSmN` placeholder, as htslib reads
-    /// them.
-    pub cigar: Vec<u32>,
-    name_end: usize,
-    seq_start: usize,
-    qual_start: usize,
+/// An error from the pileup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    /// A record's reference sequence comes before the last one's.
+    UnsortedReferenceSequences,
+    /// A record's position comes before the last one's.
+    UnsortedPositions,
+    /// The buffer holds a record from before the current position.
+    Unsorted,
+    /// A CIGAR could not be followed while adjusting overlapping mates.
+    InvalidOverlap,
+    /// A read's MM or ML tag is malformed.
+    BaseModifications(mods::ParseError),
 }
 
-impl Read {
-    pub fn new(raw: Vec<u8>) -> io::Result<Self> {
-        let i32_at = |offset: usize| le_u32(&raw[offset..offset + 4]).cast_signed();
-
-        let name_len = usize::from(raw[field::NAME_LENGTH]);
-        let n_cigar = usize::from(le_u16(&raw[field::CIGAR_OP_COUNT]));
-        let l_seq = usize::try_from(le_u32(&raw[field::SEQUENCE_LENGTH]))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        let cigar_start = field::NAME + name_len;
-        let seq_start = cigar_start + 4 * n_cigar;
-        let qual_start = seq_start + l_seq.div_ceil(2);
-
-        let mut cigar: Vec<u32> = raw[cigar_start..seq_start]
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| u32::from_le_bytes(*b))
-            .collect();
-
-        if cigar.len() == 2
-            && cigar[0] & 0xf == CIGAR_SOFT_CLIP
-            && (cigar[0] >> 4) as usize == l_seq
-            && cigar[1] & 0xf == CIGAR_SKIP
-            && let Some(range) = bam_raw::find_field(&raw, *b"CG")?
-            && raw[range.start + 2] == b'B'
-            && raw[range.start + 3] == b'I'
-        {
-            cigar = raw[range.start + 8..range.end]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| u32::from_le_bytes(*b))
-                .collect();
-        }
-
-        Ok(Self {
-            tid: i32_at(0),
-            pos: i64::from(i32_at(4)),
-            flag: le_u16(&raw[field::FLAGS]),
-            mtid: i32_at(20),
-            mpos: i64::from(i32_at(24)),
-            isize: i32_at(28),
-            l_seq,
-            cigar,
-            name_end: cigar_start - 1,
-            seq_start,
-            qual_start,
-            raw,
-        })
-    }
-
-    pub fn name(&self) -> &[u8] {
-        &self.raw[field::NAME..self.name_end]
-    }
-
-    pub fn mapq(&self) -> u8 {
-        self.raw[9]
-    }
-
-    pub fn set_mapq(&mut self, mapq: u8) {
-        self.raw[9] = mapq;
-    }
-
-    pub fn is_reverse(&self) -> bool {
-        self.flag & FLAG_REVERSE != 0
-    }
-
-    /// The 4-bit code of base `i`.
-    pub fn base(&self, i: usize) -> u8 {
-        (self.raw[self.seq_start + i / 2] >> ((!i & 1) << 2)) & 0xf
-    }
-
-    /// Sets the 4-bit code of base `i`.
-    pub fn set_base(&mut self, i: usize, code: u8) {
-        let byte = &mut self.raw[self.seq_start + i / 2];
-
-        if i & 1 == 0 {
-            *byte = (*byte & 0x0f) | (code << 4);
-        } else {
-            *byte = (*byte & 0xf0) | (code & 0x0f);
+impl error::Error for Error {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::BaseModifications(e) => Some(e),
+            _ => None,
         }
     }
+}
 
-    pub fn qual(&self) -> &[u8] {
-        &self.raw[self.qual_start..self.qual_start + self.l_seq]
-    }
-
-    pub fn qual_mut(&mut self) -> &mut [u8] {
-        &mut self.raw[self.qual_start..self.qual_start + self.l_seq]
-    }
-
-    /// The byte range of the first aux field with `tag`.
-    pub fn find_tag(&self, tag: [u8; 2]) -> Option<(usize, usize)> {
-        bam_raw::find_field(&self.raw, tag)
-            .ok()
-            .flatten()
-            .map(|r| (r.start, r.end))
-    }
-
-    pub fn remove_tag(&mut self, tag: [u8; 2]) {
-        if let Some((start, end)) = self.find_tag(tag) {
-            self.raw.drain(start..end);
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsortedReferenceSequences => {
+                f.write_str("the input is not sorted (chromosomes out of order)")
+            }
+            Self::UnsortedPositions => f.write_str("the input is not sorted (reads out of order)"),
+            Self::Unsorted => f.write_str("unsorted input; pileup aborts"),
+            Self::InvalidOverlap => f.write_str("invalid CIGAR in overlapping mates"),
+            Self::BaseModifications(_) => f.write_str("invalid base modification tags"),
         }
     }
+}
 
-    /// `bam_aux_append` of a Z field.
-    pub fn append_string_tag(&mut self, tag: [u8; 2], value: &[u8]) {
-        self.raw.extend_from_slice(&tag);
-        self.raw.push(b'Z');
-        self.raw.extend_from_slice(value);
-        self.raw.push(0);
-    }
-
-    /// `bam_cigar2rlen`
-    fn reference_length(&self) -> i64 {
-        self.cigar
-            .iter()
-            .filter(|&&op| {
-                matches!(
-                    op & 0xf,
-                    CIGAR_MATCH
-                        | CIGAR_DELETION
-                        | CIGAR_SKIP
-                        | CIGAR_SEQUENCE_MATCH
-                        | CIGAR_SEQUENCE_MISMATCH
-                )
-            })
-            .map(|&op| i64::from(op >> 4))
-            .sum()
-    }
+/// Whether to adjust the qualities of bases where mates overlap (htslib's
+/// `bam_plp_init_overlaps`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Overlaps {
+    /// Count each overlapping base once: sum or reduce the qualities on one mate and zero the
+    /// other's.
+    #[default]
+    Adjust,
+    /// Leave overlapping mates as they are.
+    Ignore,
 }
 
 /// `cstate_t`: the CIGAR op (`k`) a read is at, and the reference (`x`) and query (`y`) positions
@@ -201,25 +95,35 @@ struct CigarState {
 /// `lbnode_t`
 struct Node {
     read: Read,
+    mods: Option<BaseMods>,
     beg: i64,
     end: i64,
     s: CigarState,
 }
 
-/// `bam_pileup1_t`: one read at the current position.
+/// `bam_pileup1_t`: one read at the current position. `qpos` is the query position (for a
+/// deletion, that of the next base); `indel` is the length of an insertion (positive) or
+/// deletion (negative) that follows; `cigar_ind` is the CIGAR operation the position is in.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Entry {
     node: usize,
+    #[allow(missing_docs)]
     pub qpos: i64,
+    #[allow(missing_docs)]
     pub indel: i32,
+    #[allow(missing_docs)]
     pub is_del: bool,
+    #[allow(missing_docs)]
     pub is_head: bool,
+    #[allow(missing_docs)]
     pub is_tail: bool,
+    #[allow(missing_docs)]
     pub is_refskip: bool,
+    #[allow(missing_docs)]
     pub cigar_ind: i32,
 }
 
-/// `bam_plp_t`. Buffered reads live in `slots`, and `order` lists the occupied slots in input
+/// `bam_plp_t`: a pileup over one coordinate-sorted input. Buffered reads live in `slots`, and `order` lists the occupied slots in input
 /// order (htslib's linked list), so that dropping a read moves only slot indices.
 pub struct Pileup {
     slots: Vec<Option<Node>>,
@@ -239,10 +143,15 @@ pub struct Pileup {
     entries: Vec<Entry>,
     out_tid: i32,
     out_pos: i64,
+    base_mods: bool,
 }
 
 impl Pileup {
-    pub fn new(maxcnt: usize, overlaps: bool) -> Self {
+    /// Creates a pileup holding at most `max_depth` reads that start at one position (htslib's
+    /// `maxcnt`; samtools mpileup's `-d`).
+    pub fn new(max_depth: usize, overlaps: Overlaps) -> Self {
+        let maxcnt = max_depth;
+        let overlaps = overlaps == Overlaps::Adjust;
         Self {
             slots: Vec::new(),
             free: Vec::new(),
@@ -258,24 +167,43 @@ impl Pileup {
             entries: Vec::new(),
             out_tid: 0,
             out_pos: 0,
+            base_mods: false,
         }
     }
 
-    /// The reads at the position [`Self::next`] last prepared.
+    /// Parses the MM and ML tags of each read as it is buffered (samtools mpileup's
+    /// `--output-mods`), for [`Self::read_and_base_mods`].
+    pub fn enable_base_modifications(&mut self) {
+        self.base_mods = true;
+    }
+
+    /// The reads at the position [`Self::next_position`] last prepared.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
 
+    /// Whether the end of the input was pushed.
     pub fn is_eof(&self) -> bool {
         self.is_eof
     }
 
+    /// The reference sequence ID and 0-based position [`Self::next_position`] last prepared.
     pub fn position(&self) -> (i32, i64) {
         (self.out_tid, self.out_pos)
     }
 
+    /// The read of an entry.
     pub fn read(&self, entry: &Entry) -> &Read {
         &self.node(entry.node as u32).read
+    }
+
+    /// The read of an entry and, if [`Self::enable_base_modifications`] was called, its base
+    /// modification state. Ask the state for query positions in increasing order.
+    pub fn read_and_base_mods(&mut self, entry: &Entry) -> (&Read, Option<&mut BaseMods>) {
+        let node = self.slots[entry.node]
+            .as_mut()
+            .expect("ordered slots are occupied");
+        (&node.read, node.mods.as_mut())
     }
 
     fn node(&self, slot: u32) -> &Node {
@@ -284,8 +212,13 @@ impl Pileup {
             .expect("ordered slots are occupied")
     }
 
-    /// `bam_plp_push`; `None` marks the end of input.
-    pub fn push(&mut self, read: Option<Read>) -> anyhow::Result<()> {
+    /// `bam_plp_push`: adds the next read, or with `None`, marks the end of the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the input is not sorted by coordinate, or if overlapping mates have
+    /// an invalid CIGAR.
+    pub fn push(&mut self, read: Option<Read>) -> Result<(), Error> {
         let Some(read) = read else {
             self.is_eof = true;
             return Ok(());
@@ -306,11 +239,11 @@ impl Pileup {
         let end = read.pos + read.reference_length();
 
         if read.tid < self.max_tid {
-            bail!("The input is not sorted (chromosomes out of order)");
+            return Err(Error::UnsortedReferenceSequences);
         }
 
         if read.tid == self.max_tid && beg < self.max_pos {
-            bail!("The input is not sorted (reads out of order)");
+            return Err(Error::UnsortedPositions);
         }
 
         self.max_tid = read.tid;
@@ -318,8 +251,15 @@ impl Pileup {
         self.last = Some((read.tid, beg));
 
         if end > self.pos || read.tid > self.tid {
+            let mods = if self.base_mods {
+                Some(BaseMods::parse(&read).map_err(Error::BaseModifications)?)
+            } else {
+                None
+            };
+
             let mut node = Node {
                 read,
+                mods,
                 beg,
                 end,
                 s: CigarState {
@@ -348,7 +288,11 @@ impl Pileup {
 
     /// `bam_plp64_next`: prepares the next position with reads, if the buffer allows; returns
     /// whether it did.
-    pub fn next(&mut self) -> anyhow::Result<bool> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the buffer holds a read from before the current position.
+    pub fn next_position(&mut self) -> Result<bool, Error> {
         if self.is_eof && self.order.is_empty() {
             return Ok(false);
         }
@@ -402,7 +346,7 @@ impl Pileup {
                     let node = self.node(slot);
 
                     if self.tid > node.read.tid {
-                        bail!("Unsorted input. Pileup aborts");
+                        return Err(Error::Unsorted);
                     }
 
                     Some((node.read.tid, node.beg))
@@ -450,7 +394,7 @@ impl Pileup {
     }
 
     /// `overlap_push`
-    fn overlap_push(&mut self, node: &mut Node, slot: u32) -> anyhow::Result<()> {
+    fn overlap_push(&mut self, node: &mut Node, slot: u32) -> Result<(), Error> {
         let Some(overlaps) = &mut self.overlaps else {
             return Ok(());
         };
@@ -483,7 +427,7 @@ impl Pileup {
                     .read;
 
                 if !tweak_overlap_quality(a, &mut node.read) {
-                    bail!("tweak_overlap_quality failed");
+                    return Err(Error::InvalidOverlap);
                 }
             }
         }
@@ -632,27 +576,47 @@ fn resolve_cigar(b: &Read, pos: i64, s: &mut CigarState, node: usize) -> Entry {
     entry
 }
 
-/// `bam_plp_insertion`: the inserted bases (and pads, as `*`) after this entry, and the length
-/// of a deletion directly after them.
+/// `bam_plp_insertion`: writes the inserted bases (and pads, as `*`) after an entry to `dst`,
+/// and returns their number and the length of a deletion directly after them.
 pub fn insertion(read: &Read, entry: &Entry, dst: &mut Vec<u8>) -> (usize, usize) {
+    insertion_with_mods(read, entry, None, dst).expect("no base modifications to parse")
+}
+
+/// `bam_plp_insertion_mod`: as [`insertion`], with the modifications of each inserted base
+/// after it (as [`mods::write_calls`] writes them) if `mods` is given.
+///
+/// # Errors
+///
+/// Returns an error if the MM tag is malformed.
+pub fn insertion_with_mods(
+    read: &Read,
+    entry: &Entry,
+    mut mods: Option<&mut BaseMods>,
+    dst: &mut Vec<u8>,
+) -> Result<(usize, usize), mods::ParseError> {
     const SEQ_NT16_STR: &[u8; 16] = b"=ACMGRSVTWYHKDBN";
 
     dst.clear();
 
     if entry.indel <= 0 {
-        return (0, 0);
+        return Ok((0, 0));
     }
 
     let cigar = &read.cigar;
+    let mut len = 0;
     let mut del_len = 0;
     let mut j = 1i64;
     let mut k = entry.cigar_ind as usize + 1;
+    let mut calls = Vec::new();
 
     while k < cigar.len() {
         let (op, l) = (cigar[k] & 0xf, (cigar[k] >> 4) as usize);
 
         match op {
-            CIGAR_PAD => dst.extend(std::iter::repeat_n(b'*', l)),
+            CIGAR_PAD => {
+                dst.extend(std::iter::repeat_n(b'*', l));
+                len += l;
+            }
             CIGAR_INSERTION => {
                 for _ in 0..l {
                     let i = entry.qpos + j - i64::from(entry.is_del);
@@ -663,8 +627,17 @@ pub fn insertion(read: &Read, entry: &Entry, dst: &mut Vec<u8>) -> (usize, usize
                         b'N'
                     });
 
+                    if let Some(state) = mods.as_deref_mut()
+                        && let Ok(qpos) = usize::try_from(i)
+                    {
+                        state.at_query_position(read, qpos, &mut calls)?;
+                        mods::write_calls(dst, &calls);
+                    }
+
                     j += 1;
                 }
+
+                len += l;
             }
             CIGAR_DELETION => {
                 del_len = l;
@@ -676,7 +649,7 @@ pub fn insertion(read: &Read, entry: &Entry, dst: &mut Vec<u8>) -> (usize, usize
         k += 1;
     }
 
-    (dst.len(), del_len)
+    Ok((len, del_len))
 }
 
 /// `cigar_iref2iseq_set`: moves to the first match base at reference offset `iref`.

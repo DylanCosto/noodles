@@ -18,13 +18,16 @@ use std::{
 
 use anyhow::{Context, bail};
 use noodles_core::Region;
+use noodles_pileup::{
+    self as pileup, Entry, Overlaps, Pileup, Read,
+    baq::{self, SEQ_NT16_TABLE},
+    mods::BaseMods,
+};
 use noodles_sam as sam;
 
 use crate::{
     alignment::{AlignmentReader, Queries, ReadOptions, Rec},
-    baq::{self, SEQ_NT16_TABLE},
     flags, output,
-    pileup::{self, Entry, Pileup, Read},
     reference::IndexedFasta,
 };
 
@@ -383,32 +386,33 @@ fn prepare(
 ) -> anyhow::Result<Option<Read>> {
     let mut read = Read::new(raw)?;
 
-    if read.tid < 0 || read.flag & 0x4 != 0 {
+    if read.reference_sequence_id() < 0 || read.flags() & 0x4 != 0 {
         return Ok(None);
     }
 
-    if conf.rflag_require != 0 && conf.rflag_require & read.flag == 0 {
+    if conf.rflag_require != 0 && conf.rflag_require & read.flags() == 0 {
         return Ok(None);
     }
 
-    if conf.rflag_filter != 0 && conf.rflag_filter & read.flag != 0 {
+    if conf.rflag_filter != 0 && conf.rflag_filter & read.flags() != 0 {
         return Ok(None);
     }
 
     if let Some(bed) = &conf.bed
         && conf.all == 0
     {
-        let name = names.get(read.tid as usize).map_or(&[][..], Vec::as_slice);
+        let name = names
+            .get(read.reference_sequence_id() as usize)
+            .map_or(&[][..], Vec::as_slice);
 
-        if !bed.overlaps(name, read.pos, end_pos(&read)) {
+        if !bed.overlaps(name, read.position(), end_pos(&read)) {
             return Ok(None);
         }
     }
 
     if let Some(exclude) = &conf.exclude_rg
-        && let Some((start, end)) = read.find_tag(*b"RG")
+        && let Some((_, value)) = read.tag(*b"RG")
     {
-        let value = &read.raw[start + 3..end];
         let value = &value[..memchr::memchr(0, value).unwrap_or(value.len())];
 
         if exclude.contains(value) {
@@ -417,20 +421,20 @@ fn prepare(
     }
 
     if conf.illumina13 {
-        for q in read.qual_mut() {
+        for q in read.quality_scores_mut() {
             *q = q.saturating_sub(31);
         }
     }
 
-    let reference = references.get_id(names, read.tid)?;
+    let reference = references.get_id(names, read.reference_sequence_id())?;
 
     if let Some(reference) = &reference {
-        if (reference.len() as i64) <= read.pos {
+        if (reference.len() as i64) <= read.position() {
             eprintln!(
                 "[mplp_func] Skipping because {} is outside of {} [ref:{}]",
-                read.pos,
+                read.position(),
                 reference.len(),
-                read.tid
+                read.reference_sequence_id()
             );
             return Ok(None);
         }
@@ -449,19 +453,19 @@ fn prepare(
                 None => return Ok(None),
                 Some(q) if q < 0 => return Ok(None),
                 Some(q) => {
-                    if i32::from(read.mapq()) > q {
-                        read.set_mapq(q as u8);
+                    if i32::from(read.mapping_quality()) > q {
+                        read.set_mapping_quality(q as u8);
                     }
                 }
             }
         }
     }
 
-    if i32::from(read.mapq()) < conf.min_mq {
+    if i32::from(read.mapping_quality()) < conf.min_mq {
         return Ok(None);
     }
 
-    if conf.no_orphan && read.flag & 0x1 != 0 && read.flag & 0x2 == 0 {
+    if conf.no_orphan && read.flags() & 0x1 != 0 && read.flags() & 0x2 == 0 {
         return Ok(None);
     }
 
@@ -471,13 +475,13 @@ fn prepare(
 /// htslib's `bam_endpos`.
 fn end_pos(read: &Read) -> i64 {
     let span: i64 = read
-        .cigar
+        .cigar()
         .iter()
         .filter(|&&op| matches!(op & 0xf, 0 | 2 | 3 | 7 | 8))
         .map(|&op| i64::from(op >> 4))
         .sum();
 
-    read.pos + span.max(1)
+    read.position() + span.max(1)
 }
 
 /// Prepares a batch of records, on `workers` threads when there are several, keeping their
@@ -572,7 +576,7 @@ impl Source {
 
     /// `bam_plp64_auto`: returns whether a position is ready.
     fn auto(&mut self) -> anyhow::Result<bool> {
-        if self.pileup.next()? {
+        if self.pileup.next_position()? {
             return Ok(true);
         }
 
@@ -585,13 +589,13 @@ impl Source {
                 Some(read) => {
                     self.pileup.push(Some(read))?;
 
-                    if self.pileup.next()? {
+                    if self.pileup.next_position()? {
                         return Ok(true);
                     }
                 }
                 None => {
                     self.pileup.push(None)?;
-                    return self.pileup.next();
+                    return Ok(self.pileup.next_position()?);
                 }
             }
         }
@@ -599,10 +603,6 @@ impl Source {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    if args.output_mods {
-        bail!("--output-mods (-M) is not supported");
-    }
-
     if args.no_baq && args.redo_baq {
         bail!("Error: The -B option cannot be combined with -E");
     }
@@ -742,6 +742,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         min_bq: args.min_bq,
         rev_del: args.reverse_del,
         no_ins: args.no_output_ins,
+        mods: if args.output_mods {
+            if args.no_output_ins_mods || args.no_output_ins > 0 {
+                Mods::Bases
+            } else {
+                Mods::BasesAndInsertions
+            }
+        } else {
+            Mods::None
+        },
         no_del: args.no_output_del,
         no_ends: args.no_output_ends,
         flags: print_flags,
@@ -760,7 +769,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         options: &options,
         bed: bed.as_deref(),
         max_depth,
-        overlaps: !args.no_overlaps,
+        overlaps: if args.no_overlaps {
+            Overlaps::Ignore
+        } else {
+            Overlaps::Adjust
+        },
         workers: args.threads,
     };
 
@@ -792,7 +805,7 @@ struct PileupContext<'a> {
     options: &'a OutputOptions,
     bed: Option<&'a Bed>,
     max_depth: usize,
-    overlaps: bool,
+    overlaps: Overlaps,
     /// Threads for BAQ in each reader.
     workers: usize,
 }
@@ -834,8 +847,14 @@ fn pileup_region<W: Write>(
             });
 
             header_rxs.push(header_rx);
+            let mut pileup = Pileup::new(context.max_depth, context.overlaps);
+
+            if context.options.mods != Mods::None {
+                pileup.enable_base_modifications();
+            }
+
             sources.push(Source {
-                pileup: Pileup::new(context.max_depth, context.overlaps),
+                pileup,
                 batches: rx,
                 pending: Vec::new().into_iter(),
             });
@@ -1250,10 +1269,19 @@ impl std::fmt::Display for Disconnected {
 
 impl std::error::Error for Disconnected {}
 
+/// Which base modifications (MM and ML tags) to print, after their bases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mods {
+    None,
+    Bases,
+    BasesAndInsertions,
+}
+
 struct OutputOptions {
     min_bq: i32,
     rev_del: bool,
     no_ins: u8,
+    mods: Mods,
     no_del: u8,
     no_ends: bool,
     flags: u32,
@@ -1454,17 +1482,11 @@ fn mpileup<W: Write>(
         line.push(b'\t');
         line.push(ref_at(&reference, pos));
 
-        for (i, source) in sources.iter().enumerate() {
-            let entries: &[Entry] = if active[i] {
-                source.pileup.entries()
-            } else {
-                &[]
-            };
-
+        for (i, source) in sources.iter_mut().enumerate() {
             write_sample(
                 &mut line,
-                &source.pileup,
-                entries,
+                &mut source.pileup,
+                active[i],
                 options,
                 names,
                 pos,
@@ -1472,7 +1494,7 @@ fn mpileup<W: Write>(
                 &mut seq,
                 &mut qual,
                 &mut ins,
-            );
+            )?;
         }
 
         line.push(b'\n');
@@ -1578,8 +1600,8 @@ fn push_empty_columns(line: &mut Vec<u8>, options: &OutputOptions) {
 
 /// The base quality samtools filters and prints: that of the base at `qpos`, or 0 past the end.
 fn base_quality(read: &Read, entry: &Entry) -> i32 {
-    if (entry.qpos as usize) < read.l_seq {
-        i32::from(read.qual()[entry.qpos as usize])
+    if (entry.qpos as usize) < read.sequence_len() {
+        i32::from(read.quality_scores()[entry.qpos as usize])
     } else {
         0
     }
@@ -1589,8 +1611,8 @@ fn base_quality(read: &Read, entry: &Entry) -> i32 {
 #[expect(clippy::too_many_arguments, reason = "the line's context")]
 fn write_sample(
     line: &mut Vec<u8>,
-    pileup: &Pileup,
-    entries: &[Entry],
+    pileup: &mut Pileup,
+    active: bool,
     options: &OutputOptions,
     names: &[Vec<u8>],
     pos: i64,
@@ -1598,17 +1620,19 @@ fn write_sample(
     seq: &mut Vec<u8>,
     qual: &mut Vec<u8>,
     ins: &mut Vec<u8>,
-) {
+) -> anyhow::Result<()> {
     seq.clear();
     qual.clear();
     let mut cnt = 0i64;
+    let n_entries = if active { pileup.entries().len() } else { 0 };
 
-    for entry in entries {
-        let read = pileup.read(entry);
-        let c = base_quality(read, entry);
+    for k in 0..n_entries {
+        let entry = pileup.entries()[k];
+        let (read, mods) = pileup.read_and_base_mods(&entry);
+        let c = base_quality(read, &entry);
 
         if c >= options.min_bq {
-            push_base(seq, read, entry, pos, reference, options, ins);
+            push_base(seq, read, mods, &entry, pos, reference, options, ins)?;
             qual.push(if c + 33 < 126 { (c + 33) as u8 } else { 126 });
             cnt += 1;
         }
@@ -1618,10 +1642,10 @@ fn write_sample(
     push_int(line, cnt);
     line.push(b'\t');
 
-    if entries.is_empty() {
+    if n_entries == 0 {
         line.extend_from_slice(b"*\t*");
         push_empty_columns(line, options);
-        return;
+        return Ok(());
     }
 
     if seq.is_empty() {
@@ -1649,7 +1673,7 @@ fn write_sample(
             line.push(b'\t');
             let mut n = 0;
 
-            for entry in entries {
+            for entry in &pileup.entries()[..n_entries] {
                 let read = pileup.read(entry);
 
                 if base_quality(read, entry) < options.min_bq {
@@ -1663,36 +1687,40 @@ fn write_sample(
                 n += 1;
 
                 match flag {
-                    PRINT_MAPQ_CHAR => line.push((read.mapq() as u32 + 33).min(126) as u8),
+                    PRINT_MAPQ_CHAR => {
+                        line.push((read.mapping_quality() as u32 + 33).min(126) as u8)
+                    }
                     PRINT_QPOS => push_int(line, entry.qpos + 1),
                     PRINT_QPOS5 => {
-                        let pos5 = if read.is_reverse() {
-                            read.l_seq as i64 - entry.qpos + i64::from(entry.is_del)
+                        let pos5 = if read.is_reverse_complemented() {
+                            read.sequence_len() as i64 - entry.qpos + i64::from(entry.is_del)
                         } else {
                             entry.qpos + 1
                         };
                         push_int(line, pos5);
                     }
                     PRINT_QNAME => line.extend_from_slice(read.name()),
-                    PRINT_FLAG => push_int(line, i64::from(read.flag)),
+                    PRINT_FLAG => push_int(line, i64::from(read.flags())),
                     PRINT_RNAME => {
-                        if read.tid >= 0 {
-                            line.extend_from_slice(&names[read.tid as usize]);
+                        if read.reference_sequence_id() >= 0 {
+                            line.extend_from_slice(&names[read.reference_sequence_id() as usize]);
                         } else {
                             line.push(b'*');
                         }
                     }
-                    PRINT_POS => push_int(line, read.pos + 1),
-                    PRINT_MAPQ => push_int(line, i64::from(read.mapq())),
+                    PRINT_POS => push_int(line, read.position() + 1),
+                    PRINT_MAPQ => push_int(line, i64::from(read.mapping_quality())),
                     PRINT_RNEXT => {
-                        if read.mtid >= 0 {
-                            line.extend_from_slice(&names[read.mtid as usize]);
+                        if read.mate_reference_sequence_id() >= 0 {
+                            line.extend_from_slice(
+                                &names[read.mate_reference_sequence_id() as usize],
+                            );
                         } else {
                             line.push(b'*');
                         }
                     }
-                    PRINT_PNEXT => push_int(line, read.mpos + 1),
-                    PRINT_RLEN => push_int(line, read.l_seq as i64),
+                    PRINT_PNEXT => push_int(line, read.mate_position() + 1),
+                    PRINT_RLEN => push_int(line, read.sequence_len() as i64),
                     _ => {}
                 }
             }
@@ -1709,7 +1737,7 @@ fn write_sample(
         line.push(b'\t');
         let mut n = 0;
 
-        for entry in entries {
+        for entry in &pileup.entries()[..n_entries] {
             let read = pileup.read(entry);
 
             if base_quality(read, entry) < options.min_bq {
@@ -1728,19 +1756,18 @@ fn write_sample(
             line.push(b'*');
         }
     }
+
+    Ok(())
 }
 
 /// An --output-extra tag value, as samtools prints it.
 fn push_tag_value(line: &mut Vec<u8>, read: &Read, tag: [u8; 2], empty: u8) {
-    let Some((start, end)) = read.find_tag(tag) else {
+    let Some((ty, value)) = read.tag(tag) else {
         line.push(empty);
         return;
     };
 
-    let raw = &read.raw;
-    let value = &raw[start + 3..end];
-
-    match raw[start + 2] {
+    match ty {
         b'Z' | b'H' => line.extend_from_slice(&value[..value.len() - 1]),
         b'c' => push_int(line, i64::from(value[0].cast_signed())),
         b'C' => push_int(line, i64::from(value[0])),
@@ -1764,23 +1791,25 @@ fn push_tag_value(line: &mut Vec<u8>, read: &Read, tag: [u8; 2], empty: u8) {
 }
 
 /// `pileup_seq`: one read's base column entry.
+#[expect(clippy::too_many_arguments, reason = "the read's context")]
 fn push_base(
     seq: &mut Vec<u8>,
     read: &Read,
+    mut mods: Option<&mut BaseMods>,
     entry: &Entry,
     pos: i64,
     reference: &Option<Arc<Vec<u8>>>,
     options: &OutputOptions,
     ins: &mut Vec<u8>,
-) {
+) -> anyhow::Result<()> {
     const LOWER: &[u8; 16] = b",acmgrsvtwyhkdbn";
     const UPPER: &[u8; 16] = b".ACMGRSVTWYHKDBN";
 
-    let reverse = read.is_reverse();
+    let reverse = read.is_reverse_complemented();
 
     if !options.no_ends && entry.is_head {
         seq.push(b'^');
-        let mapq = read.mapq();
+        let mapq = read.mapping_quality();
         seq.push(if mapq > 93 { 126 } else { mapq + 33 });
     }
 
@@ -1793,7 +1822,7 @@ fn push_base(
             b'*'
         });
     } else {
-        let mut c = if (entry.qpos as usize) < read.l_seq {
+        let mut c = if (entry.qpos as usize) < read.sequence_len() {
             read.base(entry.qpos as usize)
         } else {
             15
@@ -1812,6 +1841,12 @@ fn push_base(
         }
 
         seq.push(if reverse { LOWER } else { UPPER }[usize::from(c)]);
+
+        if let Some(state) = mods.as_deref_mut() {
+            let mut calls = Vec::new();
+            state.at_query_position(read, entry.qpos as usize, &mut calls)?;
+            pileup::mods::write_calls(seq, &calls);
+        }
     }
 
     let mut del_len = if entry.indel < 0 {
@@ -1821,7 +1856,8 @@ fn push_base(
     };
 
     if entry.indel > 0 {
-        let (len, after) = pileup::insertion(read, entry, ins);
+        let mods = mods.filter(|_| options.mods == Mods::BasesAndInsertions);
+        let (len, after) = pileup::insertion_with_mods(read, entry, mods, ins)?;
         del_len = after;
 
         if options.no_ins < 2 {
@@ -1830,18 +1866,31 @@ fn push_base(
         }
 
         if options.no_ins == 0 {
-            if reverse {
-                let pad = if options.rev_del { b'#' } else { b'*' };
-                seq.extend(ins.iter().map(|&b| {
-                    if b == b'*' {
-                        pad
-                    } else {
-                        b.to_ascii_lowercase()
-                    }
-                }));
+            // Modifications (in brackets) keep their case.
+            let mut in_mod = false;
+            let pad = if reverse && options.rev_del {
+                b'#'
             } else {
-                seq.extend(ins.iter().map(u8::to_ascii_uppercase));
-            }
+                b'*'
+            };
+
+            seq.extend(ins.iter().map(|&b| {
+                if b == b'[' {
+                    in_mod = true;
+                } else if b == b']' {
+                    in_mod = false;
+                }
+
+                if in_mod {
+                    b
+                } else if !reverse {
+                    b.to_ascii_uppercase()
+                } else if b == b'*' {
+                    pad
+                } else {
+                    b.to_ascii_lowercase()
+                }
+            }));
         }
     }
 
@@ -1869,6 +1918,8 @@ fn push_base(
     if !options.no_ends && entry.is_tail {
         seq.push(b'$');
     }
+
+    Ok(())
 }
 
 fn push_int(dst: &mut Vec<u8>, n: i64) {
