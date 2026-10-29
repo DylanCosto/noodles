@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::container::block;
 
 const LOW_READER_COUNT: usize = 64;
@@ -7,14 +5,16 @@ const LOW_READER_COUNT_I32: i32 = LOW_READER_COUNT as i32;
 
 pub struct ExternalDataReaders<'c> {
     low_readers: [Option<&'c [u8]>; LOW_READER_COUNT],
-    high_readers: HashMap<block::ContentId, &'c [u8]>,
+    // Sorted by content ID. Tag blocks use large content IDs (e.g., 5063770 for `MD:Z`), and a
+    // binary search over a slice's few such blocks is much cheaper than hashing on every read.
+    high_readers: Vec<(block::ContentId, &'c [u8])>,
 }
 
 impl<'c> ExternalDataReaders<'c> {
     pub fn new() -> Self {
         Self {
             low_readers: [None; LOW_READER_COUNT],
-            high_readers: HashMap::new(),
+            high_readers: Vec::new(),
         }
     }
 
@@ -23,16 +23,21 @@ impl<'c> ExternalDataReaders<'c> {
             i @ 0..LOW_READER_COUNT_I32 => {
                 self.low_readers[i as usize] = Some(reader);
             }
-            _ => {
-                self.high_readers.insert(id, reader);
-            }
+            _ => match self.high_readers.binary_search_by_key(&id, |(i, _)| *i) {
+                Ok(i) => self.high_readers[i].1 = reader,
+                Err(i) => self.high_readers.insert(i, (id, reader)),
+            },
         }
     }
 
     pub fn get_mut(&mut self, id: &block::ContentId) -> Option<&mut &'c [u8]> {
         match *id {
             i @ 0..LOW_READER_COUNT_I32 => self.low_readers[i as usize].as_mut(),
-            _ => self.high_readers.get_mut(id),
+            _ => self
+                .high_readers
+                .binary_search_by_key(id, |(i, _)| *i)
+                .ok()
+                .map(|i| &mut self.high_readers[i].1),
         }
     }
 }
@@ -59,7 +64,7 @@ mod tests {
 
         assert_eq!(readers.low_readers[0], Some(&b"a"[..]));
         assert_eq!(readers.low_readers[63], Some(&b"b"[..]));
-        assert_eq!(readers.high_readers.get(&64), Some(&&b"c"[..]));
+        assert_eq!(readers.high_readers, [(64, &b"c"[..])]);
     }
 
     #[test]
@@ -73,5 +78,18 @@ mod tests {
         assert_eq!(readers.get_mut(&0), Some(&mut &b"a"[..]));
         assert_eq!(readers.get_mut(&63), Some(&mut &b"b"[..]));
         assert_eq!(readers.get_mut(&64), Some(&mut &b"c"[..]));
+    }
+
+    #[test]
+    fn test_high_ids_are_kept_sorted() {
+        let mut readers = ExternalDataReaders::new();
+        let ids = [5063770, i32::MAX, -1, 64, i32::MIN, 4281155, 64];
+        for (i, id) in ids.into_iter().enumerate() {
+            readers.insert(id, &b"abcdefg"[i..=i]);
+        }
+        assert_eq!(readers.get_mut(&64), Some(&mut &b"g"[..]));
+        assert_eq!(readers.get_mut(&i32::MIN), Some(&mut &b"e"[..]));
+        assert_eq!(readers.get_mut(&5063770), Some(&mut &b"a"[..]));
+        assert_eq!(readers.get_mut(&65), None);
     }
 }
