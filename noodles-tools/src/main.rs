@@ -4,6 +4,7 @@ mod alignment;
 mod bam_blocks;
 mod bam_raw;
 mod bam_sam;
+mod baq;
 mod bgzf_stream;
 mod commands;
 mod depth;
@@ -12,7 +13,9 @@ mod flags;
 mod output;
 mod parallel_cram;
 mod parallel_sam;
+mod pileup;
 mod program;
+mod reference;
 mod regions;
 mod runs;
 mod sequence;
@@ -68,6 +71,8 @@ enum Command {
     Fixmate(commands::fixmate::Args),
     /// Mark duplicate alignments.
     Markdup(commands::markdup::Args),
+    /// Text pileup of alignments.
+    Mpileup(commands::mpileup::Args),
     /// Alignment statistics for plot-bamstats.
     Stats(commands::stats::Args),
     /// Write a SAM sequence dictionary for a FASTA file.
@@ -102,6 +107,7 @@ fn main() -> ExitCode {
         Command::Collate(args) => commands::collate::run(args).map(|()| ExitCode::SUCCESS),
         Command::Fixmate(args) => commands::fixmate::run(args).map(|()| ExitCode::SUCCESS),
         Command::Markdup(args) => commands::markdup::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Mpileup(args) => commands::mpileup::run(args).map(|()| ExitCode::SUCCESS),
         Command::Stats(args) => commands::stats::run(args).map(|()| ExitCode::SUCCESS),
         Command::Dict(args) => commands::dict::run(args).map(|()| ExitCode::SUCCESS),
         Command::Bedcov(args) => commands::bedcov::run(args).map(|()| ExitCode::SUCCESS),

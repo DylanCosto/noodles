@@ -186,5 +186,21 @@ if [ -f md.marked.bam ]; then
     check "stats -I a (marked)" "$st stats -I a md.marked.bam | $strip_stats" "$nt stats -I a md.marked.bam | $strip_stats"
 fi
 
+# mpileup (BAQ with -f), on part of the short reads, long reads, and synthetic overlapping pairs
+"$st" view -b -o mp.short.bam "$short" chrS:1-300000 && "$st" index mp.short.bam
+long_name=$("$st" idxstats "$long" | head -1 | cut -f1)
+"$st" view -b -o mp.long.bam "$long" "$long_name:1-300000" && "$st" index mp.long.bam
+check "mpileup" "$st mpileup mp.short.bam 2>/dev/null" "$nt mpileup mp.short.bam 2>/dev/null"
+check "mpileup -f (BAQ) -@4" "$st mpileup -f $ref mp.short.bam 2>/dev/null" "$nt mpileup -@ 4 -f $ref mp.short.bam 2>/dev/null"
+check "mpileup long -f" "$st mpileup -f $long_ref mp.long.bam 2>/dev/null" "$nt mpileup -f $long_ref mp.long.bam 2>/dev/null"
+check "mpileup CRAM -f" "$st mpileup -f $ref -r chrS:1-300000 $corpus/short/input.3.1.cram 2>/dev/null" "$nt mpileup -f $ref -r chrS:1-300000 $corpus/short/input.3.1.cram 2>/dev/null"
+check "mpileup -aa -r -l -s -O --output-extra" "$st mpileup -aa -r chrS:1000-60000 -l targets.txt -s -O --output-BP-5 --output-extra QNAME,FLAG,RG,NM mp.short.bam 2>/dev/null" "$nt mpileup -aa -r chrS:1000-60000 -l targets.txt -s -O --output-BP-5 --output-extra QNAME,FLAG,RG,NM mp.short.bam 2>/dev/null"
+check "mpileup long ins/del options" "$st mpileup --reverse-del --no-output-ins --no-output-del --no-output-ends -f $long_ref mp.long.bam 2>/dev/null" "$nt mpileup --reverse-del --no-output-ins --no-output-del --no-output-ends -f $long_ref mp.long.bam 2>/dev/null"
+
+if [ -f md.bam ]; then
+    check "mpileup overlapping pairs -A -Q 0 -d 3" "$st mpileup -A -Q 0 -d 3 md.bam 2>/dev/null" "$nt mpileup -A -Q 0 -d 3 md.bam 2>/dev/null"
+    check "mpileup -C 50 -E -x two files" "$st mpileup -C 50 -E -x -f $ref md.bam md.bam 2>/dev/null" "$nt mpileup -C 50 -E -x -f $ref md.bam md.bam 2>/dev/null"
+fi
+
 echo "$failures difference(s)"
 [ "$failures" -eq 0 ]

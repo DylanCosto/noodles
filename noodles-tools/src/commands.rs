@@ -15,6 +15,7 @@ pub mod idxstats;
 pub mod index;
 pub mod markdup;
 pub mod merge;
+pub mod mpileup;
 pub mod quickcheck;
 pub mod reheader;
 pub mod sort;
