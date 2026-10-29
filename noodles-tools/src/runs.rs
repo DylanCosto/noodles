@@ -16,7 +16,7 @@ use noodles_bgzf::io::writer::CompressionLevel;
 
 use crate::{
     bgzf_stream::{BgzfReader, BgzfWriter},
-    sort_order::{Order, coordinate_key},
+    sort_order::{Order, coordinate_key, name_hash},
 };
 
 /// The fixed-size prefix of every encoded BAM record, up to the read name.
@@ -55,27 +55,45 @@ pub fn write_raw_record<W: Write>(writer: &mut W, record: &[u8]) -> io::Result<(
     writer.write_all(record)
 }
 
+/// The precomputed integer key of an order, if it has one.
+fn integer_key(order: Order, record: &[u8]) -> u64 {
+    match order {
+        Order::Coordinate => coordinate_key(record),
+        Order::Collate => name_hash(record),
+        Order::NameNatural | Order::NameAscii => 0,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Entry {
-    /// The coordinate key, precomputed so coordinate sorting compares integers.
+    /// The order's integer key (see [`integer_key`]), so most comparisons compare integers.
     key: u64,
     start: usize,
     end: usize,
 }
 
 /// An in-memory batch of raw records in one contiguous buffer.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Chunk {
     data: Vec<u8>,
     entries: Vec<Entry>,
+    order: Order,
 }
 
 impl Chunk {
+    pub fn new(order: Order) -> Self {
+        Self {
+            data: Vec::new(),
+            entries: Vec::new(),
+            order,
+        }
+    }
+
     pub fn push(&mut self, record: &[u8]) {
         let start = self.data.len();
         self.data.extend_from_slice(record);
         self.entries.push(Entry {
-            key: coordinate_key(record),
+            key: integer_key(self.order, record),
             start,
             end: self.data.len(),
         });
@@ -106,6 +124,11 @@ impl Chunk {
 
         let compare = |a: &Entry, b: &Entry| match order {
             Order::Coordinate => a.key.cmp(&b.key),
+            // The key is a name hash; equal hashes fall back to comparing names.
+            Order::Collate => a
+                .key
+                .cmp(&b.key)
+                .then_with(|| order.compare(&data[a.start..a.end], &data[b.start..b.end])),
             _ => order.compare(&data[a.start..a.end], &data[b.start..b.end]),
         };
 

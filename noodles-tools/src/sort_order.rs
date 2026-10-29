@@ -20,6 +20,9 @@ pub enum Order {
     NameNatural,
     /// By read name, bytewise (`samtools sort -N`).
     NameAscii,
+    /// Grouped by read name in hash order (`samtools collate`): records with the same name are
+    /// adjacent, in input order.
+    Collate,
 }
 
 impl Order {
@@ -29,6 +32,7 @@ impl Order {
             Self::Coordinate => ("coordinate", None),
             Self::NameNatural => ("queryname", Some("queryname:natural")),
             Self::NameAscii => ("queryname", Some("queryname:lexicographical")),
+            Self::Collate => ("unsorted", None),
         }
     }
 
@@ -40,6 +44,9 @@ impl Order {
             Self::NameAscii => name(a)
                 .cmp(name(b))
                 .then_with(|| (flags(a) & SEGMENT_BITS).cmp(&(flags(b) & SEGMENT_BITS))),
+            Self::Collate => name_hash(a)
+                .cmp(&name_hash(b))
+                .then_with(|| name(a).cmp(name(b))),
         }
     }
 }
@@ -51,6 +58,16 @@ pub fn coordinate_key(record: &[u8]) -> u64 {
     let pos = u64::from(le_u32(&record[field::POSITION]).wrapping_add(1));
     let is_reverse = u64::from(flags(record) & REVERSE_COMPLEMENTED != 0);
     (tid << 32) | (pos << 1) | is_reverse
+}
+
+/// FNV-1a over the read name, the grouping key for [`Order::Collate`].
+pub fn name_hash(record: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+
+    name(record)
+        .iter()
+        .fold(OFFSET_BASIS, |h, &b| (h ^ u64::from(b)).wrapping_mul(PRIME))
 }
 
 /// Returns the read name without its NUL terminator.

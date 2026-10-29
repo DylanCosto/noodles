@@ -94,35 +94,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let memory_limit = args.memory_per_thread.saturating_mul(args.threads + 1);
     let temp_dir = create_temp_dir(args.temp_prefix.as_deref(), args.output.as_deref())?;
 
-    let mut chunk = Chunk::default();
-    let mut spill_paths = Vec::new();
-    let mut encoder = bam::io::Writer::from(Vec::new());
-
-    reader.for_each(&header, |record| {
-        match record {
-            Rec::Bam(r) => chunk.push(r.as_ref()),
-            _ => {
-                // Non-BAM records are encoded once so sorting and spilling work on raw bytes.
-                let buf = encoder.get_mut();
-                buf.clear();
-                encoder.write_alignment_record(&header, record.as_dyn())?;
-                chunk.push(&encoder.get_ref()[size_of::<u32>()..]);
-            }
-        }
-
-        if chunk.size() >= memory_limit {
-            let index = spill_paths.len();
-            spill_paths.push(runs::spill(
-                &mut chunk,
-                order,
-                temp_dir.path(),
-                index,
-                args.threads,
-            )?);
-        }
-
-        Ok(())
-    })?;
+    let sorted = SortedRecords::collect(
+        &mut reader,
+        &header,
+        order,
+        memory_limit,
+        args.threads,
+        temp_dir.path(),
+        |_| Ok(true),
+    )?;
 
     set_sort_order(&mut header, order)?;
 
@@ -139,39 +119,116 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let mut writer = AlignmentWriter::create(args.output.as_deref(), &write_options, &header)?;
     writer.write_header(&header)?;
+    sorted.write_to(&mut writer, &header)?;
+    writer.finish(&header)?;
 
-    if spill_paths.is_empty() {
-        chunk.drain_sorted(order, args.threads, |record| {
-            writer.write_raw(&header, record)
+    Ok(())
+}
+
+/// Records read and sorted in memory, with any sorted runs spilled to temporary files.
+pub struct SortedRecords<'d> {
+    chunk: Chunk,
+    spill_paths: Vec<PathBuf>,
+    order: Order,
+    threads: usize,
+    temp_dir: &'d Path,
+}
+
+impl<'d> SortedRecords<'d> {
+    /// Reads every record that `keep` accepts, spilling sorted runs to `temp_dir` whenever the
+    /// buffered records reach `memory_limit` bytes.
+    pub fn collect<K>(
+        reader: &mut AlignmentReader,
+        header: &sam::Header,
+        order: Order,
+        memory_limit: usize,
+        threads: usize,
+        temp_dir: &'d Path,
+        mut keep: K,
+    ) -> anyhow::Result<Self>
+    where
+        K: FnMut(&Rec<'_>) -> anyhow::Result<bool>,
+    {
+        let mut sorted = Self {
+            chunk: Chunk::new(order),
+            spill_paths: Vec::new(),
+            order,
+            threads,
+            temp_dir,
+        };
+
+        let mut encoder = bam::io::Writer::from(Vec::new());
+
+        reader.for_each(header, |record| {
+            if !keep(&record)? {
+                return Ok(());
+            }
+
+            match record {
+                Rec::Bam(r) => sorted.chunk.push(r.as_ref()),
+                _ => {
+                    // Non-BAM records are encoded once so sorting and spilling work on raw bytes.
+                    encoder.get_mut().clear();
+                    encoder.write_alignment_record(header, record.as_dyn())?;
+                    sorted.chunk.push(&encoder.get_ref()[size_of::<u32>()..]);
+                }
+            }
+
+            if sorted.chunk.size() >= memory_limit {
+                sorted.spill()?;
+            }
+
+            Ok(())
         })?;
-    } else {
-        if !chunk.is_empty() {
-            let index = spill_paths.len();
-            spill_paths.push(runs::spill(
-                &mut chunk,
-                order,
-                temp_dir.path(),
-                index,
-                args.threads,
-            )?);
+
+        Ok(sorted)
+    }
+
+    fn spill(&mut self) -> anyhow::Result<()> {
+        let index = self.spill_paths.len();
+        let path = runs::spill(
+            &mut self.chunk,
+            self.order,
+            self.temp_dir,
+            index,
+            self.threads,
+        )?;
+        self.spill_paths.push(path);
+        Ok(())
+    }
+
+    /// Writes the records in order. `header` must have the input's reference sequences.
+    pub fn write_to(
+        mut self,
+        writer: &mut AlignmentWriter,
+        header: &sam::Header,
+    ) -> anyhow::Result<()> {
+        if self.spill_paths.is_empty() {
+            self.chunk
+                .drain_sorted(self.order, self.threads, |record| {
+                    writer.write_raw(header, record)
+                })?;
+
+            return Ok(());
+        }
+
+        if !self.chunk.is_empty() {
+            self.spill()?;
         }
 
         // Spill files are decompressed on the calling thread; there may be many of them.
-        let mut sources = spill_paths
+        let mut sources = self
+            .spill_paths
             .iter()
             .map(|path| SpillFile::open(path, 0))
             .collect::<Result<Vec<_>, _>>()
             .context("opening temporary files")?;
 
-        runs::merge(&mut sources, order, |record| {
-            writer.write_raw(&header, record)?;
+        runs::merge(&mut sources, self.order, |record| {
+            writer.write_raw(header, record)?;
             Ok(())
-        })?;
+        })
     }
-
-    writer.finish(&header)?;
-
-    Ok(())
 }
 
 /// Sets `@HD SO` (and `SS` for name orders) as samtools does, creating `@HD` if needed.
@@ -199,7 +256,7 @@ pub fn set_sort_order(header: &mut sam::Header, order: Order) -> anyhow::Result<
     Ok(())
 }
 
-fn create_temp_dir(
+pub fn create_temp_dir(
     prefix: Option<&Path>,
     output: Option<&Path>,
 ) -> anyhow::Result<tempfile::TempDir> {
@@ -228,7 +285,7 @@ fn create_temp_dir(
 }
 
 /// Parses a memory size with an optional K, M, or G suffix (powers of 1024), as samtools does.
-fn parse_memory(s: &str) -> anyhow::Result<usize> {
+pub fn parse_memory(s: &str) -> anyhow::Result<usize> {
     let s = s.trim();
     let (digits, multiplier) = match s.char_indices().last() {
         Some((i, 'k' | 'K')) => (&s[..i], 1 << 10),

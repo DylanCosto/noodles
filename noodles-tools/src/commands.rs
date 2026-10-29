@@ -1,6 +1,7 @@
 //! Subcommands.
 
 pub mod cat;
+pub mod collate;
 pub mod coverage;
 pub mod depth;
 pub mod faidx;

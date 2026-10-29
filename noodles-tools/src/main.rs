@@ -62,6 +62,8 @@ enum Command {
     Coverage(commands::coverage::Args),
     /// Write one file per read group or tag value.
     Split(commands::split::Args),
+    /// Group records by read name.
+    Collate(commands::collate::Args),
 }
 
 fn main() -> ExitCode {
@@ -85,6 +87,7 @@ fn main() -> ExitCode {
         Command::Depth(args) => commands::depth::run(args).map(|()| ExitCode::SUCCESS),
         Command::Coverage(args) => commands::coverage::run(args).map(|()| ExitCode::SUCCESS),
         Command::Split(args) => commands::split::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Collate(args) => commands::collate::run(args).map(|()| ExitCode::SUCCESS),
     };
 
     match result {
