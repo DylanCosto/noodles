@@ -96,9 +96,13 @@ Intentional differences:
 - Header lines are written grouped by type (`@HD`, `@SQ`, `@RG`, `@PG`, `@CO`). HTSlib keeps
   the input's line order and appends new lines at the end, so `addreplacerg` places a new `@RG`
   line before existing `@PG` lines where samtools places it after them.
-- `ampliconclip` recalculates the BAM bin of clipped records; samtools keeps the original bin.
-  It keeps samtools' quirks otherwise, such as the read name in the `OA` tag's reference field.
-- `import` reads an empty input file as having no records; samtools fails on it ("truncated
+- `ampliconclip` fixes samtools bugs: `OA` tags follow the SAM specification
+  (`RNAME,POS,strand,CIGAR,MAPQ,NM;`), where samtools writes the read name as RNAME and drops
+  the comma before MAPQ without an `NM` tag; clipping the 3' end of a read that ends in a
+  deletion keeps its other CIGAR operations, which samtools drops (leaving, say, `1D` for 18
+  bases, so the read is then unmapped); and clipped records get a recalculated BAM bin.
+- `import` parses `-T` tags that follow a CASAVA barcode (`-i`), which samtools loses. It reads
+  an empty input file as having no records; samtools fails on it ("truncated
   file"), as it does on the empty `-0` file `samtools fastq` often writes. An `-r` read group
   line without an ID, or with a malformed field, is an error; samtools writes nothing and exits
   successfully.

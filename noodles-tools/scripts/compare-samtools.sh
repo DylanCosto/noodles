@@ -240,10 +240,12 @@ fi
 # ampliconclip, with primer pairs every 350 bp (and a few overlapping ones)
 awk 'BEGIN { print "# primers"; for (s = 0; s < 300000; s += 350) { printf "chrS\t%d\t%d\tamp%d_LEFT\t60\t+\n", s, s + 22, s; printf "chrS\t%d\t%d\tamp%d_RIGHT\t60\t-\n", s + 328, s + 350, s; if (s % 2450 == 0) printf "chrS\t%d\t%d\talt%d\t1\t+\n", s + 5, s + 30, s } }' > primers.bed
 for opts in "" "--hard-clip --original" "--both-ends --strand --keep-tag" "--both-ends --hard-clip --fail --fail-len 145 --filter-len 140" "--clipped --no-excluded --tolerance 0 --unmap-len 130"; do
+    # OA tags differ: samtools writes the read name where the reference name belongs.
     check "ampliconclip $opts" \
-        "$st ampliconclip --no-PG -b primers.bed $opts -O sam -f st.amp.stats mp.short.bam; tail -n +2 st.amp.stats" \
-        "$nt ampliconclip --no-PG -b primers.bed $opts -O sam -f nt.amp.stats mp.short.bam; tail -n +2 nt.amp.stats"
+        "$st ampliconclip --no-PG -b primers.bed $opts -O sam -f st.amp.stats mp.short.bam | sed 's/\tOA:Z:[^\t]*//'; tail -n +2 st.amp.stats" \
+        "$nt ampliconclip --no-PG -b primers.bed $opts -O sam -f nt.amp.stats mp.short.bam | sed 's/\tOA:Z:[^\t]*//'; tail -n +2 nt.amp.stats"
 done
+check "ampliconclip --original (SAM-spec OA)" "echo 'OA:Z:chrS,9,+,150M,34,0;'" "$nt ampliconclip --no-PG -b primers.bed --original -O sam mp.short.bam | grep -o 'OA:Z:[^[:space:]]*' | head -1"
 check "ampliconclip --primer-counts" \
     "$st ampliconclip --no-PG -b primers.bed --strand --primer-counts /dev/stdout -o /dev/null mp.short.bam" \
     "$nt ampliconclip --no-PG -b primers.bed --strand --primer-counts /dev/stdout -o /dev/null mp.short.bam"
@@ -266,7 +268,9 @@ check "import -T * (long, MM/ML)" "$st import --no-PG -T '*' imp.long.fq" "$nt i
 check "import -1 -2 -s -r --order" "$st import --no-PG -1 imp.R1.fq -2 imp.R2.fq -s imp.S.fq -r ID:a -r SM:b --order XO:5" "$nt import --no-PG -1 imp.R1.fq -2 imp.R2.fq -s imp.S.fq -r ID:a -r SM:b --order XO:5"
 check "import interleaved -O bam" "$st import --no-PG -O bam imp.inter.fq | $st view -h -" "$nt import --no-PG -O bam imp.inter.fq | $st view -h -"
 check "import --i1 -1 -2 -b" "$st import --no-PG --i1 imp.R2.fq -1 imp.R1.fq -2 imp.R2.fq -b" "$nt import --no-PG --i1 imp.R2.fq -1 imp.R1.fq -2 imp.R2.fq -b"
-check "import -i -U -T *" "$st import --no-PG -i -U -T '*' imp.casava.fq" "$nt import --no-PG -i -U -T '*' imp.casava.fq"
+# samtools loses tags after a CASAVA barcode; ntools keeps them.
+check "import -i -U -T *" "$st import --no-PG -i -U -T '*' imp.casava.fq | sed 's/\tXA:i:5//'" "$nt import --no-PG -i -U -T '*' imp.casava.fq | sed 's/\tXA:i:5//'"
+check "import -i -T *: tags after a barcode" "echo 1" "$nt import --no-PG -i -T '*' imp.casava.fq | grep -c 'XA:i:5'"
 
 # reset and checksum
 check "reset" "$st reset --no-PG $tagged" "$nt reset --no-PG $tagged"

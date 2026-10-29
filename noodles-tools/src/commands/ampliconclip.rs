@@ -4,10 +4,10 @@
 //! at its 5' end (or both ends), allowing `--tolerance` bases, and the longest overlapping
 //! region is soft or hard clipped from it. Reads clipped to nothing are unmapped (`--unmap-len`).
 //!
-//! samtools quirks are kept: the `OA` tag's first field is the read name rather than the
-//! reference name, and its MAPQ is not comma-separated from the CIGAR when there is no `NM`
-//! tag; trimming the 3' end of a read ending in a deletion drops CIGAR operations. Unlike
-//! samtools, clipped records get a recalculated BAM bin.
+//! Unlike samtools, `OA` tags follow the SAM specification (`RNAME,POS,strand,CIGAR,MAPQ,NM;`;
+//! samtools writes the read name as RNAME and drops the comma before MAPQ without `NM`), trimming
+//! the 3' end of a read ending in a deletion keeps its other CIGAR operations (samtools drops
+//! them), and clipped records get a recalculated BAM bin.
 
 use std::{
     fs::File,
@@ -243,6 +243,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         use_strand: args.strand,
         original: args.original,
         delete_tags: !args.keep_tag,
+        reference_names: names_by_id,
     };
 
     let mut counts = Counts::default();
@@ -268,7 +269,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             last_tid = Some(tid);
             sites = usize::try_from(tid)
                 .ok()
-                .and_then(|i| names_by_id.get(i))
+                .and_then(|i| options.reference_names.get(i))
                 .and_then(|name| names.iter().position(|n| n == name));
         }
 
@@ -414,6 +415,8 @@ struct ClipOptions {
     use_strand: bool,
     original: bool,
     delete_tags: bool,
+    /// Reference sequence names by ID, for `OA` tags.
+    reference_names: Vec<String>,
 }
 
 /// Clips the 5' end (the end for reverse reads); returns whether the read was clipped.
@@ -423,7 +426,9 @@ fn clip_five_prime(
     options: &ClipOptions,
     counts: &mut Counts,
 ) -> anyhow::Result<bool> {
-    let original = options.original.then(|| original_alignment(raw));
+    let original = options
+        .original
+        .then(|| original_alignment(raw, &options.reference_names));
     let reverse = le_u16(&raw[14..16]) & FLAG_REVERSE != 0;
 
     let pos = if reverse {
@@ -458,7 +463,9 @@ fn clip_both_ends(
     options: &ClipOptions,
     counts: &mut Counts,
 ) -> anyhow::Result<bool> {
-    let original = options.original.then(|| original_alignment(raw));
+    let original = options
+        .original
+        .then(|| original_alignment(raw, &options.reference_names));
 
     let size = matching_clip_site(regions, position(raw), false, options);
     let left = size > 0;
@@ -769,79 +776,42 @@ fn trim_right(raw: &[u8], bases: u32, clipping: Clipping) -> Vec<u8> {
         i -= 1;
     }
 
-    let mut j: isize;
+    // The operations kept: those before the one the clip ends in, and what is left of it.
+    let mut new_cigar = Vec::with_capacity(cigar.len() + 2);
 
-    if i >= 0 {
-        if cigar_type(cigar[i as usize] & 0xf) & 1 != 0 {
+    if let Ok(last) = usize::try_from(i) {
+        let op = cigar[last];
+
+        if cigar_type(op & 0xf) & 1 != 0 {
             qry_removed += ref_remove;
         }
 
-        j = i;
-
-        if qry_removed > 0 {
-            j += 1;
-        }
-
-        if hardclip > 0 && (clipping == Clipping::Soft || qry_removed == 0) {
-            j += 1;
-        }
+        new_cigar.extend_from_slice(&cigar[..last]);
+        new_cigar.push(cigar_op((op >> 4) - ref_remove, op & 0xf));
     } else {
         if clipping == Clipping::Hard {
             return parts.encode(position(raw), &[], 0, &[], &[]);
         }
 
         qry_removed = parts.l_seq as u32;
-        j = 0;
-
-        if hardclip > 0 && clipping == Clipping::Soft {
-            j += 1;
-        }
     }
-
-    // Written by index from the end, as samtools does: a CIGAR ending in a deletion that is
-    // clipped without removing bases loses its first operations.
-    let mut new_cigar = vec![0; cigar.len() + 2];
-    let mut new_n = 0;
 
     match clipping {
         Clipping::Hard => {
             if hardclip + qry_removed > 0 {
-                new_cigar[j as usize] = cigar_op(hardclip + qry_removed, CIGAR_HARD_CLIP);
-                new_n += 1;
+                new_cigar.push(cigar_op(hardclip + qry_removed, CIGAR_HARD_CLIP));
             }
         }
         Clipping::Soft => {
-            if hardclip > 0 {
-                new_cigar[j as usize] = cigar_op(hardclip, CIGAR_HARD_CLIP);
-                new_n += 1;
-
-                if qry_removed > 0 {
-                    j -= 1;
-                }
+            if qry_removed > 0 {
+                new_cigar.push(cigar_op(qry_removed, CIGAR_SOFT_CLIP));
             }
 
-            if qry_removed > 0 {
-                new_cigar[j as usize] = cigar_op(qry_removed, CIGAR_SOFT_CLIP);
-                new_n += 1;
+            if hardclip > 0 {
+                new_cigar.push(cigar_op(hardclip, CIGAR_HARD_CLIP));
             }
         }
     }
-
-    if j > 0 {
-        j -= 1;
-        let op = cigar[i as usize];
-        new_cigar[j as usize] = cigar_op((op >> 4) - ref_remove, op & 0xf);
-        new_n += 1;
-    }
-
-    while j > 0 {
-        j -= 1;
-        i -= 1;
-        new_cigar[j as usize] = cigar[i as usize];
-        new_n += 1;
-    }
-
-    new_cigar.truncate(new_n);
 
     let removed = match clipping {
         Clipping::Soft => 0,
@@ -890,38 +860,38 @@ fn unmap(raw: &[u8]) -> Vec<u8> {
     dst
 }
 
-/// `tag_original_data`: the OA value (an existing one, then this alignment), with samtools'
-/// read name in the reference name's place.
-fn original_alignment(raw: &[u8]) -> Vec<u8> {
+/// `tag_original_data`: the OA value, an existing one followed by this alignment as
+/// `RNAME,POS,strand,CIGAR,MAPQ,NM;` (NM empty without an `NM` tag). samtools writes the read
+/// name as RNAME and drops the comma before MAPQ when there is no `NM` tag.
+fn original_alignment(raw: &[u8], reference_names: &[String]) -> Vec<u8> {
     let parts = Parts::new(raw);
     let mut oa = Vec::new();
 
-    if let Ok(Some(range)) = bam_raw::find_field(raw, *b"OA") {
-        if raw[range.start + 2] == b'Z' {
-            oa.extend_from_slice(&raw[range.start + 3..range.end - 1]);
-        } else {
-            oa.extend_from_slice(b"(null)");
-        }
+    if let Ok(Some(value)) = bam_raw::string_field(raw, *b"OA") {
+        oa.extend_from_slice(value);
     }
 
+    let reference_name = usize::try_from(le_u32(&raw[0..4]).cast_signed())
+        .ok()
+        .and_then(|id| reference_names.get(id))
+        .map_or("*", String::as_str);
+
     let flags = le_u16(&raw[14..16]);
-    let name = &raw[32..32 + usize::from(raw[8]) - 1];
-    oa.extend_from_slice(name);
     let strand = if flags & FLAG_REVERSE != 0 { '-' } else { '+' };
-    oa.extend_from_slice(format!(",{},{strand},", position(raw) + 1).as_bytes());
+    oa.extend_from_slice(format!("{reference_name},{},{strand},", position(raw) + 1).as_bytes());
 
     for &op in &parts.cigar {
         oa.extend_from_slice((op >> 4).to_string().as_bytes());
         oa.push(b"MIDNSHP=XBBBBBBB"[(op & 0xf) as usize]);
     }
 
-    let mapq = raw[9];
+    oa.extend_from_slice(format!(",{},", raw[9]).as_bytes());
 
-    match integer_tag(raw, *b"NM") {
-        Some(nm) => oa.extend_from_slice(format!(",{mapq},{nm};").as_bytes()),
-        None => oa.extend_from_slice(format!("{mapq},;").as_bytes()),
+    if let Some(nm) = integer_tag(raw, *b"NM") {
+        oa.extend_from_slice(nm.to_string().as_bytes());
     }
 
+    oa.push(b';');
     oa
 }
 
@@ -1221,6 +1191,72 @@ mod tests {
         let seq = [0x12, 0x48];
         assert_eq!(shifted_bases(&seq, 1, 3), [0x24, 0x80]);
         assert_eq!(shifted_bases(&seq, 2, 2), [0x48]);
+    }
+
+    /// An encoded record at position 100 with the CIGAR, `ACGT...` bases, and qualities 30.
+    fn record(cigar: &[u32], len: usize) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend(0i32.to_le_bytes());
+        raw.extend(99i32.to_le_bytes());
+        raw.push(2);
+        raw.push(60);
+        raw.extend(0u16.to_le_bytes());
+        raw.extend((cigar.len() as u16).to_le_bytes());
+        raw.extend(0u16.to_le_bytes());
+        raw.extend((len as u32).to_le_bytes());
+        raw.extend((-1i32).to_le_bytes());
+        raw.extend((-1i32).to_le_bytes());
+        raw.extend(0i32.to_le_bytes());
+        raw.extend(b"r\0");
+        cigar.iter().for_each(|op| raw.extend(op.to_le_bytes()));
+        raw.extend(std::iter::repeat_n(0x12, len.div_ceil(2)));
+        raw.extend(std::iter::repeat_n(30, len));
+        raw.extend(b"NMC\x03");
+        raw
+    }
+
+    #[test]
+    fn test_trim_right() {
+        // 4M2I5M3D, clipping 2 reference bases from the end: the deletion is shortened, and the
+        // operations before it are kept (samtools drops them).
+        let raw = record(
+            &[
+                cigar_op(4, 0),
+                cigar_op(2, 1),
+                cigar_op(5, 0),
+                cigar_op(3, 2),
+            ],
+            11,
+        );
+        let clipped = trim_right(&raw, 2, Clipping::Soft);
+        assert_eq!(
+            Parts::new(&clipped).cigar,
+            [
+                cigar_op(4, 0),
+                cigar_op(2, 1),
+                cigar_op(5, 0),
+                cigar_op(1, 2)
+            ]
+        );
+
+        // 10M, clipping 3: 7M3S, or 7M3H keeping 7 bases.
+        let raw = record(&[cigar_op(10, 0)], 10);
+        let clipped = trim_right(&raw, 3, Clipping::Soft);
+        assert_eq!(Parts::new(&clipped).cigar, [cigar_op(7, 0), cigar_op(3, 4)]);
+        let clipped = trim_right(&raw, 3, Clipping::Hard);
+        let parts = Parts::new(&clipped);
+        assert_eq!(parts.cigar, [cigar_op(7, 0), cigar_op(3, 5)]);
+        assert_eq!(parts.l_seq, 7);
+    }
+
+    #[test]
+    fn test_original_alignment() {
+        let mut raw = record(&[cigar_op(10, 0)], 10);
+        let names = ["chr1".to_string()];
+        assert_eq!(original_alignment(&raw, &names), b"chr1,100,+,10M,60,3;");
+
+        raw.truncate(raw.len() - 4);
+        assert_eq!(original_alignment(&raw, &names), b"chr1,100,+,10M,60,;");
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //! read names lose `/1` and `/2` suffixes (setting the read flags), `-i` parses CASAVA
 //! comments, `-U` moves Illumina UMIs from names to a tag, and `-T` parses SAM-style tags from
 //! comments with HTSlib's lenient rules. Files given with `-0`/`-1`/`-2`/`--i1`/`--i2`/`-s` are
-//! read in step, index reads becoming `BC`/`QT` tags of the reads after them.
+//! read in step, index reads becoming `BC`/`QT` tags of the reads after them. Unlike HTSlib,
+//! tags after a CASAVA barcode are parsed.
 
 use std::{
     collections::HashSet,
@@ -674,9 +675,9 @@ impl FastqReader {
             append_string_tag(dst, umi_tag, &bases);
         }
 
-        // The barcode's length with its NUL. HTSlib parses tags from this offset into the
-        // comment (not from the barcode's end), so tags after a barcode are usually lost.
-        let mut barcode_len = 0;
+        // Tags are parsed from after a CASAVA barcode. (HTSlib starts at the barcode's length
+        // into the comment, inside the CASAVA field, so tags after a barcode are usually lost.)
+        let mut aux_start = 0;
 
         if options.casava
             && let Some((barcode, casava_flags)) =
@@ -686,13 +687,13 @@ impl FastqReader {
             dst[14..16].copy_from_slice(&flags.to_le_bytes());
 
             if let Some(barcode) = barcode {
-                barcode_len = barcode.len() + 1;
+                aux_start = (barcode.end + 1).min(comment_len);
                 append_string_tag(dst, options.barcode_tag, &comment[barcode]);
             }
         }
 
         if let Some(whitelist) = &options.aux
-            && parse_aux(&comment, barcode_len, comment_len, dst, whitelist.as_ref()).is_err()
+            && parse_aux(&comment, aux_start, comment_len, dst, whitelist.as_ref()).is_err()
         {
             return Ok(Read::Truncated);
         }
