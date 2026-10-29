@@ -22,6 +22,7 @@ clap = { version = "4.5.0", features = ["derive"] }
 crossbeam-channel = "0.5.6"
 flate2.workspace = true
 lexical-core.workspace = true
+md-5 = "0.11.0"
 memchr.workspace = true
 noodles-bam = { path = "../noodles-bam" }
 noodles-bgzf = { path = "../noodles-bgzf" }

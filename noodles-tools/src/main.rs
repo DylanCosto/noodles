@@ -68,6 +68,8 @@ enum Command {
     Fixmate(commands::fixmate::Args),
     /// Mark duplicate alignments.
     Markdup(commands::markdup::Args),
+    /// Write a SAM sequence dictionary for a FASTA file.
+    Dict(commands::dict::Args),
 }
 
 fn main() -> ExitCode {
@@ -94,6 +96,7 @@ fn main() -> ExitCode {
         Command::Collate(args) => commands::collate::run(args).map(|()| ExitCode::SUCCESS),
         Command::Fixmate(args) => commands::fixmate::run(args).map(|()| ExitCode::SUCCESS),
         Command::Markdup(args) => commands::markdup::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Dict(args) => commands::dict::run(args).map(|()| ExitCode::SUCCESS),
     };
 
     match result {
