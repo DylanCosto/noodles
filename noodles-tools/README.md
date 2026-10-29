@@ -115,8 +115,8 @@ libdeflate. "short" is 1M synthetic 150 bp paired reads, "tagged" 250k reads wit
 
 Where ntools is slower, it is single-threaded: per-thread CRAM decoding still trails HTSlib,
 whose rANS decoder uses SIMD. Rows near 1.0x (flagstat, index, counting) are bound by BGZF
-decompression, which both tools do with libdeflate. With threads, ntools parallelizes more of the work than samtools
-does, so the gap reverses.
+decompression, which both tools do with libdeflate. With threads, ntools parallelizes more of
+the work than samtools does, so the gap reverses.
 
 ## Library changes in this fork
 
