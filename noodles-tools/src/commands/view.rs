@@ -15,8 +15,9 @@ use noodles_sam::{
 };
 
 use crate::{
-    alignment::{AlignmentReader, Queries, ReadOptions, Rec},
+    alignment::{AlignmentReader, Queries, ReadOptions, Rec, encode_cram_record},
     bam_raw,
+    bam_sam::{self, Names},
     commands::index::{IndexKind, index_file},
     filter::{self, Filter, Subsample, TagFilter},
     flags,
@@ -453,35 +454,19 @@ fn parse_tags(raw: &[String]) -> anyhow::Result<Vec<[u8; 2]>> {
 }
 
 /// SAM text for the records of one CRAM container that pass the filter, and a buffer for
-/// reconstructing sequences.
+/// encoding records.
+#[derive(Default)]
 struct SamChunk {
-    writer: sam::io::Writer<Vec<u8>>,
-    sequence: Vec<u8>,
+    text: Vec<u8>,
+    record: bam::Record,
 }
 
-impl Default for SamChunk {
-    fn default() -> Self {
-        Self {
-            writer: sam::io::Writer::new(Vec::new()),
-            sequence: Vec::new(),
-        }
-    }
-}
-
-/// `block_size`-prefixed BAM records for one CRAM container, and a buffer for reconstructing
-/// sequences.
+/// `block_size`-prefixed BAM records for one CRAM container that pass the filter, and a buffer
+/// for encoding records.
+#[derive(Default)]
 struct BamChunk {
-    writer: bam::io::Writer<Vec<u8>>,
-    sequence: Vec<u8>,
-}
-
-impl Default for BamChunk {
-    fn default() -> Self {
-        Self {
-            writer: bam::io::Writer::from(Vec::new()),
-            sequence: Vec::new(),
-        }
-    }
+    records: Vec<u8>,
+    record: bam::Record,
 }
 
 /// Decodes CRAM containers on `threads` workers, formatting records there as SAM or BAM.
@@ -497,34 +482,50 @@ fn write_cram_in_parallel<R>(
 where
     R: io::Read + Send,
 {
+    // Records are encoded as BAM on the workers, so SAM output uses the raw BAM formatter.
     match kind {
-        OutputFormat::Sam => parallel_cram::decode(
-            reader,
-            header,
-            repository,
-            threads,
-            |chunk: &mut SamChunk, record| {
-                if filter.matches(&Rec::Dyn(record), header)? {
-                    let view = record.with_sequence(&mut chunk.sequence);
-                    chunk.writer.write_alignment_record(header, &view)?;
-                }
-                Ok(())
-            },
-            |chunk| Ok(writer.write_sam_text(chunk.writer.into_inner())?),
-        ),
+        OutputFormat::Sam => {
+            let names = Names::new(header);
+
+            parallel_cram::decode(
+                reader,
+                header,
+                repository,
+                threads,
+                |chunk: &mut SamChunk, record| {
+                    encode_cram_record(header, record, &mut chunk.record)?;
+
+                    if filter.matches(&Rec::Bam(&chunk.record), header)?
+                        && !bam_sam::format_record(&names, chunk.record.as_ref(), &mut chunk.text)
+                    {
+                        let mut writer = sam::io::Writer::new(&mut chunk.text);
+                        writer.write_alignment_record(header, &chunk.record)?;
+                    }
+
+                    Ok(())
+                },
+                |chunk| Ok(writer.write_sam_text(chunk.text)?),
+            )
+        }
         OutputFormat::Bam => parallel_cram::decode(
             reader,
             header,
             repository,
             threads,
             |chunk: &mut BamChunk, record| {
-                if filter.matches(&Rec::Dyn(record), header)? {
-                    let view = record.with_sequence(&mut chunk.sequence);
-                    chunk.writer.write_alignment_record(header, &view)?;
+                encode_cram_record(header, record, &mut chunk.record)?;
+
+                if filter.matches(&Rec::Bam(&chunk.record), header)? {
+                    let raw = chunk.record.as_ref();
+                    let block_size = u32::try_from(raw.len())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+                    chunk.records.extend(block_size.to_le_bytes());
+                    chunk.records.extend_from_slice(raw);
                 }
+
                 Ok(())
             },
-            |chunk| Ok(writer.write_bam_records(chunk.writer.get_ref())?),
+            |chunk| Ok(writer.write_bam_records(&chunk.records)?),
         ),
         OutputFormat::Cram => bail!("CRAM-to-CRAM output is written serially"),
     }

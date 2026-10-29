@@ -5,6 +5,7 @@
 
 use std::{
     io::{self, BufRead, BufReader},
+    mem,
     path::{Path, PathBuf},
 };
 
@@ -173,9 +174,10 @@ impl AlignmentReader {
                 }
             }
             Self::Cram(reader, repository) => {
-                // Decoding containers directly avoids converting each record to a `RecordBuf`.
+                // Decoding containers directly avoids converting each record to a `RecordBuf`, and
+                // encoding records as BAM lets callers use their raw BAM paths.
                 let mut container = cram::io::reader::Container::default();
-                let mut sequence = Vec::new();
+                let mut bam_record = bam::Record::default();
 
                 while reader.read_container(&mut container)? != 0 {
                     let compression_header = container.compression_header()?;
@@ -193,8 +195,8 @@ impl AlignmentReader {
                         )?;
 
                         for record in &records {
-                            let view = record.with_sequence(&mut sequence);
-                            f(Rec::Dyn(&view))?;
+                            encode_cram_record(header, record, &mut bam_record)?;
+                            f(Rec::Bam(&bam_record))?;
                         }
                     }
                 }
@@ -306,6 +308,18 @@ impl AlignmentReader {
 
         Ok(())
     }
+}
+
+/// Encodes a CRAM record as a BAM record into `dst`, reusing its buffer.
+pub fn encode_cram_record(
+    header: &sam::Header,
+    record: &cram::Record<'_>,
+    dst: &mut bam::Record,
+) -> io::Result<()> {
+    let mut buf = Vec::from(mem::take(dst));
+    record.encode_bam_record(header, &mut buf)?;
+    *dst = bam::Record::try_from(buf)?;
+    Ok(())
 }
 
 /// A BAM (BAI or CSI) or CRAM (CRAI) index.
