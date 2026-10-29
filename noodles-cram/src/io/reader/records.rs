@@ -6,6 +6,7 @@ use std::{
 use noodles_sam as sam;
 
 use super::{Container, Reader};
+use crate::io::reader::fields::Plan;
 
 /// An iterator over records of a CRAM reader.
 ///
@@ -40,21 +41,24 @@ where
 
         let compression_header = self.container.compression_header()?;
 
+        let plan = Plan::new(&self.reader.fields, &compression_header);
+
         self.records = self
             .container
             .slices()
             .map(|result| {
                 let slice = result?;
 
-                let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
+                let (core_data_src, external_data_srcs) = slice.decode_blocks_with_plan(&plan)?;
 
                 slice
-                    .records(
+                    .records_with_plan(
                         self.reader.reference_sequence_repository.clone(),
                         self.header,
                         &compression_header,
                         &core_data_src,
                         &external_data_srcs,
+                        &plan,
                     )
                     .and_then(|records| {
                         records

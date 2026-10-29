@@ -7,12 +7,13 @@ use std::{
 use noodles_fasta as fasta;
 
 use super::IndexedReader;
-use crate::crai;
+use crate::{crai, io::reader::Fields};
 
 /// An indexed CRAM reader builder.
 #[derive(Default)]
 pub struct Builder {
     reference_sequence_repository: fasta::Repository,
+    fields: Fields,
     index: Option<crai::Index>,
 }
 
@@ -34,6 +35,21 @@ impl Builder {
         reference_sequence_repository: fasta::Repository,
     ) -> Self {
         self.reference_sequence_repository = reference_sequence_repository;
+        self
+    }
+
+    /// Sets the record fields to decode.
+    ///
+    /// By default, every field is decoded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use noodles_cram::{io::indexed_reader::Builder, io::reader::Fields};
+    /// let builder = Builder::default().set_fields(Fields::default().set_quality_scores(false));
+    /// ```
+    pub fn set_fields(mut self, fields: Fields) -> Self {
+        self.fields = fields;
         self
     }
 
@@ -96,6 +112,7 @@ impl Builder {
     {
         let inner = crate::io::reader::Builder::default()
             .set_reference_sequence_repository(self.reference_sequence_repository)
+            .set_fields(self.fields)
             .build_from_reader(reader);
 
         let index = self

@@ -17,7 +17,10 @@ use crate::{
             preservation_map::tag_sets,
         },
     },
-    io::BitReader,
+    io::{
+        BitReader,
+        reader::fields::{Action, Plan},
+    },
     record::{Feature, Flags, MateFlags, feature},
 };
 
@@ -48,7 +51,9 @@ pub struct Records<'c, 'ch: 'c> {
     reference_sequence_context: ReferenceSequenceContext,
     id: u64,
     prev_alignment_start: Option<Position>,
-    resolved_tag_sets: Vec<Vec<(tag_sets::Key, &'ch Encoding<ByteArray>)>>,
+    resolved_tag_sets: Vec<Vec<(tag_sets::Key, &'ch Encoding<ByteArray>, Action)>>,
+    quality_scores: Action,
+    read_group_ids: bool,
 }
 
 impl<'c, 'ch: 'c> Records<'c, 'ch> {
@@ -58,13 +63,14 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
         external_data_readers: ExternalDataReaders<'c>,
         reference_sequence_context: ReferenceSequenceContext,
         initial_id: u64,
+        plan: &Plan,
     ) -> io::Result<Self> {
         let initial_alignment_start = match reference_sequence_context {
             ReferenceSequenceContext::Some(context) => Some(context.alignment_start()),
             _ => None,
         };
 
-        let resolved_tag_sets = resolve_tag_sets(compression_header)?;
+        let resolved_tag_sets = resolve_tag_sets(compression_header, plan)?;
 
         Ok(Self {
             compression_header,
@@ -74,6 +80,8 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
             id: initial_id,
             prev_alignment_start: initial_alignment_start,
             resolved_tag_sets,
+            quality_scores: plan.quality_scores(),
+            read_group_ids: plan.read_group_ids(),
         })
     }
 
@@ -136,6 +144,10 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
 
         record.alignment_start = self.read_alignment_start()?;
         record.read_group_id = self.read_read_group_id()?;
+
+        if !self.read_group_ids {
+            record.read_group_id = None;
+        }
 
         Ok(())
     }
@@ -340,12 +352,18 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
 
         record.data.reserve(tag_set.len());
 
-        for (key, encoding) in tag_set {
-            let value = encoding
-                .decode(&mut self.core_data_reader, &mut self.external_data_readers)
-                .and_then(|src| self::data::read_value(src, key.ty()))?;
+        for &(key, encoding, action) in tag_set {
+            if action == Action::Skip {
+                continue;
+            }
 
-            record.data.push((key.tag(), value));
+            let src =
+                encoding.decode(&mut self.core_data_reader, &mut self.external_data_readers)?;
+
+            if action == Action::Decode {
+                let value = self::data::read_value(src, key.ty())?;
+                record.data.push((key.tag(), value));
+            }
         }
 
         Ok(())
@@ -369,9 +387,12 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
         let mut prev_position = 0;
 
         for _ in 0..feature_count {
-            let feature = self.read_feature(prev_position)?;
-            prev_position = usize::from(feature.position());
-            record.features.push(feature);
+            let (position, feature) = self.read_feature(prev_position)?;
+            prev_position = usize::from(position);
+
+            if let Some(feature) = feature {
+                record.features.push(feature);
+            }
         }
 
         record.mapping_quality = self.read_mapping_quality()?;
@@ -394,7 +415,12 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
             })
     }
 
-    fn read_feature(&mut self, prev_position: usize) -> io::Result<Feature<'c>> {
+    /// Reads a feature and returns its position and the feature, or `None` for a quality score
+    /// feature when quality scores are left out.
+    fn read_feature(
+        &mut self,
+        prev_position: usize,
+    ) -> io::Result<(Position, Option<Feature<'c>>)> {
         use feature::Code;
 
         let code = self.read_feature_code()?;
@@ -402,6 +428,31 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
         let delta = self.read_feature_position_delta()?;
         let position = Position::try_from(prev_position + delta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        if matches!(code, Code::Scores | Code::QualityScore)
+            && self.quality_scores != Action::Decode
+        {
+            if self.quality_scores == Action::Discard {
+                if code == Code::Scores {
+                    self.read_stretches_of_quality_scores()?;
+                } else {
+                    self.read_quality_score()?;
+                }
+            }
+
+            return Ok((position, None));
+        }
+
+        self.read_feature_code_data(code, position)
+            .map(|feature| (position, Some(feature)))
+    }
+
+    fn read_feature_code_data(
+        &mut self,
+        code: feature::Code,
+        position: Position,
+    ) -> io::Result<Feature<'c>> {
+        use feature::Code;
 
         match code {
             Code::Bases => {
@@ -417,8 +468,15 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
                 })
             }
             Code::ReadBase => {
+                const MISSING: u8 = 0;
+
                 let base = self.read_base()?;
-                let quality_score = self.read_quality_score()?;
+
+                let quality_score = match self.quality_scores {
+                    Action::Decode => self.read_quality_score()?,
+                    Action::Discard => self.read_quality_score().map(|_| MISSING)?,
+                    Action::Skip => MISSING,
+                };
 
                 Ok(Feature::ReadBase {
                     position,
@@ -635,6 +693,10 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
     fn read_quality_scores(&mut self, read_length: usize) -> io::Result<Cow<'c, [u8]>> {
         const MISSING: u8 = 0xff;
 
+        if self.quality_scores == Action::Skip {
+            return Ok(Cow::from(&[]));
+        }
+
         let encoding = self
             .compression_header
             .data_series_encodings()
@@ -647,7 +709,7 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
             read_length,
         )?;
 
-        if src.iter().all(|&n| n == MISSING) {
+        if self.quality_scores == Action::Discard || src.iter().all(|&n| n == MISSING) {
             Ok(Cow::from(&[]))
         } else {
             Ok(src)
@@ -656,9 +718,10 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
 }
 
 #[expect(clippy::type_complexity)]
-fn resolve_tag_sets(
-    compression_header: &CompressionHeader,
-) -> io::Result<Vec<Vec<(tag_sets::Key, &Encoding<ByteArray>)>>> {
+fn resolve_tag_sets<'ch>(
+    compression_header: &'ch CompressionHeader,
+    plan: &Plan,
+) -> io::Result<Vec<Vec<(tag_sets::Key, &'ch Encoding<ByteArray>, Action)>>> {
     compression_header
         .preservation_map()
         .tag_sets()
@@ -677,7 +740,7 @@ fn resolve_tag_sets(
                             )
                         })?;
 
-                    Ok((key, encoding))
+                    Ok((key, encoding, plan.tag(key)))
                 })
                 .collect()
         })

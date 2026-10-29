@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+  * cram/io/reader: Add option to decode only some record fields
+    (`cram::io::reader::Fields`).
+
+    Readers built with `Builder::set_fields` can leave out quality scores and
+    data fields. External blocks that only left-out fields use are not
+    decompressed.
+
 ## 0.101.0 - 2026-10-15
 
 ### Changed

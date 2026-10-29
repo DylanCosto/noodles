@@ -19,7 +19,7 @@ use crate::{
         block::{self, ContentType},
         slice::Header,
     },
-    io::BitReader,
+    io::{BitReader, reader::fields::Plan},
     record::Feature,
 };
 
@@ -41,18 +41,38 @@ impl<'c> Slice<'c> {
     pub fn decode_blocks(
         &self,
     ) -> io::Result<(Cow<'c, [u8]>, Vec<(block::ContentId, Cow<'c, [u8]>)>)> {
+        self.decode_blocks_with_plan(&Plan::default())
+    }
+
+    /// Decodes the core data block and the external blocks, except those the plan skips.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn decode_blocks_with_plan(
+        &self,
+        plan: &Plan,
+    ) -> io::Result<(Cow<'c, [u8]>, Vec<(block::ContentId, Cow<'c, [u8]>)>)> {
         let mut src = self.src;
 
         let block = read_block_as(&mut src, ContentType::CoreData)?;
         let core_data_src = block.decode()?;
 
+        let skipped_block_content_ids = plan.skipped_block_content_ids();
+        let embedded_reference_bases_block_content_id =
+            self.header.embedded_reference_bases_block_content_id();
+
         let external_data_block_count = self.header.block_count() - 1;
-        let external_data_srcs = (0..external_data_block_count)
-            .map(|_| {
-                let block = read_block_as(&mut src, ContentType::ExternalData)?;
-                block.decode().map(|src| (block.content_id, src))
-            })
-            .collect::<io::Result<_>>()?;
+        let mut external_data_srcs = Vec::with_capacity(external_data_block_count);
+
+        for _ in 0..external_data_block_count {
+            let block = read_block_as(&mut src, ContentType::ExternalData)?;
+
+            if skipped_block_content_ids.contains(&block.content_id)
+                && Some(block.content_id) != embedded_reference_bases_block_content_id
+            {
+                continue;
+            }
+
+            external_data_srcs.push((block.content_id, block.decode()?));
+        }
 
         Ok((core_data_src, external_data_srcs))
     }
@@ -101,6 +121,28 @@ impl<'c> Slice<'c> {
         core_data_src: &'c [u8],
         external_data_srcs: &'c [(block::ContentId, Cow<'c, [u8]>)],
     ) -> io::Result<Vec<Record<'c>>> {
+        self.records_with_plan(
+            reference_sequence_repository,
+            header,
+            compression_header,
+            core_data_src,
+            external_data_srcs,
+            &Plan::default(),
+        )
+    }
+
+    /// Reads the records in this slice, decoding the fields the plan selects.
+    ///
+    /// The blocks must be decoded with the same plan.
+    pub(crate) fn records_with_plan<'h: 'c, 'ch: 'c>(
+        &self,
+        reference_sequence_repository: fasta::Repository,
+        header: &'h sam::Header,
+        compression_header: &'ch CompressionHeader,
+        core_data_src: &'c [u8],
+        external_data_srcs: &'c [(block::ContentId, Cow<'c, [u8]>)],
+        plan: &Plan,
+    ) -> io::Result<Vec<Record<'c>>> {
         let core_data_reader = BitReader::new(core_data_src);
 
         let mut external_data_readers = ExternalDataReaders::new();
@@ -118,6 +160,7 @@ impl<'c> Slice<'c> {
             external_data_readers,
             reference_sequence_context,
             initial_id,
+            plan,
         )?;
 
         let slice_reference_sequence = get_slice_reference_sequence(

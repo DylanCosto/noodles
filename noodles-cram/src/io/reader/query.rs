@@ -11,6 +11,7 @@ use noodles_sam as sam;
 use self::records::Records;
 use super::{Container, Reader};
 use crate::crai;
+use crate::io::reader::fields::Plan;
 
 /// A reader over records that intersect a given region.
 ///
@@ -150,20 +151,23 @@ where
             Err(e) => return Some(Err(e)),
         };
 
+        let plan = Plan::new(&self.reader.fields, &compression_header);
+
         let records = container
             .slices()
             .map(|result| {
                 let slice = result?;
 
-                let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
+                let (core_data_src, external_data_srcs) = slice.decode_blocks_with_plan(&plan)?;
 
                 slice
-                    .records(
+                    .records_with_plan(
                         self.reader.reference_sequence_repository.clone(),
                         self.header,
                         &compression_header,
                         &core_data_src,
                         &external_data_srcs,
+                        &plan,
                     )
                     .and_then(|records| {
                         records

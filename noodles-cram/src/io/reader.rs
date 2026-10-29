@@ -3,6 +3,7 @@
 mod builder;
 pub(crate) mod collections;
 pub(crate) mod container;
+pub(crate) mod fields;
 pub mod header;
 pub(crate) mod num;
 pub(crate) mod query;
@@ -14,7 +15,9 @@ use noodles_core::Region;
 use noodles_fasta as fasta;
 use noodles_sam as sam;
 
-pub use self::{builder::Builder, container::Container, query::Query, records::Records};
+pub use self::{
+    builder::Builder, container::Container, fields::Fields, query::Query, records::Records,
+};
 use self::{container::read_container, header::read_header};
 use crate::{FileDefinition, crai};
 
@@ -43,6 +46,7 @@ use crate::{FileDefinition, crai};
 pub struct Reader<R> {
     inner: R,
     reference_sequence_repository: fasta::Repository,
+    fields: Fields,
 }
 
 impl<R> Reader<R> {
@@ -109,6 +113,10 @@ where
 
     pub(crate) fn reference_sequence_repository(&self) -> &fasta::Repository {
         &self.reference_sequence_repository
+    }
+
+    pub(crate) fn fields(&self) -> &Fields {
+        &self.fields
     }
 
     /// Returns a CRAM header reader.

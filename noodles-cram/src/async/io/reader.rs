@@ -16,12 +16,16 @@ use tokio::io::{self, AsyncRead, AsyncSeek, AsyncSeekExt, SeekFrom};
 
 pub use self::{builder::Builder, query::Query};
 use self::{container::read_container, crc_reader::CrcReader, header::read_header};
-use crate::{FileDefinition, crai, io::reader::Container};
+use crate::{
+    FileDefinition, crai,
+    io::reader::{Container, Fields},
+};
 
 /// An async CRAM reader.
 pub struct Reader<R> {
     inner: R,
     reference_sequence_repository: fasta::Repository,
+    fields: Fields,
 }
 
 impl<R> Reader<R> {
@@ -87,6 +91,10 @@ where
 
     pub(crate) fn reference_sequence_repository(&self) -> &fasta::Repository {
         &self.reference_sequence_repository
+    }
+
+    pub(crate) fn fields(&self) -> &Fields {
+        &self.fields
     }
 
     /// Returns an async CRAM header reader.

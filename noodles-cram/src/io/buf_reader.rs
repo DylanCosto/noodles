@@ -6,6 +6,7 @@ use std::{
 use noodles_sam as sam;
 
 use super::{Reader, reader::Container};
+use crate::io::reader::fields::Plan;
 
 /// A buffered CRAM reader.
 pub struct BufReader<R> {
@@ -132,20 +133,23 @@ where
         let reference_sequence_repository = self.get_ref().reference_sequence_repository().clone();
         let compression_header = self.container.compression_header()?;
 
+        let plan = Plan::new(self.get_ref().fields(), &compression_header);
+
         let mut records = Vec::with_capacity(self.container.header().record_count());
 
         for result in self.container.slices() {
             let slice = result?;
 
-            let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
+            let (core_data_src, external_data_srcs) = slice.decode_blocks_with_plan(&plan)?;
 
             let record_bufs = slice
-                .records(
+                .records_with_plan(
                     reference_sequence_repository.clone(),
                     header,
                     &compression_header,
                     &core_data_src,
                     &external_data_srcs,
+                    &plan,
                 )?
                 .into_iter()
                 .map(|record| {

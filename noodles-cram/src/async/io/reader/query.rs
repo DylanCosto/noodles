@@ -6,6 +6,7 @@ use noodles_sam as sam;
 use tokio::io::{self, AsyncRead, AsyncSeek};
 
 use super::Reader;
+use crate::io::reader::fields::Plan;
 use crate::{
     crai,
     io::reader::{
@@ -116,20 +117,23 @@ where
         Err(e) => return Some(Err(e)),
     };
 
+    let plan = Plan::new(&ctx.inner.fields, &compression_header);
+
     let records = container
         .slices()
         .map(|result| {
             let slice = result?;
 
-            let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
+            let (core_data_src, external_data_srcs) = slice.decode_blocks_with_plan(&plan)?;
 
             slice
-                .records(
+                .records_with_plan(
                     ctx.inner.reference_sequence_repository.clone(),
                     ctx.header,
                     &compression_header,
                     &core_data_src,
                     &external_data_srcs,
+                    &plan,
                 )
                 .and_then(|records| {
                     records

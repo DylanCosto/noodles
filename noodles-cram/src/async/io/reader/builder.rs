@@ -7,11 +7,13 @@ use tokio::{
 };
 
 use super::Reader;
+use crate::io::reader::Fields;
 
 /// An async CRAM reader builder.
 #[derive(Default)]
 pub struct Builder {
     reference_sequence_repository: fasta::Repository,
+    fields: Fields,
 }
 
 impl Builder {
@@ -33,6 +35,21 @@ impl Builder {
         reference_sequence_repository: fasta::Repository,
     ) -> Self {
         self.reference_sequence_repository = reference_sequence_repository;
+        self
+    }
+
+    /// Sets the record fields to decode.
+    ///
+    /// By default, every field is decoded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use noodles_cram::{r#async::io::reader::Builder, io::reader::Fields};
+    /// let builder = Builder::default().set_fields(Fields::default().set_quality_scores(false));
+    /// ```
+    pub fn set_fields(mut self, fields: Fields) -> Self {
+        self.fields = fields;
         self
     }
 
@@ -73,6 +90,7 @@ impl Builder {
         Reader {
             inner: reader,
             reference_sequence_repository: self.reference_sequence_repository,
+            fields: self.fields,
         }
     }
 }
