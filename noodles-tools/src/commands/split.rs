@@ -174,9 +174,17 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
                     let i = groups.len();
                     let path = output_path(&format, &basename, i, pad, &value, extension)?;
+
+                    // As in samtools, splitting by RG keeps only that read group's @RG line.
+                    let group_header = if tag == Tag::READ_GROUP {
+                        read_group_header(&header, &value)
+                    } else {
+                        header.clone()
+                    };
+
                     groups.push(open_group(
                         &path,
-                        header.clone(),
+                        group_header,
                         &write_options,
                         args.verbose,
                     )?);
