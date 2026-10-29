@@ -71,6 +71,8 @@ enum Command {
     Fixmate(commands::fixmate::Args),
     /// Mark duplicate alignments.
     Markdup(commands::markdup::Args),
+    /// Recalculate MD and NM tags.
+    Calmd(commands::calmd::Args),
     /// Text pileup of alignments.
     Mpileup(commands::mpileup::Args),
     /// Alignment statistics for plot-bamstats.
@@ -107,6 +109,7 @@ fn main() -> ExitCode {
         Command::Collate(args) => commands::collate::run(args).map(|()| ExitCode::SUCCESS),
         Command::Fixmate(args) => commands::fixmate::run(args).map(|()| ExitCode::SUCCESS),
         Command::Markdup(args) => commands::markdup::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Calmd(args) => commands::calmd::run(args).map(|()| ExitCode::SUCCESS),
         Command::Mpileup(args) => commands::mpileup::run(args).map(|()| ExitCode::SUCCESS),
         Command::Stats(args) => commands::stats::run(args).map(|()| ExitCode::SUCCESS),
         Command::Dict(args) => commands::dict::run(args).map(|()| ExitCode::SUCCESS),

@@ -39,6 +39,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-S`, `-t`, `-d` (optical duplicates), `-T`, `-s/-f`, `--json`, `--no-multi-dup`, `--include-fails`, `--use-read-groups`, `--duplicate-count` |
 | `stats` | `stats` | all sections; `-r`, `-t`, regions, `-f/-F/-d`, `-c`, `-i`, `-m`, `-q`, `-l`, `-I`, `-S/-P`, `-p`, `-g`, `-x`, `--GC-depth`, `--ref-stats`; per-cycle counts use `-@` threads |
 | `mpileup` | `mpileup` | text pileup with BAQ (`-B`, `-E`), overlap removal (`-x`), `-f`, `-r`, `-l`, `-a/-aa`, `-q/-Q`, `-d`, `-A`, `-C`, `-G`, `-R`, `-6`, `--rf/--ff`, `-b`, `-X`, `-s`, `-O`, `--output-BP-5`, `--output-QNAME`, `--output-extra`, `--output-sep/-empty`, `--reverse-del`, `--no-output-ins/-del/-ends`; reads and BAQ use `-@` threads, and indexed inputs with several sequences pile up one chromosome per thread |
+| `calmd` | `calmd` | `-e`, `-r` (BAQ), `-A`, `-E`, `-n`, `-C`, `-d`, `-q`, `-N`, `-Q`, `-b/-u`; records are processed on `-@` threads |
 
 `-@ N` adds worker threads throughout. Beyond BGZF compression and decompression, which is what
 samtools mostly uses its threads for, ntools also formats SAM text, decodes CRAM containers,
@@ -95,32 +96,34 @@ libdeflate. "short" is 1M synthetic 150 bp paired reads, "tagged" 250k reads wit
 
 | Operation | samtools (s) | ntools (s) | Speedup |
 |---|---:|---:|---:|
-| view BAM->SAM, short | 0.381 | 0.352 | 1.08x |
-| view BAM->SAM, long | 2.140 | 1.711 | 1.25x |
-| view BAM->SAM, long, -@4 | 0.572 | 0.348 | 1.64x |
-| view BAM->SAM, long, -@8 | 0.299 | 0.235 | 1.27x |
-| view CRAM->SAM, short | 0.888 | 1.063 | 0.84x |
-| view CRAM->SAM, long | 2.884 | 2.562 | 1.13x |
-| view CRAM->SAM, long, -@8 | 0.568 | 0.354 | 1.60x |
-| view CRAM->BAM, long, -@8 | 2.133 | 1.405 | 1.52x |
-| view BAM->BAM, long, -@4 | 3.367 | 2.364 | 1.42x |
-| view -c -q 30, short | 0.145 | 0.148 | 0.98x |
-| flagstat, long, -@4 | 0.331 | 0.339 | 0.98x |
-| index, long, -@4 | 0.333 | 0.340 | 0.98x |
-| sort, short, -@4 | 0.997 | 0.586 | 1.70x |
-| sort -n, short, -@4 | 1.070 | 0.579 | 1.85x |
-| collate -Ou, short, -@4 | 2.087 | 0.370 | 5.64x |
-| fixmate -m, short | 3.509 | 3.363 | 1.04x |
-| fixmate -m, short, -@4 | 0.888 | 0.472 | 1.88x |
-| markdup, short | 3.822 | 2.401 | 1.59x |
-| markdup, short, -@4 | 0.911 | 0.725 | 1.26x |
-| fastq, short | 0.607 | 0.649 | 0.94x |
-| depth, short | 0.284 | 0.315 | 0.90x |
-| stats, short | 1.658 | 1.085 | 1.53x |
-| stats, short, -@4 | 1.584 | 0.661 | 2.40x |
-| stats, long, -@8 | 5.674 | 1.484 | 3.82x |
-| coverage, short | 1.143 | 0.446 | 2.56x |
-| faidx 1024 regions | 0.018 | 0.022 | 0.82x |
+| view BAM->SAM, short | 0.388 | 0.353 | 1.10x |
+| view BAM->SAM, long | 2.129 | 1.742 | 1.22x |
+| view BAM->SAM, long, -@4 | 0.569 | 0.353 | 1.61x |
+| view BAM->SAM, long, -@8 | 0.299 | 0.246 | 1.22x |
+| view CRAM->SAM, short | 0.883 | 0.970 | 0.91x |
+| view CRAM->SAM, long | 2.901 | 2.504 | 1.16x |
+| view CRAM->SAM, long, -@8 | 0.577 | 0.346 | 1.67x |
+| view CRAM->BAM, long, -@8 | 2.167 | 1.456 | 1.49x |
+| view BAM->BAM, long, -@4 | 3.409 | 2.373 | 1.44x |
+| view -c -q 30, short | 0.145 | 0.150 | 0.97x |
+| flagstat, long, -@4 | 0.330 | 0.342 | 0.96x |
+| index, long, -@4 | 0.333 | 0.342 | 0.97x |
+| sort, short, -@4 | 1.009 | 0.644 | 1.57x |
+| sort -n, short, -@4 | 1.146 | 0.636 | 1.80x |
+| collate -Ou, short, -@4 | 2.103 | 0.400 | 5.26x |
+| fixmate -m, short | 3.496 | 3.352 | 1.04x |
+| fixmate -m, short, -@4 | 0.886 | 0.445 | 1.99x |
+| markdup, short | 3.820 | 2.384 | 1.60x |
+| markdup, short, -@4 | 0.912 | 0.707 | 1.29x |
+| fastq, short | 0.613 | 0.623 | 0.98x |
+| depth, short | 0.285 | 0.317 | 0.90x |
+| stats, short | 1.663 | 1.169 | 1.42x |
+| stats, short, -@4 | 1.584 | 0.723 | 2.19x |
+| stats, long, -@8 | 5.884 | 1.597 | 3.68x |
+| mpileup, short | 2.906 | 2.989 | 0.97x |
+| mpileup -f (BAQ), short, -@8 | 27.796 | 4.489 | 6.19x |
+| coverage, short | 1.151 | 0.406 | 2.83x |
+| faidx 1024 regions | 0.018 | 0.020 | 0.90x |
 
 Where ntools is slower, it is single-threaded. Short-read CRAM decoding still trails HTSlib in
 per-record tag decoding and allocation; its rANS decoding (AVX2) now keeps pace with HTSlib's.

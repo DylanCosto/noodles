@@ -322,7 +322,27 @@ pub enum BaqSkipped {
 
 /// `sam_prob_realn(b, ref, ref_len, BAQ_APPLY | BAQ_EXTEND [| BAQ_REDO])`: caps base qualities
 /// by their extended BAQ and records the adjustment in a ZQ tag.
-pub fn apply_baq(read: &mut Read, reference: &[u8], redo: bool) -> Result<(), BaqSkipped> {
+/// `sam_prob_realn`'s `BAQ_APPLY`, `BAQ_EXTEND`, and `BAQ_REDO` flags.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BaqMode {
+    /// Cap the qualities by their BAQ and record the change in a ZQ tag, instead of only storing
+    /// the BAQ in a BQ tag.
+    pub apply: bool,
+    /// Use extended BAQ.
+    pub extend: bool,
+    /// Ignore existing BQ tags.
+    pub redo: bool,
+}
+
+/// `sam_prob_realn`: computes the BAQ of a read's bases against `reference`, recording it in a
+/// BQ tag, or with [`BaqMode::apply`] capping the qualities by it and recording the change in a
+/// ZQ tag.
+pub fn prob_realn(read: &mut Read, reference: &[u8], mode: BaqMode) -> Result<(), BaqSkipped> {
+    let BaqMode {
+        apply,
+        extend,
+        redo,
+    } = mode;
     let l_qseq = read.l_seq;
 
     let mut params = Params {
@@ -370,9 +390,22 @@ pub fn apply_baq(read: &mut Read, reference: &[u8], redo: bool) -> Result<(), Ba
     }
 
     if bq || zq {
-        // With BAQ applied, a ZQ tag means there is nothing to do, and a BQ tag is applied and
-        // renamed to ZQ.
+        // A tag of the kind requested means there is nothing to do; one of the other kind is
+        // converted.
+        if (apply && zq) || (!apply && bq) {
+            return Err(BaqSkipped::Tagged);
+        }
+
         if zq {
+            // ZQ to BQ
+            let (start, _) = read.find_tag(*b"ZQ").expect("ZQ is present");
+            let values: Vec<u8> = read.raw[start + 3..start + 3 + l_qseq].to_vec();
+
+            for (q, &z) in read.qual_mut().iter_mut().zip(&values) {
+                *q = (i32::from(*q) + i32::from(z) - 64) as u8;
+            }
+
+            read.raw[start] = b'B';
             return Err(BaqSkipped::Tagged);
         }
 
@@ -483,20 +516,103 @@ pub fn apply_baq(read: &mut Read, reference: &[u8], redo: bool) -> Result<(), Ba
         return Err(BaqSkipped::Invalid);
     }
 
-    // Extended BAQ: the BAQ of each match run is the min of its running maxima from each side.
-    let mut bq = vec![0u8; l_qseq];
-    let mut left = vec![0u8; l_qseq];
-    let mut rght = vec![0u8; l_qseq];
-    let (mut x, mut y) = (read.pos, 0i64);
+    // htslib starts from the qualities, so bases outside matches get no adjustment.
+    let mut bq = qual.clone();
+
+    if extend {
+        extended_baq(&read.cigar, read.pos, xb, &state, &q, &mut bq);
+
+        for (b, &q) in bq.iter_mut().zip(&qual) {
+            *b = 64 + q.saturating_sub(*b);
+        }
+    } else {
+        capped_baq(&read.cigar, read.pos, xb, &state, &q, &mut bq);
+
+        for (b, &q) in bq.iter_mut().zip(&qual) {
+            *b = q.wrapping_sub(*b).wrapping_add(64);
+        }
+    }
+
+    if apply {
+        for (q, &b) in read.qual_mut().iter_mut().zip(&bq) {
+            *q = q.wrapping_sub(b.wrapping_sub(64));
+        }
+
+        read.append_string_tag(*b"ZQ", &bq);
+    } else {
+        read.append_string_tag(*b"BQ", &bq);
+    }
+
+    Ok(())
+}
+
+/// Whether the realignment put query base `i` on the reference base the CIGAR puts it on.
+fn on_cigar(state: &[i32], i: usize, expected: i64) -> bool {
+    (state[i] & 3) == 0 && i64::from(state[i] >> 2) == expected
+}
+
+/// BAQ capped by the base quality: `bq` holds the qualities and becomes min(quality, BAQ) in
+/// matches, or 0 where the realignment disagrees with the CIGAR.
+fn capped_baq(cigar: &[u32], pos: i64, xb: i64, state: &[i32], q: &[u8], bq: &mut [u8]) {
+    let l_qseq = bq.len() as i64;
+    let (mut x, mut y) = (pos, 0i64);
+
+    for &op in cigar {
+        let kind = op & 0xf;
+        let mut l = i64::from(op >> 4);
+
+        if l == 0 {
+            continue;
+        }
+
+        match kind {
+            0 | 7 | 8 => {
+                if l > l_qseq - y {
+                    l = l_qseq - y;
+                }
+
+                for i in y..y + l {
+                    let i_us = i as usize;
+
+                    bq[i_us] = if on_cigar(state, i_us, x - xb + (i - y)) {
+                        bq[i_us].min(q[i_us])
+                    } else {
+                        0
+                    };
+                }
+
+                x += l;
+                y += l;
+            }
+            4 | 1 => {
+                if l > l_qseq - y {
+                    l = l_qseq - y;
+                }
+
+                y += l;
+            }
+            2 => x += l,
+            _ => {}
+        }
+    }
+}
+
+/// Extended BAQ, which can exceed the base quality: in each run of matches, the BAQ of a base is
+/// the smaller of the running maxima from either side.
+fn extended_baq(cigar: &[u32], pos: i64, xb: i64, state: &[i32], q: &[u8], bq: &mut [u8]) {
+    let l_qseq = bq.len() as i64;
+    let mut left = vec![0u8; bq.len()];
+    let mut rght = vec![0u8; bq.len()];
+    let (mut x, mut y) = (pos, 0i64);
     let mut len = 0i64;
-    let n_cigar = read.cigar.len();
 
-    for k in 0..n_cigar {
-        let op = read.cigar[k] & 0xf;
-        let mut l = i64::from(read.cigar[k] >> 4);
+    for k in 0..cigar.len() {
+        let op = cigar[k] & 0xf;
+        let mut l = i64::from(cigar[k] >> 4);
 
+        // Adjacent match ops count as one, so that 50M50M is the same as 100M.
         if matches!(op, 0 | 7 | 8) {
-            if k + 1 < n_cigar && matches!(read.cigar[k + 1] & 0xf, 0 | 7 | 8) {
+            if k + 1 < cigar.len() && matches!(cigar[k + 1] & 0xf, 0 | 7 | 8) {
                 len += l;
                 continue;
             }
@@ -511,8 +627,8 @@ pub fn apply_baq(read: &mut Read, reference: &[u8], redo: bool) -> Result<(), Ba
 
         match op {
             0 | 7 | 8 => {
-                if l > l_qseq_i - y {
-                    l = l_qseq_i - y;
+                if l > l_qseq - y {
+                    l = l_qseq - y;
                 }
 
                 // Only a CIGAR longer than the sequence leaves nothing here.
@@ -525,11 +641,10 @@ pub fn apply_baq(read: &mut Read, reference: &[u8], redo: bool) -> Result<(), Ba
                 let (ys, ls) = (y as usize, l as usize);
 
                 for i in ys..ys + ls {
-                    let expected = x - xb + (i as i64 - y);
-                    bq[i] = if (state[i] & 3) != 0 || i64::from(state[i] >> 2) != expected {
-                        0
-                    } else {
+                    bq[i] = if on_cigar(state, i, x - xb + (i as i64 - y)) {
                         q[i]
+                    } else {
+                        0
                     };
                 }
 
@@ -553,8 +668,8 @@ pub fn apply_baq(read: &mut Read, reference: &[u8], redo: bool) -> Result<(), Ba
                 y += l;
             }
             4 | 1 => {
-                if l > l_qseq_i - y {
-                    l = l_qseq_i - y;
+                if l > l_qseq - y {
+                    l = l_qseq - y;
                 }
 
                 y += l;
@@ -563,18 +678,6 @@ pub fn apply_baq(read: &mut Read, reference: &[u8], redo: bool) -> Result<(), Ba
             _ => {}
         }
     }
-
-    for (b, &q) in bq.iter_mut().zip(&qual) {
-        *b = 64 + q.saturating_sub(*b);
-    }
-
-    for (q, &b) in read.qual_mut().iter_mut().zip(&bq) {
-        *q = q.wrapping_sub(b.wrapping_sub(64));
-    }
-
-    read.append_string_tag(*b"ZQ", &bq);
-
-    Ok(())
 }
 
 /// `sam_cap_mapq`: the capped mapping quality, or `None` to skip the read.

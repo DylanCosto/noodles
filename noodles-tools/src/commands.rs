@@ -2,6 +2,7 @@
 
 pub mod addreplacerg;
 pub mod bedcov;
+pub mod calmd;
 pub mod cat;
 pub mod collate;
 pub mod coverage;

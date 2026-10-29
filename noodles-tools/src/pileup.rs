@@ -128,6 +128,17 @@ impl Read {
         (self.raw[self.seq_start + i / 2] >> ((!i & 1) << 2)) & 0xf
     }
 
+    /// Sets the 4-bit code of base `i`.
+    pub fn set_base(&mut self, i: usize, code: u8) {
+        let byte = &mut self.raw[self.seq_start + i / 2];
+
+        if i & 1 == 0 {
+            *byte = (*byte & 0x0f) | (code << 4);
+        } else {
+            *byte = (*byte & 0xf0) | (code & 0x0f);
+        }
+    }
+
     pub fn qual(&self) -> &[u8] {
         &self.raw[self.qual_start..self.qual_start + self.l_seq]
     }

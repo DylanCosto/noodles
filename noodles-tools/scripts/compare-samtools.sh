@@ -205,5 +205,12 @@ if [ -f md.bam ]; then
     check "mpileup by chromosome -aa -@4" "$st mpileup -aa -A md.bam 2>/dev/null" "$nt mpileup -@ 4 -aa -A md.bam 2>/dev/null"
 fi
 
+# calmd
+check "calmd" "$st calmd --no-PG mp.short.bam $ref 2>/dev/null" "$nt calmd --no-PG mp.short.bam $ref 2>/dev/null"
+check "calmd -e -r -A -E -@4" "$st calmd --no-PG -e -r -A -E mp.short.bam $ref 2>/dev/null" "$nt calmd --no-PG -@ 4 -e -r -A -E mp.short.bam $ref 2>/dev/null"
+check "calmd -r -n 1 -d -q -C 50" "$st calmd --no-PG -r -n 1 -d -q -C 50 mp.short.bam $ref 2>/dev/null" "$nt calmd --no-PG -r -n 1 -d -q -C 50 mp.short.bam $ref 2>/dev/null"
+check "calmd long -e -r -A" "$st calmd --no-PG -e -r -A mp.long.bam $long_ref 2>/dev/null" "$nt calmd --no-PG -e -r -A mp.long.bam $long_ref 2>/dev/null"
+check "calmd CRAM -u" "$st calmd --no-PG -u $corpus/short/input.3.1.cram $ref 2>/dev/null | $st view -h -" "$nt calmd --no-PG -u $corpus/short/input.3.1.cram $ref 2>/dev/null | $st view -h -"
+
 echo "$failures difference(s)"
 [ "$failures" -eq 0 ]

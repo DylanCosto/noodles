@@ -436,7 +436,12 @@ fn prepare(
         }
 
         if conf.realn {
-            let _ = baq::apply_baq(&mut read, reference, conf.redo_baq);
+            let mode = baq::BaqMode {
+                apply: true,
+                extend: true,
+                redo: conf.redo_baq,
+            };
+            let _ = baq::prob_realn(&mut read, reference, mode);
         }
 
         if conf.capq_thres > 10 {
