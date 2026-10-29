@@ -258,6 +258,22 @@ impl TryFrom<Vec<u8>> for Record {
     }
 }
 
+/// Returns the encoded record's buffer, e.g., to reuse it for another record.
+///
+/// # Examples
+///
+/// ```
+/// use noodles_bam as bam;
+/// let record = bam::Record::default();
+/// let buf = Vec::from(record);
+/// assert!(bam::Record::try_from(buf).is_ok());
+/// ```
+impl From<Record> for Vec<u8> {
+    fn from(record: Record) -> Self {
+        record.0
+    }
+}
+
 impl fmt::Debug for Record {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Record")
