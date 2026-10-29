@@ -24,6 +24,7 @@ long_cram=$corpus/long/input.3.1.cram
 short_cram=$corpus/short/input.3.1.cram
 
 "$st" sort -n --no-PG -o "$work/short.name.bam" "$short"
+"$st" fixmate -m --no-PG "$work/short.name.bam" - | "$st" sort --no-PG -o "$work/fixed.bam" -
 
 median() {
     local cmd=$1 times=()
@@ -63,6 +64,11 @@ row "flagstat, long, -@4" "flagstat -@ 4 $long" "flagstat -@ 4 $long"
 row "index, long, -@4" "index -@ 4 -o $work/x.bai $long" "index -@ 4 -o $work/x.bai $long"
 row "sort, short, -@4" "sort --no-PG -@ 4 -o $work/x.bam $work/short.name.bam" "sort --no-PG -@ 4 -o $work/x.bam $work/short.name.bam"
 row "sort -n, short, -@4" "sort -n --no-PG -@ 4 -o $work/x.bam $short" "sort -n --no-PG -@ 4 -o $work/x.bam $short"
+row "collate -Ou, short, -@4" "collate -Ou -@4 $short" "collate -Ou -@ 4 $short"
+row "fixmate -m, short" "fixmate -m $work/short.name.bam $work/x.bam" "fixmate -m $work/short.name.bam $work/x.bam"
+row "fixmate -m, short, -@4" "fixmate -m -@4 $work/short.name.bam $work/x.bam" "fixmate -m -@ 4 $work/short.name.bam $work/x.bam"
+row "markdup, short" "markdup $work/fixed.bam $work/x.bam" "markdup $work/fixed.bam $work/x.bam"
+row "markdup, short, -@4" "markdup -@4 $work/fixed.bam $work/x.bam" "markdup -@ 4 $work/fixed.bam $work/x.bam"
 row "fastq, short" "fastq $short" "fastq $short"
 row "depth, short" "depth $short" "depth $short"
 row "coverage, short" "coverage $short" "coverage $short"

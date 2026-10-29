@@ -102,6 +102,14 @@ check "sort -N" "$st sort -N --no-PG -o - $short | $st view --no-PG -h -" "$nt s
 "$st" view --no-PG -b -F 64 -o p2.bam "$short"
 check "merge" "$st merge -c -p --no-PG -f -o - p1.bam p2.bam | $st view --no-PG - | cut -f1-11" "$nt merge --no-PG -f -o /dev/stdout p1.bam p2.bam | $st view --no-PG - | cut -f1-11"
 
+# duplicate marking pipeline
+check "fixmate" "$st fixmate --no-PG short.name.bam - | $st view --no-PG -h -" "$nt fixmate --no-PG short.name.bam /dev/stdout | $st view --no-PG -h -"
+check "fixmate -m -c -r -@4" "$st fixmate --no-PG -m -c -r short.name.bam - | $st view --no-PG -h -" "$nt fixmate --no-PG -m -c -r -@ 4 short.name.bam /dev/stdout | $st view --no-PG -h -"
+"$st" fixmate -m --no-PG short.name.bam - | "$st" sort --no-PG -o fixed.bam -
+check "markdup" "$st markdup --no-PG fixed.bam - | $st view --no-PG -h -" "$nt markdup --no-PG fixed.bam /dev/stdout | $st view --no-PG -h -"
+check "markdup -c -m s" "$st markdup --no-PG -c -m s fixed.bam - | $st view --no-PG -h -" "$nt markdup --no-PG -c -m s fixed.bam /dev/stdout | $st view --no-PG -h -"
+check "collate grouping" "$st view $short | cut -f1 | sort -u | wc -l" "$nt collate --no-PG -O $short | $st view - | awk -F'\\t' '\$1 != p { print \$1; p = \$1 }' | sort | uniq | wc -l"
+
 # reads
 check "fastq" "$st fastq short.name.bam" "$nt fastq short.name.bam"
 check "fastq -n -t" "$st fastq -n -t $tagged" "$nt fastq -n -t $tagged"
@@ -115,6 +123,15 @@ check "faidx index" "cat expected.fai" "cat frag.fa.fai"
 check "faidx regions" "$st faidx -r $corpus/fasta-regions.1024.txt frag.fa" "$nt faidx -r $corpus/fasta-regions.1024.txt frag.fa"
 "$nt" index -o ntools.bai "$short"
 check "index BAI queries" "$st view --no-PG -X $short $corpus/short/input.bam.bai $regions" "$st view --no-PG -X $short ntools.bai $regions"
+
+# split
+mkdir -p split-s split-n
+"$st" view -h "$short" chrS:1-200000 | awk 'BEGIN{OFS="\t"} /^@RG/ {print "@RG\tID:A\tSM:a"; print "@RG\tID:B\tSM:b"; next} /^@/ {print; next} {sub(/\tRG:Z:synthetic/, ""); n++; print $0 (n%3==0 ? "" : (n%3==1 ? "\tRG:Z:A" : "\tRG:Z:B"))}' | "$st" view -b -o multi.bam -
+(cd split-s && "$st" split --no-PG -u u.bam ../multi.bam)
+(cd split-n && "$nt" split --no-PG -u u.bam ../multi.bam)
+for f in multi_0.bam multi_1.bam u.bam; do
+    check "split $f" "$st view --no-PG -h split-s/$f" "$st view --no-PG -h split-n/$f"
+done
 
 echo "$failures difference(s)"
 [ "$failures" -eq 0 ]

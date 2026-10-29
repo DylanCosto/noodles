@@ -30,15 +30,29 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `quickcheck` | `quickcheck` | `-v`, `-q`, `-u` |
 | `reheader` | `reheader` | BAM; copies compressed blocks |
 | `cat` | `cat` | BAM; copies compressed blocks |
+| `split` | `split` | by read group or `-d` tag; `-f`, `-p`, `-u`, `-M` |
+| `collate` | `collate` | groups templates by name; `-f`, `-O/-o`, `-u`, `-l`, `-m`, `-T` |
+| `fixmate` | `fixmate` | `-m`, `-c`, `-r`, `-p`, `-z`; parallel with `-@` |
+| `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-s/-f`, `--include-fails`, `--use-read-groups`, `--duplicate-count` |
 
 `-@ N` adds worker threads throughout. Beyond BGZF compression and decompression, which is what
-samtools uses its threads for, ntools also formats SAM text and decodes CRAM containers in
-parallel.
+samtools mostly uses its threads for, ntools also formats SAM text, decodes CRAM containers,
+sorts, and fixes mates in parallel.
+
+A typical duplicate-marking pipeline is unchanged apart from the program name:
+
+```sh
+ntools collate -Ou -@ 8 in.bam | ntools fixmate -m -@ 8 - - | ntools sort -@ 8 - \
+  | ntools markdup -@ 8 - out.bam
+```
+
+On the short-read corpus this pipeline takes 1.30 s, against 3.24 s for the same samtools
+pipeline, and marks the same 26,749 duplicates in identical records.
 
 ## Compatibility
 
 `scripts/compare-samtools.sh` checks ntools against samtools byte for byte on the benchmark
-corpus (short paired-end, tagged, and nanopore long reads; BAM, SAM, and CRAM 3.0/3.1). All 70
+corpus (short paired-end, tagged, and nanopore long reads; BAM, SAM, and CRAM 3.0/3.1). All
 checks pass.
 
 Intentional differences:
@@ -55,12 +69,47 @@ Intentional differences:
   Decoded records are the same apart from tag order.
 - `reheader` and `cat` recompress the block holding the end of the header with noodles' encoder,
   so files can differ in size by a few bytes; records are identical.
+- `collate` groups each template's records together, in input order, as samtools does, but
+  templates come out in a different (hash) order.
+- `markdup` does not yet support `-S`, `-t`, `-d` (optical duplicates), or barcode options.
 
 ## Performance
 
 `scripts/benchmark.sh` times both tools on the corpus (median of 5 warm runs).
 
-BENCHMARK_TABLE
+Measured on an Intel Xeon Gold 5418Y VM (24 vCPUs) against samtools/HTSlib 1.24, both with
+libdeflate. "short" is 1M synthetic 150 bp paired reads, "tagged" 250k reads with extra tags, and
+"long" 9,784 nanopore reads with MM/ML modification tags. `-@ N` adds N threads to both tools.
+
+| Operation | samtools (s) | ntools (s) | Speedup |
+|---|---:|---:|---:|
+| view BAM->SAM, short | 0.379 | 0.432 | 0.88x |
+| view BAM->SAM, long | 2.130 | 1.848 | 1.15x |
+| view BAM->SAM, long, -@4 | 0.571 | 0.350 | 1.63x |
+| view BAM->SAM, long, -@8 | 0.301 | 0.236 | 1.28x |
+| view CRAM->SAM, short | 0.883 | 1.619 | 0.55x |
+| view CRAM->SAM, long | 2.889 | 3.520 | 0.82x |
+| view CRAM->SAM, long, -@8 | 0.569 | 0.472 | 1.21x |
+| view CRAM->BAM, long, -@8 | 2.128 | 1.421 | 1.50x |
+| view BAM->BAM, long, -@4 | 3.372 | 2.416 | 1.40x |
+| view -c -q 30, short | 0.144 | 0.148 | 0.97x |
+| flagstat, long, -@4 | 0.332 | 0.339 | 0.98x |
+| index, long, -@4 | 0.333 | 0.340 | 0.98x |
+| sort, short, -@4 | 0.992 | 0.588 | 1.69x |
+| sort -n, short, -@4 | 1.086 | 0.581 | 1.87x |
+| collate -Ou, short, -@4 | 2.089 | 0.381 | 5.48x |
+| fixmate -m, short | 3.416 | 3.350 | 1.02x |
+| fixmate -m, short, -@4 | 0.886 | 0.457 | 1.94x |
+| markdup, short | 3.818 | 2.400 | 1.59x |
+| markdup, short, -@4 | 0.912 | 0.699 | 1.30x |
+| fastq, short | 0.606 | 0.699 | 0.87x |
+| depth, short | 0.284 | 0.318 | 0.89x |
+| coverage, short | 1.138 | 0.407 | 2.80x |
+| faidx 1024 regions | 0.018 | 0.020 | 0.90x |
+
+Where ntools is slower, it is single-threaded: per-thread CRAM decoding (rANS) and short-read
+formatting still trail HTSlib. With threads, ntools parallelizes more of the work than samtools
+does, so the gap reverses.
 
 ## Library changes in this fork
 
