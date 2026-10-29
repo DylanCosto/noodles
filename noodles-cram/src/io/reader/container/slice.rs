@@ -376,7 +376,12 @@ fn get_slice_reference_sequence<'c>(
         let (reference_sequence_name, reference_sequence) = header
             .reference_sequences()
             .get_index(context.reference_sequence_id())
-            .expect("invalid slice reference sequence ID");
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid slice reference sequence ID",
+                )
+            })?;
 
         if allow_range
             && let Some(reference_sequence) = get_slice_reference_sequence_range(
@@ -394,13 +399,23 @@ fn get_slice_reference_sequence<'c>(
         let sequence = reference_sequence_repository
             .get(reference_sequence_name)
             .transpose()?
-            .expect("invalid slice reference sequence name");
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("missing reference sequence: {reference_sequence_name}"),
+                )
+            })?;
 
         // § 8.5 "Slice header block" (2024-09-04): "MD5sums should not be validated if the stored
         // checksum is all-zero."
         if let Some(expected_md5) = slice_header.reference_md5() {
             let interval = context.alignment_start()..=context.alignment_end();
-            let subsequence = &sequence[interval];
+            let subsequence = sequence.get(interval).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "slice alignment span is outside the reference sequence",
+                )
+            })?;
             validate_sequence(subsequence, expected_md5)?;
         }
 
@@ -410,7 +425,9 @@ fn get_slice_reference_sequence<'c>(
             .iter()
             .find(|(id, _)| *id == block_content_id)
             .map(|(_, src)| src)
-            .expect("invalid block content ID");
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid block content ID")
+            })?;
 
         Ok(Some(ReferenceSequence::Embedded {
             reference_start: context.alignment_start(),

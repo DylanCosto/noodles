@@ -111,6 +111,21 @@ where
         &self.reference_sequence_repository
     }
 
+    /// Replaces the reference sequence repository, for example with one found from the header's
+    /// `@SQ` `UR` fields after reading it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use noodles_cram as cram;
+    /// use noodles_fasta as fasta;
+    /// let mut reader = cram::io::Reader::new(&[][..]);
+    /// reader.set_reference_sequence_repository(fasta::Repository::default());
+    /// ```
+    pub fn set_reference_sequence_repository(&mut self, repository: fasta::Repository) {
+        self.reference_sequence_repository = repository;
+    }
+
     /// Returns a CRAM header reader.
     ///
     /// # Examples
