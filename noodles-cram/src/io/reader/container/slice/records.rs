@@ -609,6 +609,9 @@ impl<'c, 'ch: 'c> Records<'c, 'ch> {
     }
 
     fn read_unmapped_read(&mut self, record: &mut Record<'c>) -> io::Result<()> {
+        // Unmapped records have no mapping quality data series. HTSlib decodes them as 0.
+        record.mapping_quality = sam::alignment::record::MappingQuality::new(0);
+
         record.sequence = self.read_sequence(record.read_length)?;
 
         if record.cram_flags.quality_scores_are_stored_as_array() {
