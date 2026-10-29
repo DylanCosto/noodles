@@ -44,6 +44,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `head` | `head` | `-h` (header lines), `-n` (records) |
 | `flags` | `flags` | numbers and flag names, both ways |
 | `samples` | `samples` | `-h`, `-i`, `-T`, `-f/-F` (matching references), `-X`, `-o`, paths from stdin |
+| `consensus` | `consensus` | FASTA/FASTQ/pileup; `simple` and Bayesian modes (`bayesian`, `_r`, `_p`, `_m`, `_116`), `-X` presets and `-t` calibration files, `-a/-aa`, `--show-ins/--show-del/--mark-ins`, `-A`, `-r`, `--regions-file`, `-T`, every tuning option; `-@` on an indexed input computes `-Z` blocks in parallel, as samtools does |
 
 CRAM input without `--reference` uses the FASTA file named by the `@SQ` `UR` fields when it exists
 locally with a `.fai` index, as HTSlib does.
@@ -95,6 +96,16 @@ Intentional differences:
   `regex` syntax rather than POSIX extended regular expressions (the same for ordinary
   patterns). Without `-S`, `--move-umi-to-tag` moves the UMI of every read; samtools 1.24 moves
   only those of reads still buffered at the end of the input.
+- `consensus` follows samtools where it reads past a record: a read padded or deleted after its
+  last stored base (e.g. a mapped `SEQ *` read, kept by `-m simple` or `--no-use-MQ`) takes a
+  quality from the bytes after the record, which in samtools can be uninitialized memory. ntools
+  reads the stale bytes of earlier records there, as a reused `bam1_t` holds them, so those
+  columns may differ. Base qualities above 100 read past samtools' probability tables; ntools
+  reads the following tables within the same struct and 0 beyond it. With `-@` and a `-T` FASTA
+  that lacks a needed sequence, samtools silently writes truncated or garbage sequence; ntools
+  stops with an error. As in samtools, `-@` with pileup output on an unindexed input drops the
+  pileup lines. CRAM files whose `MD`/`NM` tags HTSlib stripped (to regenerate on decoding) give
+  a different consensus, because ntools does not regenerate the tags and `--adj-MQ` uses `MD`.
 
 ## Performance
 
@@ -133,6 +144,10 @@ libdeflate. "short" is 1M synthetic 150 bp paired reads, "tagged" 250k reads wit
 | mpileup, short | 2.906 | 2.989 | 0.97x |
 | mpileup -f (BAQ), short, -@8 | 27.796 | 4.489 | 6.19x |
 | coverage, short | 1.151 | 0.406 | 2.83x |
+| consensus, short | 6.37 | 6.08 | 1.05x |
+| consensus, short, -@4 | 1.61 | 1.54 | 1.05x |
+| consensus, long | 11.51 | 10.89 | 1.06x |
+| consensus, long, -@4 | 3.43 | 3.23 | 1.06x |
 | faidx 1024 regions | 0.018 | 0.020 | 0.90x |
 
 Where ntools is slower, it is single-threaded. Short-read CRAM decoding still trails HTSlib in

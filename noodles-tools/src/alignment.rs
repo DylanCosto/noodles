@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use noodles_bam as bam;
-use noodles_core::Region;
+use noodles_core::{Position, Region};
 use noodles_cram as cram;
 use noodles_fasta as fasta;
 use noodles_sam::{
@@ -275,13 +275,61 @@ impl AlignmentReader {
         index: &AlignmentIndex,
         header: &sam::Header,
         queries: &Queries<'_>,
-        mut f: F,
+        f: F,
     ) -> anyhow::Result<()>
     where
         F: FnMut(Rec<'_>) -> anyhow::Result<()>,
     {
         let queries = queries.to_list(header)?;
+        self.run_queries(index, header, &queries, f)
+    }
 
+    /// Calls `f` with the records overlapping the 0-based, half-open interval `[start, end)` of
+    /// one reference sequence, as `sam_itr_queryi` selects them. An `end` of `None` means the
+    /// end of the reference sequence.
+    pub fn for_each_in_interval<F>(
+        &mut self,
+        index: &AlignmentIndex,
+        header: &sam::Header,
+        reference_sequence_id: usize,
+        start: usize,
+        end: Option<usize>,
+        f: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(Rec<'_>) -> anyhow::Result<()>,
+    {
+        let Some(name) = header
+            .reference_sequences()
+            .get_index(reference_sequence_id)
+            .map(|(name, _)| name)
+        else {
+            return Ok(());
+        };
+
+        let name = std::str::from_utf8(name).context("reference sequence name is not UTF-8")?;
+        let start = Position::try_from(start + 1)?;
+
+        let region = match end {
+            Some(end) if end < start.get() => return Ok(()),
+            Some(end) => Region::new(name, start..=Position::try_from(end)?),
+            None if start == Position::MIN => Region::new(name, ..),
+            None => Region::new(name, start..),
+        };
+
+        self.run_queries(index, header, &[Query::Region(region)], f)
+    }
+
+    fn run_queries<F>(
+        &mut self,
+        index: &AlignmentIndex,
+        header: &sam::Header,
+        queries: &[Query<'_>],
+        mut f: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(Rec<'_>) -> anyhow::Result<()>,
+    {
         // In a region set, a record is visited only while querying the first merged interval it
         // overlaps, so each record is visited once and in file order.
         let mut visit = |record: Rec<'_>, query: &Query| -> anyhow::Result<()> {
@@ -305,7 +353,7 @@ impl AlignmentReader {
 
         match (self, index) {
             (Self::Bam(reader), AlignmentIndex::Bam(index)) => {
-                for query in &queries {
+                for query in queries {
                     match query {
                         Query::Unmapped => {
                             for result in reader.query_unmapped(index)? {
@@ -325,7 +373,7 @@ impl AlignmentReader {
                 }
             }
             (Self::Cram(reader, _, _), AlignmentIndex::Cram(index)) => {
-                for query in &queries {
+                for query in queries {
                     match query {
                         Query::Unmapped => {
                             for result in reader.query_unmapped(header, index)? {

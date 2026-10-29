@@ -90,6 +90,9 @@ enum Command {
     Flags(commands::flags::Args),
     /// List the samples (read group SM values) of alignment files.
     Samples(commands::samples::Args),
+    /// Generate a consensus sequence from aligned reads.
+    #[command(disable_help_flag = true)]
+    Consensus(commands::consensus::Args),
 }
 
 fn main() -> ExitCode {
@@ -130,6 +133,7 @@ fn main() -> ExitCode {
         Command::Head(args) => commands::head::run(args).map(|()| ExitCode::SUCCESS),
         Command::Flags(args) => commands::flags::run(args),
         Command::Samples(args) => commands::samples::run(args),
+        Command::Consensus(args) => commands::consensus::run(args),
     };
 
     match result {

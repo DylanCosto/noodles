@@ -6,6 +6,7 @@ pub mod bedcov;
 pub mod calmd;
 pub mod cat;
 pub mod collate;
+pub mod consensus;
 pub mod coverage;
 pub mod depth;
 pub mod dict;

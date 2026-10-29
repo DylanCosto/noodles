@@ -25,6 +25,7 @@ short_cram=$corpus/short/input.3.1.cram
 
 "$st" sort -n --no-PG -o "$work/short.name.bam" "$short"
 "$st" fixmate -m --no-PG "$work/short.name.bam" - | "$st" sort --no-PG -o "$work/fixed.bam" -
+awk 'BEGIN { for (s = 0; s < 8000000; s += 350) { printf "chrS\t%d\t%d\tamp%d_LEFT\t60\t+\n", s, s + 22, s; printf "chrS\t%d\t%d\tamp%d_RIGHT\t60\t-\n", s + 328, s + 350, s } }' > "$work/primers.bed"
 
 median() {
     local cmd=$1 times=()
@@ -78,5 +79,12 @@ row "mpileup, short" "mpileup $short" "mpileup $short"
 row "mpileup -f (BAQ), short, -@8" "mpileup -f $ref $short" "mpileup -@ 8 -f $ref $short"
 row "calmd -b, short, -@4" "calmd -@ 4 -b $short $ref" "calmd -@ 4 -b $short $ref"
 row "calmd -r -A -b (BAQ), short, -@8" "calmd -@ 8 -r -A -b $short $ref" "calmd -@ 8 -r -A -b $short $ref"
+row "mpileup -M (base modifications), long" "mpileup -M $long" "mpileup -M $long"
+row "ampliconclip, short" "ampliconclip --no-PG -b $work/primers.bed -o $work/x.bam $short" "ampliconclip --no-PG -b $work/primers.bed -o $work/x.bam $short"
+row "ampliconclip --both-ends, short, -@4" "ampliconclip --no-PG --both-ends -@ 4 -b $work/primers.bed -o $work/x.bam $short" "ampliconclip --no-PG --both-ends -@ 4 -b $work/primers.bed -o $work/x.bam $short"
 row "coverage, short" "coverage $short" "coverage $short"
+row "consensus, short" "consensus $short" "consensus $short"
+row "consensus, short, -@4" "consensus -@ 4 $short" "consensus -@ 4 $short"
+row "consensus, long" "consensus $long" "consensus $long"
+row "consensus, long, -@4" "consensus -@ 4 $long" "consensus -@ 4 $long"
 row "faidx 1024 regions" "faidx -r $corpus/fasta-regions.1024.txt $corpus/fragmented-reference.fa" "faidx -r $corpus/fasta-regions.1024.txt $corpus/fragmented-reference.fa"

@@ -259,6 +259,43 @@ awk 'BEGIN { print "@HD\tVN:1.6"; print "@SQ\tSN:c\tLN:100"; for (i = 0; i < 600
 check "samples" "$st samples rg.bam $short $tagged" "$nt samples rg.bam $short $tagged"
 check "samples -h -i -T LB -f" "$st samples -h -i -T LB -f $ref rg.bam $short $corpus/short/input.3.1.cram" "$nt samples -h -i -T LB -f $ref rg.bam $short $corpus/short/input.3.1.cram"
 
+# consensus: every mode and -X preset, output formats, -a/-aa, insertions and deletions, regions,
+# and the threaded (-@) block layout, which samtools computes differently from the serial path
+for set in short long; do
+    for opts in "" "-f fastq" "-f pileup" "-a -f fastq --show-del yes --show-ins no" "-A --mark-ins" \
+        "-m simple" "-m simple -q -A -d 3 -c 0.6 -H 0.3" "-m bayesian_m -A" "-m bayesian_p" "-m bayesian_116" \
+        "-X hiseq" "-X hifi -A" "-X r10.4_sup" "-X r10.4_dup -f fastq" "-X ultima" \
+        "-p --no-adj-MQ --min-MQ 10 --min-BQ 5" "--no-use-MQ -C 20" "-t :hifi --P-het 1e-2 --het-scale 0.5" \
+        "-@4" "-@4 -f pileup -a -Z 20000" "-@4 -f fastq --mark-ins -Z 777"; do
+        check "consensus $set $opts" "$st consensus $opts mp.$set.bam 2>/dev/null" "$nt consensus $opts mp.$set.bam 2>/dev/null"
+    done
+done
+check "consensus long -r -a -T" "$st consensus -r $long_name:20000-60000 -a -f fastq -T $long_ref --ref-qual 5 mp.long.bam" "$nt consensus -r $long_name:20000-60000 -a -f fastq -T $long_ref --ref-qual 5 mp.long.bam"
+check "consensus -r -a -f pileup" "$st consensus -r chrS:1000-60000 -a -f pileup mp.short.bam" "$nt consensus -r chrS:1000-60000 -a -f pileup mp.short.bam"
+check "consensus -aa -f pileup -T" "$st consensus -aa -f pileup -T $ref mp.short.bam" "$nt consensus -aa -f pileup -T $ref mp.short.bam"
+printf "chrS\t5000\t9000\nchrS\t100\t2000\nchrS\t1500\t2500\n" > cons.bed
+check "consensus --regions-file" "$st consensus --regions-file cons.bed -a mp.short.bam" "$nt consensus --regions-file cons.bed -a mp.short.bam"
+check "consensus --regions-file -@2" "$st consensus -@2 -Z 700 --regions-file cons.bed -f pileup mp.short.bam" "$nt consensus -@2 -Z 700 --regions-file cons.bed -f pileup mp.short.bam"
+check "consensus CRAM -r" "$st consensus -r chrS:1-300000 -f fastq $corpus/short/input.3.1.cram" "$nt consensus -r chrS:1-300000 -f fastq $corpus/short/input.3.1.cram"
+
+# consensus edge cases: insertions at read starts, pads, deletions, reference skips, clips,
+# heterozygous sites, N bases, low depth, and references with no reads
+{
+    printf "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:a\tLN:60\n@SQ\tSN:b\tLN:30\n@SQ\tSN:c\tLN:50\n"
+    printf "r1\t0\ta\t3\t60\t2I10M2D5M\t*\t0\t0\tGGACGTACGTACACGTA\tIIIIIIIIIIIIIIIII\tMD:Z:10^TT5\n"
+    printf "r2\t16\ta\t3\t30\t3S6M1P2I4M3N6M\t*\t0\t0\tTTTACGTACTTGTACACGTAC\t#####55555??????IIIII\n"
+    printf "r3\t0\ta\t5\t60\t8M1D9M2H\t*\t0\t0\tGTACGTTCACGTACNNA\t;;;;;;;;;;;;;;;;;\tMD:Z:6A1^G9\n"
+    printf "r4\t1024\ta\t6\t60\t10M\t*\t0\t0\tTACGTACGTA\tIIIIIIIIII\n"
+    printf "r5\t0\ta\t7\t0\t1S12M4I\t*\t0\t0\tAACGTACGTACGTCCCC\t*\n"
+    printf "r6\t16\ta\t9\t60\t5=1X4=2D3M\t*\t0\t0\tGTACGCACGTGTA\t+++++++++++++\n"
+    printf "r7\t0\tc\t10\t60\t15M\t*\t0\t0\tACGTTGCAACGTTGC\tIIIII#####IIIII\n"
+    printf "r8\t0\tc\t12\t60\t4M1I8M\t*\t0\t0\tGTTGTCAACGTTG\tIIIIIIIIIIIII\n"
+} > cons.sam
+"$st" view -b -o cons.bam cons.sam && "$st" index cons.bam
+for opts in "" "-f pileup" "-aa -f fastq --show-del yes" "-aa -f pileup" "-A --mark-ins -d 1 -C 0" "-m simple -A" "-m simple -q --show-del yes -f pileup" "--no-use-MQ -A" "-@2 -aa -Z 7 -f fastq"; do
+    check "consensus synthetic $opts" "$st consensus $opts cons.bam 2>/dev/null" "$nt consensus $opts cons.bam 2>/dev/null"
+done
+
 # calmd
 check "calmd" "$st calmd --no-PG mp.short.bam $ref 2>/dev/null" "$nt calmd --no-PG mp.short.bam $ref 2>/dev/null"
 check "calmd -e -r -A -E -@4" "$st calmd --no-PG -e -r -A -E mp.short.bam $ref 2>/dev/null" "$nt calmd --no-PG -@ 4 -e -r -A -E mp.short.bam $ref 2>/dev/null"
