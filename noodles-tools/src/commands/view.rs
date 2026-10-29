@@ -6,13 +6,19 @@ use std::{
 };
 
 use anyhow::bail;
-use noodles_sam::alignment::record::Flags;
+use noodles_bam as bam;
+use noodles_cram as cram;
+use noodles_fasta as fasta;
+use noodles_sam::{
+    self as sam,
+    alignment::{io::Write as _, record::Flags},
+};
 
 use crate::{
     alignment::{AlignmentReader, ReadOptions, Rec},
     flags,
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
-    program,
+    parallel_cram, program,
 };
 
 /// Mapping quality samtools uses for "unavailable"; it passes every `-q` threshold.
@@ -150,8 +156,33 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         min_mapping_quality: args.min_mapping_quality,
     };
 
+    let parallel_cram = args.regions.is_empty() && args.threads > 0;
+
     if args.count {
         let mut n = 0u64;
+
+        if let (AlignmentReader::Cram(reader, repository), true) = (&mut reader, parallel_cram) {
+            parallel_cram::decode(
+                reader,
+                &header,
+                repository,
+                args.threads,
+                |count: &mut u64, record| {
+                    if filter.matches(&Rec::Dyn(record))? {
+                        *count += 1;
+                    }
+                    Ok(())
+                },
+                |count| {
+                    n += count;
+                    Ok(())
+                },
+            )?;
+
+            writeln!(io::stdout().lock(), "{n}")?;
+            return Ok(());
+        }
+
         visit(
             &mut reader,
             path.as_deref(),
@@ -188,6 +219,22 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     if !args.header_only {
+        if let (AlignmentReader::Cram(reader, repository), true, Some(kind)) =
+            (&mut reader, parallel_cram, writer.preformatted_kind())
+        {
+            write_cram_in_parallel(
+                reader,
+                repository,
+                &header,
+                &filter,
+                kind,
+                args.threads,
+                &mut writer,
+            )?;
+            writer.finish(&header)?;
+            return Ok(());
+        }
+
         visit(
             &mut reader,
             path.as_deref(),
@@ -205,6 +252,68 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     writer.finish(&header)?;
 
     Ok(())
+}
+
+/// SAM text for the records of one CRAM container that pass the filter.
+struct SamChunk(sam::io::Writer<Vec<u8>>);
+
+impl Default for SamChunk {
+    fn default() -> Self {
+        Self(sam::io::Writer::new(Vec::new()))
+    }
+}
+
+/// `block_size`-prefixed BAM records for one CRAM container.
+struct BamChunk(bam::io::Writer<Vec<u8>>);
+
+impl Default for BamChunk {
+    fn default() -> Self {
+        Self(bam::io::Writer::from(Vec::new()))
+    }
+}
+
+/// Decodes CRAM containers on `threads` workers, formatting records there as SAM or BAM.
+fn write_cram_in_parallel<R>(
+    reader: &mut cram::io::Reader<R>,
+    repository: &fasta::Repository,
+    header: &sam::Header,
+    filter: &Filter,
+    kind: OutputFormat,
+    threads: usize,
+    writer: &mut AlignmentWriter,
+) -> anyhow::Result<()>
+where
+    R: io::Read + Send,
+{
+    match kind {
+        OutputFormat::Sam => parallel_cram::decode(
+            reader,
+            header,
+            repository,
+            threads,
+            |chunk: &mut SamChunk, record| {
+                if filter.matches(&Rec::Dyn(record))? {
+                    chunk.0.write_alignment_record(header, record)?;
+                }
+                Ok(())
+            },
+            |chunk| Ok(writer.write_sam_text(chunk.0.into_inner())?),
+        ),
+        OutputFormat::Bam => parallel_cram::decode(
+            reader,
+            header,
+            repository,
+            threads,
+            |chunk: &mut BamChunk, record| {
+                if filter.matches(&Rec::Dyn(record))? {
+                    chunk.0.write_alignment_record(header, record)?;
+                }
+                Ok(())
+            },
+            |chunk| Ok(writer.write_bam_records(chunk.0.get_ref())?),
+        ),
+        OutputFormat::Cram => bail!("CRAM-to-CRAM output is written serially"),
+    }
 }
 
 fn visit<F>(

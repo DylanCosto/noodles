@@ -5,6 +5,7 @@ mod bgzf_stream;
 mod commands;
 mod flags;
 mod output;
+mod parallel_cram;
 mod parallel_sam;
 mod program;
 mod runs;

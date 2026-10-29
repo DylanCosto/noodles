@@ -154,6 +154,39 @@ impl AlignmentWriter {
         }
     }
 
+    /// Returns whether pre-formatted SAM text ([`Self::write_sam_text`]) or pre-encoded BAM
+    /// records ([`Self::write_bam_records`]) can be written directly, and which.
+    pub fn preformatted_kind(&self) -> Option<OutputFormat> {
+        match self {
+            Self::Sam(_) | Self::ParallelSam { .. } => Some(OutputFormat::Sam),
+            Self::Bam(_) => Some(OutputFormat::Bam),
+            Self::Cram(_) => None,
+        }
+    }
+
+    /// Writes SAM record lines formatted elsewhere. Only valid for SAM output.
+    pub fn write_sam_text(&mut self, text: Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Sam(w) => w.get_mut().write_all(&text),
+            Self::ParallelSam { writer, .. } => writer.write_text(text),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SAM text written to non-SAM output",
+            )),
+        }
+    }
+
+    /// Writes `block_size`-prefixed BAM records encoded elsewhere. Only valid for BAM output.
+    pub fn write_bam_records(&mut self, records: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Bam(w) => w.get_mut().write_all(records),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "BAM records written to non-BAM output",
+            )),
+        }
+    }
+
     /// Flushes buffered records and writes any end-of-file marker.
     pub fn finish(self, header: &sam::Header) -> io::Result<()> {
         match self {

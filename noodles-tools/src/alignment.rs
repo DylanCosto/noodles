@@ -40,6 +40,8 @@ pub enum Rec<'a> {
     Bam(&'a bam::Record),
     Sam(&'a sam::Record),
     Buf(&'a RecordBuf),
+    /// Any other record, e.g., a CRAM record decoded on a worker.
+    Dyn(&'a dyn sam::alignment::Record),
 }
 
 impl Rec<'_> {
@@ -49,6 +51,7 @@ impl Rec<'_> {
             Self::Bam(r) => *r,
             Self::Sam(r) => *r,
             Self::Buf(r) => *r,
+            Self::Dyn(r) => *r,
         }
     }
 
@@ -57,6 +60,7 @@ impl Rec<'_> {
             Self::Bam(r) => Ok(r.flags()),
             Self::Sam(r) => r.flags(),
             Self::Buf(r) => Ok(r.flags()),
+            Self::Dyn(r) => r.flags(),
         }
     }
 
@@ -66,6 +70,7 @@ impl Rec<'_> {
             Self::Bam(r) => Ok(r.mapping_quality().map(u8::from)),
             Self::Sam(r) => r.mapping_quality().transpose().map(|q| q.map(u8::from)),
             Self::Buf(r) => Ok(r.mapping_quality().map(u8::from)),
+            Self::Dyn(r) => r.mapping_quality().transpose().map(|q| q.map(u8::from)),
         }
     }
 
@@ -84,7 +89,8 @@ type BamReader = bam::io::Reader<BgzfReader<BufReader<Stream>>>;
 pub enum AlignmentReader {
     Sam(sam::io::Reader<Box<dyn BufRead + Send>>),
     Bam(BamReader),
-    Cram(cram::io::Reader<BufReader<Stream>>),
+    /// A CRAM reader and the reference repository it decodes with.
+    Cram(cram::io::Reader<BufReader<Stream>>, fasta::Repository),
 }
 
 impl AlignmentReader {
@@ -122,8 +128,9 @@ impl AlignmentReader {
                 let repository = reference_repository(options.reference.as_deref())?;
                 Self::Cram(
                     cram::io::reader::Builder::default()
-                        .set_reference_sequence_repository(repository)
+                        .set_reference_sequence_repository(repository.clone())
                         .build_from_reader(reader),
+                    repository,
                 )
             }
         })
@@ -133,7 +140,7 @@ impl AlignmentReader {
         match self {
             Self::Sam(_) => Format::Sam,
             Self::Bam(_) => Format::Bam,
-            Self::Cram(_) => Format::Cram,
+            Self::Cram(_, _) => Format::Cram,
         }
     }
 
@@ -141,7 +148,7 @@ impl AlignmentReader {
         match self {
             Self::Sam(r) => r.read_header(),
             Self::Bam(r) => r.read_header(),
-            Self::Cram(r) => r.read_header(),
+            Self::Cram(r, _) => r.read_header(),
         }
         .context("reading header")
     }
@@ -164,7 +171,7 @@ impl AlignmentReader {
                     f(Rec::Sam(&record))?;
                 }
             }
-            Self::Cram(reader) => {
+            Self::Cram(reader, _) => {
                 for result in reader.records(header) {
                     let record = result?;
                     f(Rec::Buf(&record))?;
@@ -210,7 +217,7 @@ impl AlignmentReader {
                     }
                 }
             }
-            Self::Cram(reader) => {
+            Self::Cram(reader, _) => {
                 let index = cram::fs::read_associated_index(path)
                     .with_context(|| format!("reading index for {}", path.display()))?;
 
