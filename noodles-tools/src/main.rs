@@ -1,6 +1,7 @@
 //! `ntools`: a samtools-compatible command-line toolkit built on noodles.
 
 mod alignment;
+mod bam_blocks;
 mod bam_raw;
 mod bgzf_stream;
 mod commands;
@@ -47,25 +48,36 @@ enum Command {
     Fastq(commands::fastq::Args),
     /// Convert alignments to FASTA.
     Fasta(commands::fastq::Args),
+    /// Check that files look intact.
+    Quickcheck(commands::quickcheck::Args),
+    /// Replace a BAM header without recompressing records.
+    Reheader(commands::reheader::Args),
+    /// Concatenate BAM files without recompressing records.
+    Cat(commands::cat::Args),
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::View(args) => commands::view::run(args),
-        Command::Flagstat(args) => commands::flagstat::run(args),
-        Command::Idxstats(args) => commands::idxstats::run(args),
-        Command::Index(args) => commands::index::run(args),
-        Command::Faidx(args) => commands::faidx::run(args),
-        Command::Sort(args) => commands::sort::run(args),
-        Command::Merge(args) => commands::merge::run(args),
-        Command::Fastq(args) => commands::fastq::run(args, commands::fastq::ReadFormat::Fastq),
-        Command::Fasta(args) => commands::fastq::run(args, commands::fastq::ReadFormat::Fasta),
+        Command::View(args) => commands::view::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Flagstat(args) => commands::flagstat::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Idxstats(args) => commands::idxstats::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Index(args) => commands::index::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Faidx(args) => commands::faidx::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Sort(args) => commands::sort::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Merge(args) => commands::merge::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Fastq(args) => commands::fastq::run(args, commands::fastq::ReadFormat::Fastq)
+            .map(|()| ExitCode::SUCCESS),
+        Command::Fasta(args) => commands::fastq::run(args, commands::fastq::ReadFormat::Fasta)
+            .map(|()| ExitCode::SUCCESS),
+        Command::Quickcheck(args) => commands::quickcheck::run(args),
+        Command::Reheader(args) => commands::reheader::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Cat(args) => commands::cat::run(args).map(|()| ExitCode::SUCCESS),
     };
 
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         // A closed downstream pipe (`| head`) is not an error worth reporting.
         Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
         Err(e) => {
