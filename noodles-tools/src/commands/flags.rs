@@ -87,7 +87,7 @@ NAME,...,NAME representing a combination of the following flag names:\n\
 
 /// `bam_str2flag`: an integer as C's `strtol(s, &end, 0)` reads it (truncated to `int`), or
 /// names, matched without case; `None` if a name is unknown.
-fn parse(s: &str) -> Option<i32> {
+pub(crate) fn parse(s: &str) -> Option<i32> {
     if let Some(n) = strtol(s) {
         return Some(n as i32);
     }
@@ -139,7 +139,7 @@ fn strtol(s: &str) -> Option<i64> {
 }
 
 /// `bam_flag2str`: the names of the set flags, comma separated.
-fn names(mask: i32) -> String {
+pub(crate) fn names(mask: i32) -> String {
     FLAGS
         .iter()
         .filter(|(bit, _, _)| mask & i32::from(*bit) != 0)

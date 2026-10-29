@@ -42,6 +42,8 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `calmd` | `calmd` | `-e`, `-r` (BAQ), `-A`, `-E`, `-n`, `-C`, `-d`, `-q`, `-N`, `-Q`, `-b/-u`; records are processed on `-@` threads |
 | `ampliconclip` | `ampliconclip` | soft or `--hard-clip`, `--both-ends`, `--strand`, `--tolerance`, `--original`, `--keep-tag`, `--clipped`, `--fail`, `--filter-len/--fail-len/--unmap-len`, `--no-excluded`, `--rejects-file`, `--primer-counts`, `-f` |
 | `import` | `import` | FASTQ/FASTA (plain or gzipped) to unaligned SAM/BAM/CRAM; `-0/-1/-2/-s`, `--i1/--i2` (index reads to `BC`/`QT`), `-b`, `-i` (CASAVA), `-U` (UMIs), `-N` (SRA names), `-T` (tags from comments, such as `MM`/`ML`), `-r/-R`, `--order`, `-O`, `-u`, `-o` |
+| `reset` | `reset` | `-x`/`--keep-tag` (including `^` lists), `--reject-PG`, `--no-RG`, `--dupflag`, `-O`, `-o` |
+| `checksum` | `checksum` | `-F/-f/-b`, `-c`, `-t` (including `*` negation), `-O`, `-P/-C/-M`, `-z`, `-N`, `-q`, `-v`, `-a`, `-T`, `-B`, `-m` (merge reports), `-o` |
 | `head` | `head` | `-h` (header lines), `-n` (records) |
 | `flags` | `flags` | numbers and flag names, both ways |
 | `samples` | `samples` | `-h`, `-i`, `-T`, `-f/-F` (matching references), `-X`, `-o`, paths from stdin |

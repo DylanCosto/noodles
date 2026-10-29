@@ -268,6 +268,20 @@ check "import interleaved -O bam" "$st import --no-PG -O bam imp.inter.fq | $st 
 check "import --i1 -1 -2 -b" "$st import --no-PG --i1 imp.R2.fq -1 imp.R1.fq -2 imp.R2.fq -b" "$nt import --no-PG --i1 imp.R2.fq -1 imp.R1.fq -2 imp.R2.fq -b"
 check "import -i -U -T *" "$st import --no-PG -i -U -T '*' imp.casava.fq" "$nt import --no-PG -i -U -T '*' imp.casava.fq"
 
+# reset and checksum
+check "reset" "$st reset --no-PG $tagged" "$nt reset --no-PG $tagged"
+check "reset CRAM" "$st reset --no-PG $corpus/short/input.3.1.cram" "$nt reset --no-PG $corpus/short/input.3.1.cram"
+check "checksum" "$st checksum $tagged" "$nt checksum $tagged"
+check "checksum -a long" "$st checksum -a $long" "$nt checksum -a $long"
+
+if [ -f md.bam ]; then
+    check "reset --dupflag -x ^RG,ms --reject-PG" "$st reset --no-PG --dupflag -x '^RG,ms' --reject-PG samtools.1 md.bam" "$nt reset --no-PG --dupflag -x '^RG,ms' --reject-PG samtools.1 md.bam"
+    check "checksum -q -v -T -P -C -M -OO" "$st checksum -q -v -T -P -C -M -OO md.bam" "$nt checksum -q -v -T -P -C -M -OO md.bam"
+    "$st" split -f 'chk_%!.bam' md.bam
+    for f in chk_*.bam; do "$st" checksum -q -o "$f.chk" "$f"; done
+    check "checksum -m (merge)" "$st checksum -q -m chk_*.bam.chk" "$nt checksum -q -m chk_*.bam.chk"
+fi
+
 # head, flags, samples
 check "head" "$st head $tagged" "$nt head $tagged"
 check "head -n 5 -h 2" "$st head -n 5 -h 2 $long" "$nt head -n 5 -h 2 $long"

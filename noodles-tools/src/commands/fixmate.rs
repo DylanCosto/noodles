@@ -27,6 +27,7 @@ use crate::{
     alignment::{AlignmentReader, ReadOptions},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     program,
+    sanitize::Sanitize,
 };
 
 /// Base qualities below this are not counted in mate scores (`MD_MIN_QUALITY`).
@@ -47,49 +48,6 @@ const UNMAPPED_REMOVED_TAGS: [Tag; 4] = [
     Tag::new(b'C', b'G'),
     Tag::new(b'S', b'M'),
 ];
-
-/// samtools' `-z` sanitizer steps.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Sanitize(u8);
-
-impl Sanitize {
-    const POS: u8 = 2;
-    const MQUAL: u8 = 4;
-    const UNMAP: u8 = 8;
-    const CIGAR: u8 = 16;
-    const AUX: u8 = 32;
-    const CIGDUP: u8 = 64;
-    const CIGARX: u8 = 128;
-    const ALL: u8 = 127;
-    const ON: u8 = Self::MQUAL | Self::UNMAP | Self::CIGAR | Self::AUX;
-
-    fn has(self, flag: u8) -> bool {
-        self.0 & flag != 0
-    }
-
-    /// Parses samtools' comma-separated keywords.
-    fn parse(s: &str) -> anyhow::Result<Self> {
-        let mut opt = 0;
-
-        for keyword in s.split(',').filter(|k| !k.is_empty()) {
-            opt = match keyword {
-                k if k.starts_with("all") || k.starts_with('*') => Self::ALL,
-                k if k.starts_with("none") || k.starts_with("off") => 0,
-                k if k.starts_with("on") => Self::ON,
-                k if k.starts_with("pos") => opt | Self::POS,
-                k if k.starts_with("mqual") => opt | Self::MQUAL,
-                k if k.starts_with("unmap") => opt | Self::UNMAP,
-                k if k.starts_with("cigdup") => opt | Self::CIGDUP,
-                k if k.starts_with("cigarx") => opt | Self::CIGARX | Self::CIGDUP,
-                k if k.starts_with("cigar") => opt | Self::CIGAR,
-                k if k.starts_with("aux") => opt | Self::AUX,
-                k => bail!("unrecognised sanitize keyword: {k}"),
-            };
-        }
-
-        Ok(Self(opt))
-    }
-}
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -943,16 +901,5 @@ mod tests {
                 Op::new(Kind::Match, 4)
             ]
         );
-    }
-
-    #[test]
-    fn test_sanitize_parse() -> anyhow::Result<()> {
-        assert_eq!(Sanitize::parse("all")?, Sanitize(Sanitize::ALL));
-        assert_eq!(
-            Sanitize::parse("off,pos,mqual")?,
-            Sanitize(Sanitize::POS | Sanitize::MQUAL)
-        );
-        assert!(Sanitize::parse("nope").is_err());
-        Ok(())
     }
 }
