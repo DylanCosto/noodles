@@ -7,6 +7,7 @@ mod flags;
 mod mate_flags;
 mod quality_scores;
 mod sequence;
+mod sequence_record;
 
 use std::{borrow::Cow, io, iter, marker::PhantomData};
 
@@ -56,6 +57,25 @@ pub struct Record<'c> {
 }
 
 impl Record<'_> {
+    /// Reconstructs the sequence into `dst` and returns a view of this record that borrows it.
+    ///
+    /// Formatting or encoding the view copies the sequence once instead of rebuilding it base by
+    /// base from the reference and read features. `dst` is cleared first.
+    pub fn with_sequence<'r>(&'r self, dst: &'r mut Vec<u8>) -> impl sam::alignment::Record + 'r {
+        dst.clear();
+
+        if self.bam_flags.is_unmapped() || self.cram_flags.sequence_is_missing() {
+            dst.extend_from_slice(&self.sequence);
+        } else {
+            self.sequence_decoder().extend_to(dst);
+        }
+
+        sequence_record::SequenceRecord {
+            record: self,
+            sequence: dst,
+        }
+    }
+
     fn alignment_span(&self) -> usize {
         calculate_alignment_span(self.read_length, &self.features)
     }
@@ -65,6 +85,89 @@ impl Record<'_> {
             let end = usize::from(alignment_start) + self.alignment_span() - 1;
             Position::new(end)
         })
+    }
+
+    fn sequence_decoder(&self) -> Sequence<'_, '_> {
+        let (reference_sequence, alignment_start) = match self.reference_sequence.as_ref() {
+            Some(ReferenceSequence::Embedded {
+                reference_start,
+                sequence,
+            }) => {
+                let alignment_start = usize::from(self.alignment_start.unwrap());
+                let offset = usize::from(*reference_start);
+                let offset_alignment_start = Position::new(alignment_start - offset + 1).unwrap();
+                (Some(*sequence), offset_alignment_start)
+            }
+            Some(ReferenceSequence::ExternalRange {
+                reference_start,
+                sequence,
+            }) => {
+                let alignment_start = usize::from(self.alignment_start.unwrap());
+                let offset = usize::from(*reference_start);
+                let offset_alignment_start = Position::new(alignment_start - offset + 1).unwrap();
+                (Some((**sequence).as_ref()), offset_alignment_start)
+            }
+            Some(ReferenceSequence::External { sequence, .. }) => {
+                (Some((**sequence).as_ref()), self.alignment_start.unwrap())
+            }
+            None => (None, Position::MIN),
+        };
+
+        Sequence::new(
+            reference_sequence,
+            self.substitution_matrix.clone(),
+            &self.features,
+            alignment_start,
+            self.read_length,
+        )
+    }
+
+    /// Converts this record to an owned record buffer, reconstructing the sequence in bulk.
+    ///
+    /// This is equivalent to [`sam::alignment::RecordBuf::try_from_alignment_record`].
+    pub(crate) fn try_into_record_buf(self) -> io::Result<sam::alignment::RecordBuf> {
+        use sam::alignment::{Record as _, record::QualityScores as _};
+
+        let cigar = self.cigar().iter().collect::<io::Result<_>>()?;
+
+        let mut data = sam::alignment::record_buf::Data::default();
+
+        for result in self.data().iter() {
+            let (tag, value) = result?;
+            data.insert(tag, value.try_into()?);
+        }
+
+        let sequence = if self.bam_flags.is_unmapped() || self.cram_flags.sequence_is_missing() {
+            self.sequence.into_owned()
+        } else {
+            self.sequence_decoder().to_vec()
+        };
+
+        let quality_scores = if self.bam_flags.is_unmapped()
+            || self.cram_flags.quality_scores_are_stored_as_array()
+        {
+            self.quality_scores.into_owned()
+        } else {
+            QualityScores::new(&self.features, self.read_length)
+                .iter()
+                .collect::<io::Result<Vec<_>>>()?
+        };
+
+        let mut record = sam::alignment::RecordBuf::default();
+        *record.name_mut() = self.name.map(|name| name.into_owned().into());
+        *record.flags_mut() = self.bam_flags;
+        *record.reference_sequence_id_mut() = self.reference_sequence_id;
+        *record.alignment_start_mut() = self.alignment_start;
+        *record.mapping_quality_mut() = self.mapping_quality;
+        *record.cigar_mut() = cigar;
+        *record.mate_reference_sequence_id_mut() = self.mate_reference_sequence_id;
+        *record.mate_alignment_start_mut() = self.mate_alignment_start;
+        *record.template_length_mut() = self.template_length;
+        *record.sequence_mut() = sequence.into();
+        *record.quality_scores_mut() = quality_scores.into();
+        *record.data_mut() = data;
+
+        Ok(record)
     }
 }
 
@@ -147,40 +250,7 @@ impl sam::alignment::Record for Record<'_> {
         if self.bam_flags.is_unmapped() || self.cram_flags.sequence_is_missing() {
             Box::new(Bases(&self.sequence[..]))
         } else {
-            let (reference_sequence, alignment_start) = match self.reference_sequence.as_ref() {
-                Some(ReferenceSequence::Embedded {
-                    reference_start,
-                    sequence,
-                }) => {
-                    let alignment_start = usize::from(self.alignment_start.unwrap());
-                    let offset = usize::from(*reference_start);
-                    let offset_alignment_start =
-                        Position::new(alignment_start - offset + 1).unwrap();
-                    (Some(*sequence), offset_alignment_start)
-                }
-                Some(ReferenceSequence::ExternalRange {
-                    reference_start,
-                    sequence,
-                }) => {
-                    let alignment_start = usize::from(self.alignment_start.unwrap());
-                    let offset = usize::from(*reference_start);
-                    let offset_alignment_start =
-                        Position::new(alignment_start - offset + 1).unwrap();
-                    (Some((**sequence).as_ref()), offset_alignment_start)
-                }
-                Some(ReferenceSequence::External { sequence, .. }) => {
-                    (Some((**sequence).as_ref()), self.alignment_start.unwrap())
-                }
-                None => (None, Position::MIN),
-            };
-
-            Box::new(Sequence::new(
-                reference_sequence,
-                self.substitution_matrix.clone(),
-                &self.features,
-                alignment_start,
-                self.read_length,
-            ))
+            Box::new(self.sequence_decoder())
         }
     }
 

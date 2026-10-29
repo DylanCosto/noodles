@@ -171,10 +171,31 @@ impl AlignmentReader {
                     f(Rec::Sam(&record))?;
                 }
             }
-            Self::Cram(reader, _) => {
-                for result in reader.records(header) {
-                    let record = result?;
-                    f(Rec::Buf(&record))?;
+            Self::Cram(reader, repository) => {
+                // Decoding containers directly avoids converting each record to a `RecordBuf`.
+                let mut container = cram::io::reader::Container::default();
+                let mut sequence = Vec::new();
+
+                while reader.read_container(&mut container)? != 0 {
+                    let compression_header = container.compression_header()?;
+
+                    for result in container.slices() {
+                        let slice = result?;
+                        let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
+
+                        let records = slice.records(
+                            repository.clone(),
+                            header,
+                            &compression_header,
+                            &core_data_src,
+                            &external_data_srcs,
+                        )?;
+
+                        for record in &records {
+                            let view = record.with_sequence(&mut sequence);
+                            f(Rec::Dyn(&view))?;
+                        }
+                    }
                 }
             }
         }

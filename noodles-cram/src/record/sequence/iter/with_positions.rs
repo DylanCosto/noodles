@@ -4,14 +4,17 @@ use noodles_core::Position;
 
 use crate::record::Feature;
 
-pub(super) struct WithPositions<'r, 'c: 'r> {
+pub(in crate::record::sequence) struct WithPositions<'r, 'c: 'r> {
     features: slice::Iter<'r, Feature<'c>>,
     reference_position: Position,
     read_position: Position,
 }
 
 impl<'r, 'c: 'r> WithPositions<'r, 'c> {
-    pub(super) fn new(features: &'r [Feature<'c>], alignment_start: Position) -> Self {
+    pub(in crate::record::sequence) fn new(
+        features: &'r [Feature<'c>],
+        alignment_start: Position,
+    ) -> Self {
         Self {
             features: features.iter(),
             reference_position: alignment_start,
@@ -19,7 +22,7 @@ impl<'r, 'c: 'r> WithPositions<'r, 'c> {
         }
     }
 
-    pub(super) fn positions(&self) -> (Position, Position) {
+    pub(in crate::record::sequence) fn positions(&self) -> (Position, Position) {
         (self.reference_position, self.read_position)
     }
 }

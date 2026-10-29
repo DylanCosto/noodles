@@ -1,4 +1,4 @@
-mod with_positions;
+pub(super) mod with_positions;
 
 use std::{iter::FusedIterator, ops::Range, slice};
 

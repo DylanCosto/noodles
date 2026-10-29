@@ -254,21 +254,35 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// SAM text for the records of one CRAM container that pass the filter.
-struct SamChunk(sam::io::Writer<Vec<u8>>);
+/// SAM text for the records of one CRAM container that pass the filter, and a buffer for
+/// reconstructing sequences.
+struct SamChunk {
+    writer: sam::io::Writer<Vec<u8>>,
+    sequence: Vec<u8>,
+}
 
 impl Default for SamChunk {
     fn default() -> Self {
-        Self(sam::io::Writer::new(Vec::new()))
+        Self {
+            writer: sam::io::Writer::new(Vec::new()),
+            sequence: Vec::new(),
+        }
     }
 }
 
-/// `block_size`-prefixed BAM records for one CRAM container.
-struct BamChunk(bam::io::Writer<Vec<u8>>);
+/// `block_size`-prefixed BAM records for one CRAM container, and a buffer for reconstructing
+/// sequences.
+struct BamChunk {
+    writer: bam::io::Writer<Vec<u8>>,
+    sequence: Vec<u8>,
+}
 
 impl Default for BamChunk {
     fn default() -> Self {
-        Self(bam::io::Writer::from(Vec::new()))
+        Self {
+            writer: bam::io::Writer::from(Vec::new()),
+            sequence: Vec::new(),
+        }
     }
 }
 
@@ -293,11 +307,12 @@ where
             threads,
             |chunk: &mut SamChunk, record| {
                 if filter.matches(&Rec::Dyn(record))? {
-                    chunk.0.write_alignment_record(header, record)?;
+                    let view = record.with_sequence(&mut chunk.sequence);
+                    chunk.writer.write_alignment_record(header, &view)?;
                 }
                 Ok(())
             },
-            |chunk| Ok(writer.write_sam_text(chunk.0.into_inner())?),
+            |chunk| Ok(writer.write_sam_text(chunk.writer.into_inner())?),
         ),
         OutputFormat::Bam => parallel_cram::decode(
             reader,
@@ -306,11 +321,12 @@ where
             threads,
             |chunk: &mut BamChunk, record| {
                 if filter.matches(&Rec::Dyn(record))? {
-                    chunk.0.write_alignment_record(header, record)?;
+                    let view = record.with_sequence(&mut chunk.sequence);
+                    chunk.writer.write_alignment_record(header, &view)?;
                 }
                 Ok(())
             },
-            |chunk| Ok(writer.write_bam_records(chunk.0.get_ref())?),
+            |chunk| Ok(writer.write_bam_records(chunk.writer.get_ref())?),
         ),
         OutputFormat::Cram => bail!("CRAM-to-CRAM output is written serially"),
     }
