@@ -4,7 +4,9 @@ use std::io;
 
 use noodles_bgzf as bgzf;
 use noodles_core::region::Interval;
-use noodles_csi::{self as csi, binning_index::index::reference_sequence::bin::Chunk};
+use noodles_csi::{
+    self as csi, binning_index::index::reference_sequence::bin::Chunk, io::RecordMatch,
+};
 use noodles_sam::alignment::Record as _;
 
 pub use self::records::Records;
@@ -60,12 +62,19 @@ where
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
     pub fn read_record(&mut self, record: &mut Record) -> io::Result<usize> {
-        next_record(
-            &mut self.inner,
-            record,
-            self.reference_sequence_id,
-            self.interval,
-        )
+        loop {
+            let n = self.inner.read_record(record)?;
+
+            if n == 0 {
+                return Ok(0);
+            }
+
+            let record_match = classify_record(record, self.reference_sequence_id, self.interval)?;
+
+            if self.inner.get_mut().accept(record_match) {
+                return Ok(n);
+            }
+        }
     }
 
     /// Returns an iterator over records.
@@ -94,58 +103,72 @@ where
     }
 }
 
+#[cfg(feature = "async")]
 pub(crate) fn intersects(
     record: &Record,
     reference_sequence_id: usize,
     region_interval: Interval,
 ) -> io::Result<bool> {
+    classify_record(record, reference_sequence_id, region_interval)
+        .map(|record_match| record_match == RecordMatch::Include)
+}
+
+/// Classifies a record read from a query of a coordinate-sorted file.
+pub(crate) fn classify_record(
+    record: &Record,
+    reference_sequence_id: usize,
+    region_interval: Interval,
+) -> io::Result<RecordMatch> {
     let Some(id) = record.reference_sequence_id().transpose()? else {
-        return Ok(false);
+        return Ok(RecordMatch::Skip);
     };
 
     if id != reference_sequence_id {
-        return Ok(false);
+        return Ok(if id > reference_sequence_id {
+            RecordMatch::NextChunk
+        } else {
+            RecordMatch::Skip
+        });
     }
 
     if interval_is_unbounded(region_interval) {
-        Ok(true)
+        return Ok(RecordMatch::Include);
+    }
+
+    let start = record.alignment_start().transpose()?;
+
+    // Records are coordinate-sorted, so one starting past the region ends this chunk. Only the
+    // chunk: an index may return chunks out of order.
+    if let (Some(start), Some(end)) = (start, region_interval.end())
+        && start > end
+    {
+        return Ok(RecordMatch::NextChunk);
+    }
+
+    // Placed unmapped reads occupy one reference base, as with HTSlib's bam_endpos, even when
+    // they keep a CIGAR.
+    let end = if record.flags().is_unmapped() {
+        start
     } else {
-        match (
-            record.alignment_start().transpose()?,
-            record.alignment_end().transpose()?,
-        ) {
-            (Some(start), Some(end)) => {
-                let alignment_interval = (start..=end).into();
-                Ok(region_interval.intersects(alignment_interval))
-            }
-            _ => Ok(false),
+        record.alignment_end().transpose()?
+    };
+
+    match (start, end) {
+        (Some(start), Some(end)) => {
+            let alignment_interval = (start..=end).into();
+
+            Ok(if region_interval.intersects(alignment_interval) {
+                RecordMatch::Include
+            } else {
+                RecordMatch::Skip
+            })
         }
+        _ => Ok(RecordMatch::Skip),
     }
 }
 
 fn interval_is_unbounded(interval: Interval) -> bool {
     interval.start().is_none() && interval.end().is_none()
-}
-
-fn next_record<R>(
-    reader: &mut super::Reader<csi::io::Query<'_, R>>,
-    record: &mut Record,
-    reference_sequence_id: usize,
-    interval: Interval,
-) -> io::Result<usize>
-where
-    R: bgzf::io::BufRead + bgzf::io::Seek,
-{
-    loop {
-        match reader.read_record(record)? {
-            0 => return Ok(0),
-            n => {
-                if intersects(record, reference_sequence_id, interval)? {
-                    return Ok(n);
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]

@@ -13,5 +13,8 @@ pub use self::{
     indexed_records::IndexedRecords, query::Query, reader::Reader, writer::Writer,
 };
 
+#[doc(hidden)]
+pub use self::query::RecordMatch;
+
 pub(crate) const MAGIC_NUMBER: [u8; 4] = *b"CSI\x01";
 pub(crate) const MAX_DEPTH: u8 = 9;
