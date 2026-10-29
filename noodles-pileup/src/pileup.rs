@@ -2,7 +2,9 @@
 //! order and resolved against each reference position in turn, with the same CIGAR resolution,
 //! maximum depth rule, and overlapping mate quality adjustment as htslib.
 
-use std::{collections::HashMap, error, fmt};
+use std::{error, fmt};
+
+use rustc_hash::FxHashMap;
 
 use crate::{
     Read,
@@ -90,12 +92,26 @@ struct CigarState {
     x: i64,
     y: i64,
     end: i64,
+    /// The operation at `k` and its length, cached so that positions inside an operation are
+    /// resolved without reading the CIGAR (`NO_OP` when `k` is not an operation).
+    op: u32,
+    len: i64,
 }
 
-/// `lbnode_t`
+/// A cached CIGAR operation that is never matched.
+const NO_OP: u32 = u32::MAX;
+
+/// `lbnode_t`: a buffered read. What the per-position scan needs is kept apart, in [`Hot`].
 struct Node {
     read: Read,
     mods: Option<Box<BaseMods>>,
+}
+
+/// A buffered read's reference sequence ID, 0-based start and exclusive end, and CIGAR state,
+/// stored compactly so that scanning the buffer at each position touches little memory.
+#[derive(Clone, Copy, Debug)]
+struct Hot {
+    tid: i32,
     beg: i64,
     end: i64,
     s: CigarState,
@@ -127,6 +143,8 @@ pub struct Entry {
 /// order (htslib's linked list), so that dropping a read moves only slot indices.
 pub struct Pileup {
     slots: Vec<Option<Node>>,
+    /// The scan state of each slot's read.
+    hot: Vec<Hot>,
     free: Vec<u32>,
     order: Vec<u32>,
     tid: i32,
@@ -139,7 +157,7 @@ pub struct Pileup {
     /// buffer is empty.
     last: Option<(i32, i64)>,
     /// Reads whose mates may still overlap them, by name, to their slots.
-    overlaps: Option<HashMap<Vec<u8>, u32>>,
+    overlaps: Option<FxHashMap<Vec<u8>, u32>>,
     entries: Vec<Entry>,
     out_tid: i32,
     out_pos: i64,
@@ -154,6 +172,7 @@ impl Pileup {
         let overlaps = overlaps == Overlaps::Adjust;
         Self {
             slots: Vec::new(),
+            hot: Vec::new(),
             free: Vec::new(),
             order: Vec::new(),
             tid: 0,
@@ -163,7 +182,7 @@ impl Pileup {
             is_eof: false,
             maxcnt,
             last: None,
-            overlaps: overlaps.then(HashMap::new),
+            overlaps: overlaps.then(FxHashMap::default),
             entries: Vec::new(),
             out_tid: 0,
             out_pos: 0,
@@ -265,9 +284,9 @@ impl Pileup {
                 None
             };
 
-            let mut node = Node {
-                read,
-                mods,
+            let mut node = Node { read, mods };
+            let hot = Hot {
+                tid: node.read.tid,
                 beg,
                 end,
                 s: CigarState {
@@ -275,18 +294,24 @@ impl Pileup {
                     x: 0,
                     y: 0,
                     end: end - 1,
+                    op: NO_OP,
+                    len: 0,
                 },
             };
 
             let slot = match self.free.pop() {
-                Some(slot) => slot,
+                Some(slot) => {
+                    self.hot[slot as usize] = hot;
+                    slot
+                }
                 None => {
                     self.slots.push(None);
+                    self.hot.push(hot);
                     u32::try_from(self.slots.len() - 1).expect("depth fits in u32")
                 }
             };
 
-            self.overlap_push(&mut node, slot)?;
+            self.overlap_push(&mut node.read, end, slot)?;
             self.slots[slot as usize] = Some(node);
             self.order.push(slot);
         }
@@ -317,11 +342,9 @@ impl Pileup {
             // Drop reads that ended before this position, and pile up the rest that started.
             for i in 0..self.order.len() {
                 let slot = self.order[i];
-                let node = self.slots[slot as usize]
-                    .as_mut()
-                    .expect("ordered slots are occupied");
+                let hot = &mut self.hot[slot as usize];
 
-                if node.read.tid < tid || (node.read.tid == tid && node.end <= pos) {
+                if hot.tid < tid || (hot.tid == tid && hot.end <= pos) {
                     let node = self.slots[slot as usize].take().expect("occupied");
 
                     if let Some(overlaps) = &mut self.overlaps
@@ -335,8 +358,17 @@ impl Pileup {
                     continue;
                 }
 
-                if node.read.tid == tid && node.beg <= pos {
-                    let entry = resolve_cigar(&node.read, pos, &mut node.s, slot as usize);
+                if hot.tid == tid && hot.beg <= pos {
+                    let entry = match resolve_cigar_fast(hot.beg, pos, &hot.s, slot as usize) {
+                        Some(entry) => entry,
+                        None => {
+                            let node = self.slots[slot as usize]
+                                .as_ref()
+                                .expect("ordered slots are occupied");
+                            resolve_cigar(&node.read, pos, &mut hot.s, slot as usize)
+                        }
+                    };
+
                     self.entries.push(entry);
                 }
 
@@ -351,13 +383,13 @@ impl Pileup {
 
             let head = match self.order.first() {
                 Some(&slot) => {
-                    let node = self.node(slot);
+                    let hot = &self.hot[slot as usize];
 
-                    if self.tid > node.read.tid {
+                    if self.tid > hot.tid {
                         return Err(Error::Unsorted);
                     }
 
-                    Some((node.read.tid, node.beg))
+                    Some((hot.tid, hot.beg))
                 }
                 None => self.last,
             };
@@ -402,19 +434,19 @@ impl Pileup {
     }
 
     /// `overlap_push`
-    fn overlap_push(&mut self, node: &mut Node, slot: u32) -> Result<(), Error> {
+    fn overlap_push(&mut self, read: &mut Read, end: i64, slot: u32) -> Result<(), Error> {
         let Some(overlaps) = &mut self.overlaps else {
             return Ok(());
         };
 
-        let b = &node.read;
+        let b = &*read;
 
         if b.flag & FLAG_MATE_UNMAPPED != 0 || b.flag & FLAG_PROPER_PAIR == 0 {
             return Ok(());
         }
 
         if (b.mtid >= 0 && b.tid != b.mtid)
-            || (i64::from(b.isize).abs() >= 2 * b.l_seq as i64 && b.mpos >= node.end)
+            || (i64::from(b.isize).abs() >= 2 * b.l_seq as i64 && b.mpos >= end)
         {
             return Ok(());
         }
@@ -426,21 +458,53 @@ impl Pileup {
                 }
             }
             Some(&mate) => {
-                let name = b.name().to_vec();
-                overlaps.remove(&name);
+                overlaps.remove(b.name());
 
                 let a = &mut self.slots[mate as usize]
                     .as_mut()
                     .expect("overlap entries refer to buffered reads")
                     .read;
 
-                if !tweak_overlap_quality(a, &mut node.read) {
+                if !tweak_overlap_quality(a, read) {
                     return Err(Error::InvalidOverlap);
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+/// [`resolve_cigar`] for a position inside an operation, before its last base, where nothing
+/// changes but the offset; `None` elsewhere. `beg` is the read's start.
+#[inline]
+fn resolve_cigar_fast(beg: i64, pos: i64, s: &CigarState, node: usize) -> Option<Entry> {
+    if s.k < 0 || pos - s.x >= s.len - 1 {
+        return None;
+    }
+
+    if is_match(s.op) {
+        Some(Entry {
+            node,
+            qpos: s.y + (pos - s.x),
+            is_head: pos == beg,
+            is_tail: pos == s.end,
+            cigar_ind: s.k,
+            ..Entry::default()
+        })
+    } else if s.op == CIGAR_DELETION || s.op == CIGAR_SKIP {
+        Some(Entry {
+            node,
+            qpos: s.y,
+            is_del: true,
+            is_refskip: s.op == CIGAR_SKIP,
+            is_head: pos == beg,
+            is_tail: pos == s.end,
+            cigar_ind: s.k,
+            ..Entry::default()
+        })
+    } else {
+        None
     }
 }
 
@@ -523,6 +587,8 @@ fn resolve_cigar(b: &Read, pos: i64, s: &mut CigarState, node: usize) -> Entry {
     }
 
     let (op, l) = (op_at(s.k), len_at(s.k));
+    s.op = op;
+    s.len = l;
 
     if s.x + l - 1 == pos && s.k + 1 < n_cigar {
         let op2 = op_at(s.k + 1);
@@ -797,10 +863,12 @@ impl<'a> Mate<'a> {
         }
     }
 
+    #[inline]
     fn base(&self, i: usize) -> u8 {
         (self.seq[i / 2] >> ((!i & 1) << 2)) & 0xf
     }
 
+    #[inline]
     fn qual_mut(&mut self, i: usize) -> &mut u8 {
         &mut self.qual[i]
     }
@@ -809,11 +877,6 @@ impl<'a> Mate<'a> {
 /// `tweak_overlap_quality`: for overlapping mates `a` (left) and `b`, zeroes or combines the
 /// qualities of one of each pair of overlapping bases. Returns `false` on a malformed CIGAR.
 fn tweak_overlap_quality(a: &mut Read, b: &mut Read) -> bool {
-    /// `uint8 * 0.8` truncated back to a byte.
-    fn scaled(q: u8) -> u8 {
-        (f64::from(q) * 0.8) as u8
-    }
-
     let (a_pos, b_pos) = (a.pos, b.pos);
 
     // Which read's qualities are kept, chosen by a hash of the name.
@@ -939,23 +1002,60 @@ fn tweak_overlap_quality(a: &mut Read, b: &mut Read) -> bool {
             return true;
         }
 
-        let (ai, bi) = (a_iseq as usize, b_iseq as usize);
-        let (aq, bq) = (*a.qual_mut(ai), *b.qual_mut(bi));
+        combine_overlap(&mut a, &mut b, a_iseq as usize, b_iseq as usize, amul, bmul);
 
-        if a.base(ai) == b.base(bi) {
-            // Confident: the sum of the qualities, on one read.
-            let qual = (u32::from(aq) + u32::from(bq)).min(200) as u8;
-            *a.qual_mut(ai) = amul * qual;
-            *b.qual_mut(bi) = bmul * qual;
-        } else if aq > bq {
-            *a.qual_mut(ai) = scaled(aq);
-            *b.qual_mut(bi) = 0;
-        } else if aq < bq {
-            *b.qual_mut(bi) = scaled(bq);
-            *a.qual_mut(ai) = 0;
-        } else {
-            *a.qual_mut(ai) = (f64::from(amul) * 0.8 * f64::from(aq)) as u8;
-            *b.qual_mut(bi) = (f64::from(bmul) * 0.8 * f64::from(bq)) as u8;
+        // While both reads are aligned at the same base and stay in their match operations, the
+        // loop above only steps each by one base: do that directly.
+        if a_iref + a_pos == b_iref + b_pos && iref == a_iref + a_pos + 1 {
+            let a_left = i64::from(a_cigar[a_ci] >> 4) - 1 - a_icig;
+            let b_left = i64::from(b_cigar[b_ci] >> 4) - 1 - b_icig;
+
+            for _ in 0..a_left.min(b_left) {
+                a_icig += 1;
+                a_iseq += 1;
+                a_iref += 1;
+                b_icig += 1;
+                b_iseq += 1;
+                b_iref += 1;
+                iref += 1;
+
+                if a_iseq > a_l || b_iseq > b_l {
+                    return false;
+                }
+
+                if a_iseq == a_l || b_iseq == b_l {
+                    return true;
+                }
+
+                combine_overlap(&mut a, &mut b, a_iseq as usize, b_iseq as usize, amul, bmul);
+            }
         }
     }
+}
+
+/// Combines the qualities of one pair of overlapping bases.
+#[inline]
+fn combine_overlap(a: &mut Mate<'_>, b: &mut Mate<'_>, ai: usize, bi: usize, amul: u8, bmul: u8) {
+    let (aq, bq) = (*a.qual_mut(ai), *b.qual_mut(bi));
+
+    if a.base(ai) == b.base(bi) {
+        // Confident: the sum of the qualities, on one read.
+        let qual = (u32::from(aq) + u32::from(bq)).min(200) as u8;
+        *a.qual_mut(ai) = amul * qual;
+        *b.qual_mut(bi) = bmul * qual;
+    } else if aq > bq {
+        *a.qual_mut(ai) = scaled(aq);
+        *b.qual_mut(bi) = 0;
+    } else if aq < bq {
+        *b.qual_mut(bi) = scaled(bq);
+        *a.qual_mut(ai) = 0;
+    } else {
+        *a.qual_mut(ai) = (f64::from(amul) * 0.8 * f64::from(aq)) as u8;
+        *b.qual_mut(bi) = (f64::from(bmul) * 0.8 * f64::from(bq)) as u8;
+    }
+}
+
+/// `uint8 * 0.8` truncated back to a byte.
+fn scaled(q: u8) -> u8 {
+    (f64::from(q) * 0.8) as u8
 }

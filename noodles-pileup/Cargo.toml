@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 noodles-bam = { path = "../noodles-bam" }
+rustc-hash = "2.1.3"
 
 [lints]
 workspace = true

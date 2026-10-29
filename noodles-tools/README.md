@@ -163,11 +163,11 @@ libdeflate. "short" is 1M synthetic 150 bp paired reads, "tagged" 250k reads wit
 | stats, short | 1.659 | 1.142 | 1.45x |
 | stats, short, -@4 | 1.581 | 0.727 | 2.17x |
 | stats, long, -@8 | 5.699 | 1.577 | 3.61x |
-| mpileup, short | 2.880 | 3.020 | 0.95x |
-| mpileup -f (BAQ), short, -@8 | 27.771 | 4.413 | 6.29x |
-| calmd -b, short, -@4 | 0.697 | 0.644 | 1.08x |
-| calmd -r -A -b (BAQ), short, -@8 | 26.236 | 4.643 | 5.65x |
-| mpileup -M (base modifications), long | 16.360 | 11.130 | 1.47x |
+| mpileup, short | 2.899 | 2.529 | 1.15x |
+| mpileup -f (BAQ), short, -@8 | 27.788 | 4.365 | 6.37x |
+| calmd -b, short, -@4 | 0.687 | 0.643 | 1.07x |
+| calmd -r -A -b (BAQ), short, -@8 | 26.262 | 4.617 | 5.69x |
+| mpileup -M (base modifications), long | 16.429 | 10.986 | 1.50x |
 | ampliconclip, short | 3.048 | 1.792 | 1.70x |
 | ampliconclip --both-ends, short, -@4 | 0.809 | 0.395 | 2.05x |
 | coverage, short | 1.145 | 0.413 | 2.77x |
@@ -210,4 +210,7 @@ ntools relies on these changes to the noodles crates, which downstream tools get
   as `cram-size`.
 - New crate `noodles-pileup`: HTSlib-compatible pileup (`bam_plp`), BAQ, mapping quality capping,
   MD/NM calculation, and MM/ML base modifications over encoded BAM records, which `mpileup` and
-  `calmd` use.
+  `calmd` use. Positions inside a CIGAR operation are resolved from a cached
+  cursor without reading the CIGAR, the per-position scan reads a compact array rather than the
+  buffered records, and overlapping mates' qualities are combined in lockstep along shared match
+  operations.
