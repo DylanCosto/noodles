@@ -228,6 +228,36 @@ impl AsRef<[u8]> for Record {
     }
 }
 
+/// Creates a record from encoded bytes, excluding the leading `block_size`.
+///
+/// This is the inverse of [`AsRef<[u8]>`](#impl-AsRef%3C%5Bu8%5D%3E-for-Record), e.g., for records
+/// held as raw bytes while sorting.
+///
+/// # Errors
+///
+/// Returns an error if the buffer is too short for the field lengths it declares.
+///
+/// # Examples
+///
+/// ```
+/// use noodles_bam as bam;
+///
+/// let src = bam::Record::default().as_ref().to_vec();
+/// let record = bam::Record::try_from(src)?;
+/// assert_eq!(record, bam::Record::default());
+///
+/// assert!(bam::Record::try_from(vec![0; 8]).is_err());
+/// # Ok::<_, std::io::Error>(())
+/// ```
+impl TryFrom<Vec<u8>> for Record {
+    type Error = io::Error;
+
+    fn try_from(buf: Vec<u8>) -> Result<Self, Self::Error> {
+        crate::io::reader::record::validate(&buf)?;
+        Ok(Self(buf))
+    }
+}
+
 impl fmt::Debug for Record {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Record")
