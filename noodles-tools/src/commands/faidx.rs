@@ -1,6 +1,7 @@
 //! `ntools faidx`: index a FASTA file or extract regions from it (samtools faidx).
 
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::{self, BufWriter, Write},
     num::NonZero,
@@ -56,9 +57,21 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         return build_index(&args.input);
     }
 
-    let mut reader = fasta::io::indexed_reader::Builder::default()
-        .build_from_path(&args.input)
-        .with_context(|| format!("opening {} (is it indexed?)", args.input.display()))?;
+    let index = fasta::fs::read_associated_index(&args.input).with_context(|| {
+        format!(
+            "reading the index of {} (is it indexed?)",
+            args.input.display()
+        )
+    })?;
+
+    let records: HashMap<&[u8], &fai::Record> = index
+        .as_ref()
+        .iter()
+        .map(|record| (record.name().as_ref(), record))
+        .collect();
+
+    let file =
+        File::open(&args.input).with_context(|| format!("opening {}", args.input.display()))?;
 
     let sink: Box<dyn Write> = match &args.output {
         Some(path) => {
@@ -68,6 +81,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     };
     let mut writer = BufWriter::new(sink);
 
+    let mut raw = Vec::new();
     let mut sequence = Vec::new();
 
     for raw_region in &regions {
@@ -75,12 +89,24 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .parse()
             .with_context(|| format!("invalid region: {raw_region}"))?;
 
-        let record = reader
-            .query(&region)
-            .with_context(|| format!("retrieving {raw_region}"))?;
+        let name: &[u8] = region.name().as_ref();
+        let record = *records
+            .get(name)
+            .with_context(|| format!("{} is not in the index", region.name()))?;
 
-        sequence.clear();
-        sequence.extend_from_slice(record.sequence().as_ref());
+        let length = usize::try_from(record.length()).context("sequence length overflows usize")?;
+        let interval = region.interval();
+        let start = interval.start().map_or(1, usize::from);
+        let requested_end = interval.end().map(usize::from);
+
+        if requested_end.is_some_and(|end| end > length) {
+            eprintln!("[faidx] Truncated sequence: {raw_region}");
+        }
+
+        let end = requested_end.unwrap_or(length).min(length);
+
+        read_bases(&file, record, start, end, &mut raw, &mut sequence)
+            .with_context(|| format!("retrieving {raw_region}"))?;
 
         if args.reverse_complement {
             reverse_complement(&mut sequence);
@@ -89,17 +115,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             writeln!(writer, ">{raw_region}")?;
         }
 
-        let index_record = index_record(reader.index(), &region)?;
-
-        if region.interval().end().is_some_and(|end| {
-            u64::try_from(usize::from(end)).is_ok_and(|end| end > index_record.length())
-        }) {
-            eprintln!("[faidx] Truncated sequence: {raw_region}");
-        }
-
         let line_width = match args.line_width {
             Some(n) => n.get(),
-            None => usize::try_from(index_record.line_base_count().get())
+            None => usize::try_from(record.line_base_count().get())
                 .context("line width overflows usize")?,
         };
 
@@ -114,12 +132,58 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn index_record<'i>(index: &'i fai::Index, region: &Region) -> anyhow::Result<&'i fai::Record> {
-    index
-        .as_ref()
-        .iter()
-        .find(|record| record.name() == region.name())
-        .with_context(|| format!("{} is not in the index", region.name()))
+/// Reads the bases of the 1-based closed interval `[start, end]` into `sequence`, reading the
+/// whole span at once and dropping line endings, as samtools does.
+fn read_bases(
+    file: &File,
+    record: &fai::Record,
+    start: usize,
+    end: usize,
+    raw: &mut Vec<u8>,
+    sequence: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    sequence.clear();
+
+    if start > end || start == 0 {
+        return Ok(());
+    }
+
+    let line_bases = record.line_base_count().get();
+    let line_width = record.line_width().get();
+
+    // The file offset of the base at a 0-based position.
+    let offset = |position: u64| {
+        record.position() + position / line_bases * line_width + position % line_bases
+    };
+
+    let first = offset(u64::try_from(start - 1)?);
+    let last = offset(u64::try_from(end - 1)?);
+    let len = usize::try_from(last - first + 1)?;
+
+    raw.resize(len, 0);
+    read_exact_at(file, raw, first)?;
+
+    // Copy whole lines between line endings rather than filtering byte by byte.
+    for line in raw.split(|&b| b == b'\n') {
+        sequence.extend_from_slice(line.strip_suffix(b"\r").unwrap_or(line));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(not(unix))]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = file;
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(buf)
 }
 
 fn build_index(src: &Path) -> anyhow::Result<()> {
