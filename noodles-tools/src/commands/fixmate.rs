@@ -3,14 +3,16 @@
 //! This follows `bam_mating_core` and `bam_sanitize` in samtools 1.24 step by step, including
 //! the order in which tags are replaced.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf, thread};
 
 use anyhow::{Context, bail};
 use bstr::BString;
 use noodles_core::Position;
 use noodles_sam::{
+    self as sam,
     alignment::{
         RecordBuf,
+        io::Write as _,
         record::{
             Flags, MappingQuality,
             cigar::{Op, op::Kind},
@@ -198,6 +200,22 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .map(|rs| rs.length().get())
         .collect();
 
+    if args.threads > 0
+        && matches!(reader, AlignmentReader::Bam(_))
+        && writer.preformatted_kind() == Some(OutputFormat::Bam)
+    {
+        let config = BatchConfig {
+            header: &header,
+            lengths: &lengths,
+            sanitize,
+            options,
+        };
+
+        fix_in_parallel(&mut reader, &config, args.threads, &mut writer)?;
+        writer.finish(&header)?;
+        return Ok(());
+    }
+
     let mut template: Vec<RecordBuf> = Vec::new();
     let mut framed = Vec::new();
 
@@ -251,6 +269,163 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     writer.finish(&header)?;
 
     Ok(())
+}
+
+/// Raw record bytes per batch sent to a worker.
+const BATCH_CAPACITY: usize = 1 << 20;
+
+/// What a worker needs to fix a batch of templates.
+struct BatchConfig<'a> {
+    header: &'a sam::Header,
+    lengths: &'a [usize],
+    sanitize: Sanitize,
+    options: Options,
+}
+
+/// Fixes templates on `threads` workers: this thread batches raw records at template
+/// boundaries, workers decode, fix, and re-encode them, and a writer thread writes batches in
+/// input order.
+fn fix_in_parallel(
+    reader: &mut AlignmentReader,
+    config: &BatchConfig<'_>,
+    threads: usize,
+    writer: &mut AlignmentWriter,
+) -> anyhow::Result<()> {
+    let header = config.header;
+
+    thread::scope(|scope| {
+        let (work_tx, work_rx) = crossbeam_channel::bounded::<(u64, Vec<u8>)>(threads * 2);
+        let (done_tx, done_rx) =
+            crossbeam_channel::bounded::<(u64, anyhow::Result<Vec<u8>>)>(threads * 2);
+
+        for _ in 0..threads {
+            let work_rx = work_rx.clone();
+            let done_tx = done_tx.clone();
+
+            scope.spawn(move || {
+                for (id, batch) in work_rx {
+                    let result = fix_batch(&batch, config);
+
+                    if done_tx.send((id, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        drop(work_rx);
+        drop(done_tx);
+
+        let write = scope.spawn(move || -> anyhow::Result<()> {
+            let mut pending = BTreeMap::new();
+            let mut next = 0;
+
+            for (id, result) in done_rx {
+                pending.insert(id, result?);
+
+                while let Some(records) = pending.remove(&next) {
+                    writer.write_bam_records(&records)?;
+                    next += 1;
+                }
+            }
+
+            Ok(())
+        });
+
+        let mut batch = Vec::with_capacity(BATCH_CAPACITY);
+        let mut last_name = Vec::new();
+        let mut id = 0;
+
+        let produced = reader.for_each(header, |record| {
+            let crate::alignment::Rec::Bam(record) = record else {
+                bail!("parallel fixmate needs BAM input");
+            };
+
+            let raw = record.as_ref();
+            let name = crate::sort_order::name(raw);
+
+            // Batches end only between templates.
+            if batch.len() >= BATCH_CAPACITY && name != last_name.as_slice() {
+                let full = std::mem::replace(&mut batch, Vec::with_capacity(BATCH_CAPACITY));
+                work_tx
+                    .send((id, full))
+                    .map_err(|_| anyhow::anyhow!("fixmate writer stopped"))?;
+                id += 1;
+            }
+
+            last_name.clear();
+            last_name.extend_from_slice(name);
+            crate::runs::write_raw_record(&mut batch, raw)?;
+
+            Ok(())
+        });
+
+        let sent = match produced {
+            Ok(()) if !batch.is_empty() => work_tx
+                .send((id, batch))
+                .map_err(|_| anyhow::anyhow!("fixmate writer stopped")),
+            other => other,
+        };
+
+        drop(work_tx);
+
+        let written = write
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixmate writer thread panicked"))?;
+
+        // A writer error explains a failed send, so report it first.
+        written.and(sent)
+    })
+}
+
+/// Decodes, fixes, and re-encodes the templates of one batch.
+fn fix_batch(batch: &[u8], config: &BatchConfig<'_>) -> anyhow::Result<Vec<u8>> {
+    let mut reader = noodles_bam::io::Reader::from(batch);
+    let mut encoder = noodles_bam::io::Writer::from(Vec::with_capacity(batch.len()));
+    let mut template: Vec<RecordBuf> = Vec::new();
+
+    let mut flush = |template: &mut Vec<RecordBuf>| -> anyhow::Result<()> {
+        fix_template(template, config.options)?;
+
+        for record in template.iter() {
+            let removed = config.options.remove_reads
+                && record
+                    .flags()
+                    .intersects(Flags::SECONDARY | Flags::UNMAPPED);
+
+            if !removed {
+                encoder.write_alignment_record(config.header, record)?;
+            }
+        }
+
+        template.clear();
+        Ok(())
+    };
+
+    loop {
+        let mut record = RecordBuf::default();
+
+        if reader.read_record_buf(config.header, &mut record)? == 0 {
+            break;
+        }
+
+        sanitize_record(&mut record, config.lengths, config.sanitize)?;
+
+        if template
+            .first()
+            .is_some_and(|first| first.name() != record.name())
+        {
+            flush(&mut template)?;
+        }
+
+        template.push(record);
+    }
+
+    if !template.is_empty() {
+        flush(&mut template)?;
+    }
+
+    Ok(encoder.into_inner())
 }
 
 /// The 0-based position, or -1.
