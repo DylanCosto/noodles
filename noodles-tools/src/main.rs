@@ -9,6 +9,7 @@ mod commands;
 mod depth;
 mod filter;
 mod flags;
+mod hts_region;
 mod khash;
 mod output;
 mod parallel_cram;
@@ -45,6 +46,8 @@ enum Command {
     Index(commands::index::Args),
     /// Index a FASTA file or extract regions from it.
     Faidx(commands::faidx::Args),
+    /// Index a FASTQ file or extract regions from it.
+    Fqidx(commands::faidx::Args),
     /// Sort alignments by coordinate or read name.
     Sort(commands::sort::Args),
     /// Merge sorted BAM files.
@@ -110,7 +113,8 @@ fn main() -> ExitCode {
         Command::Flagstat(args) => commands::flagstat::run(args).map(|()| ExitCode::SUCCESS),
         Command::Idxstats(args) => commands::idxstats::run(args).map(|()| ExitCode::SUCCESS),
         Command::Index(args) => commands::index::run(args).map(|()| ExitCode::SUCCESS),
-        Command::Faidx(args) => commands::faidx::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Faidx(args) => commands::faidx::run(args),
+        Command::Fqidx(args) => commands::faidx::run_fqidx(args),
         Command::Sort(args) => commands::sort::run(args).map(|()| ExitCode::SUCCESS),
         Command::Merge(args) => commands::merge::run(args).map(|()| ExitCode::SUCCESS),
         Command::Fastq(args) => commands::fastq::run(args, commands::fastq::ReadFormat::Fastq)

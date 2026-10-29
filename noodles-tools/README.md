@@ -21,7 +21,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `sort` | `sort` | coordinate, `-n` (natural), `-N` (bytewise); `-m`, `-T`, `-@`; stable, like samtools |
 | `merge` | `merge -c -p` | BAM inputs; reference dictionaries are merged and IDs translated |
 | `index` | `index` | BAI (default) or CSI (`-c`) for BAM; CRAI for CRAM |
-| `faidx` | `faidx` | build `.fai`; extract regions (`-r`, `-n`, `-i`, `-o`) |
+| `faidx`, `fqidx` | `faidx`, `fqidx` | FASTA and FASTQ, plain or BGZF (`.fai` and `.gzi` as HTSlib builds them); regions as HTSlib parses them (`{name}` quoting, `1,000`, `2k`), `-r`, `-o` (BGZF for `.gz`), `-n`, `-c`, `-i`, `--mark-strand`, `--fai-idx/--gzi-idx`, `--write-index`, `-f` |
 | `flagstat` | `flagstat` | default, `-O tsv`, `-O json` |
 | `idxstats` | `idxstats` | from BAM index metadata; scans CRAM/SAM |
 | `depth` | `depth` | `-a/-aa`, `-r`, `-b`, `-J`, `-q/-Q`, `-g/-G`, `-l`, `-H`, several inputs |

@@ -158,6 +158,26 @@ cp "$corpus/fragmented-reference.fa" frag.fa
 "$nt" faidx frag.fa
 check "faidx index" "cat expected.fai" "cat frag.fa.fai"
 check "faidx regions" "$st faidx -r $corpus/fasta-regions.1024.txt frag.fa" "$nt faidx -r $corpus/fasta-regions.1024.txt frag.fa"
+check "faidx -i -n 25 --mark-strand sign -c" "$st faidx -i -n 25 --mark-strand sign -c frag.fa nope $(head -1 frag.fa.fai | cut -f1):5-300" "$nt faidx -i -n 25 --mark-strand sign -c frag.fa nope $(head -1 frag.fa.fai | cut -f1):5-300"
+bgzip=$(dirname "$st")/bgzip
+if [ -x "$bgzip" ]; then
+    "$bgzip" -c frag.fa > frag.fa.gz
+    "$st" faidx frag.fa.gz && mv frag.fa.gz.fai expected.gz.fai && mv frag.fa.gz.gzi expected.gzi
+    "$nt" faidx frag.fa.gz
+    check "faidx index (bgzip)" "cat expected.gz.fai expected.gzi" "cat frag.fa.gz.fai frag.fa.gz.gzi"
+    check "faidx regions (bgzip)" "$st faidx -r $corpus/fasta-regions.1024.txt frag.fa.gz" "$nt faidx -r $corpus/fasta-regions.1024.txt frag.fa.gz"
+fi
+
+# fqidx, on FASTQ written by samtools fastq (single-line) and a multi-line FASTQ
+"$st" fastq "$tagged" 2>/dev/null | head -40000 > fq.fq
+awk 'NR % 4 == 1 { print; next } NR % 4 == 3 { print "+"; next } { while (length($0) > 60) { print substr($0, 1, 60); $0 = substr($0, 61) } print }' fq.fq > fqml.fq
+for f in fq.fq fqml.fq; do
+    "$st" fqidx $f && mv $f.fai expected.fq.fai
+    "$nt" fqidx $f
+    check "fqidx index $f" "cat expected.fq.fai" "cat $f.fai"
+    names=$(awk 'NR % 997 == 1 { printf "%s ", $1 } NR % 1999 == 1 { printf "%s:5-90 ", $1 }' $f.fai)
+    check "fqidx regions $f -i" "$st fqidx -i $f $names" "$nt fqidx -i $f $names"
+done
 "$nt" index -o ntools.bai "$short"
 check "index BAI queries" "$st view --no-PG -X $short $corpus/short/input.bam.bai $regions" "$st view --no-PG -X $short ntools.bai $regions"
 
