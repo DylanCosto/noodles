@@ -1,9 +1,6 @@
 //! Formatting pileup columns.
 
-use std::{
-    io::{self, Write},
-    sync::Arc,
-};
+use std::io::{self, Write};
 
 use noodles_pileup as pileup;
 use noodles_pileup::{Entry, Pileup, Read, baq::SEQ_NT16_TABLE, mods::BaseMods};
@@ -22,7 +19,7 @@ pub(super) fn write_empty<W: Write>(
     name: &[u8],
     pos: i64,
     n: usize,
-    reference: &Option<Arc<Vec<u8>>>,
+    reference: Option<&[u8]>,
 ) -> io::Result<()> {
     line.clear();
     line.extend_from_slice(name);
@@ -72,24 +69,31 @@ pub(super) fn base_quality(read: &Read, entry: &Entry) -> i32 {
     }
 }
 
-/// The columns of one input at one position.
+/// The columns of one input at one position; `pileup` is `None` for an input without reads
+/// there.
 #[expect(clippy::too_many_arguments, reason = "the line's context")]
 pub(super) fn write_sample(
     line: &mut Vec<u8>,
-    pileup: &mut Pileup,
-    active: bool,
+    pileup: Option<&mut Pileup>,
     options: &OutputOptions,
     names: &[Vec<u8>],
     pos: i64,
-    reference: &Option<Arc<Vec<u8>>>,
+    reference: Option<&[u8]>,
     seq: &mut Vec<u8>,
     qual: &mut Vec<u8>,
     ins: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
     seq.clear();
     qual.clear();
+
+    let Some(pileup) = pileup else {
+        line.extend_from_slice(b"\t0\t*\t*");
+        push_empty_columns(line, options);
+        return Ok(());
+    };
+
     let mut cnt = 0i64;
-    let n_entries = if active { pileup.entries().len() } else { 0 };
+    let n_entries = pileup.entries().len();
 
     if options.mods == Mods::None {
         for entry in &pileup.entries()[..n_entries] {
@@ -278,7 +282,7 @@ pub(super) fn push_base(
     mut mods: Option<&mut BaseMods>,
     entry: &Entry,
     pos: i64,
-    reference: &Option<Arc<Vec<u8>>>,
+    reference: Option<&[u8]>,
     options: &OutputOptions,
     ins: &mut Vec<u8>,
 ) -> anyhow::Result<()> {

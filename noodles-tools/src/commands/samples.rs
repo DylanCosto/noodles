@@ -17,6 +17,13 @@ use crate::{
     khash::StringSet,
 };
 
+/// Whether an input has an index (`-i`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndexStatus {
+    Found,
+    Missing,
+}
+
 #[derive(Debug, clap::Args)]
 #[command(disable_help_flag = true)]
 pub struct Args {
@@ -185,10 +192,17 @@ impl Lister<'_> {
             .read_header()
             .with_context(|| format!("[samples] Failed to read the header from \"{path}\""))?;
 
-        let has_index = self.test_index
-            && local.as_deref().is_some_and(|local| {
+        let index_status = self.test_index.then(|| {
+            let found = local.as_deref().is_some_and(|local| {
                 AlignmentIndex::read(reader.format(), local, index.map(Path::new)).is_ok()
             });
+
+            if found {
+                IndexStatus::Found
+            } else {
+                IndexStatus::Missing
+            }
+        });
 
         let mut samples = StringSet::new();
 
@@ -210,10 +224,10 @@ impl Lister<'_> {
         let reference = self.reference_for(&header);
 
         if samples.is_empty() {
-            self.print_sample(out, b".", path, has_index, reference)?;
+            self.print_sample(out, b".", path, index_status, reference)?;
         } else {
             for sample in samples.iter() {
-                self.print_sample(out, sample, path, has_index, reference)?;
+                self.print_sample(out, sample, path, index_status, reference)?;
             }
         }
 
@@ -225,14 +239,16 @@ impl Lister<'_> {
         out: &mut W,
         sample: &[u8],
         path: &str,
-        has_index: bool,
+        index_status: Option<IndexStatus>,
         reference: Option<&Reference>,
     ) -> io::Result<()> {
         out.write_all(sample)?;
         write!(out, "\t{path}")?;
 
-        if self.test_index {
-            write!(out, "\t{}", if has_index { 'Y' } else { 'N' })?;
+        match index_status {
+            Some(IndexStatus::Found) => out.write_all(b"\tY")?,
+            Some(IndexStatus::Missing) => out.write_all(b"\tN")?,
+            None => {}
         }
 
         if !self.references.is_empty() {

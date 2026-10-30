@@ -381,12 +381,7 @@ fn local_nm(p: &Entry, pos: i32) -> (f64, i32) {
 }
 
 /// `calculate_consensus_gap5`
-fn consensus_gap5(
-    column: &Column<'_>,
-    use_mqual: bool,
-    opts: &CallerOptions,
-    cp: &ConsProbs,
-) -> Cons {
+fn consensus_gap5(column: &Column<'_>, opts: &CallerOptions, cp: &ConsProbs) -> Cons {
     let min_e_exp = f64::from(f64::MIN_EXP) * 2f64.ln() + 1.0;
 
     let mut s = [0.0f64; 15];
@@ -415,7 +410,7 @@ fn consensus_gap5(
         let base = NT16_TO_ACGT[(p.base4 & 31) as usize];
         let (nm, poly) = local_nm(p, p.seq_offset + 1);
 
-        if use_mqual {
+        if opts.use_mqual {
             let mut mqual = f64::from(p.mapq);
 
             if opts.nm_adjust {
@@ -635,7 +630,6 @@ fn consensus_gap5(
 /// parameters in mixed mode.
 fn consensus_gap5m(
     column: &Column<'_>,
-    use_mqual: bool,
     opts: &CallerOptions,
     cp_r: &ConsProbs,
     cp_p: &ConsProbs,
@@ -646,11 +640,11 @@ fn consensus_gap5m(
         } else {
             cp_r
         };
-        return consensus_gap5(column, use_mqual, opts, cp);
+        return consensus_gap5(column, opts, cp);
     }
 
-    let cons_p = consensus_gap5(column, use_mqual, opts, cp_p);
-    let mut cons_r = consensus_gap5(column, use_mqual, opts, cp_r);
+    let cons_p = consensus_gap5(column, opts, cp_p);
+    let mut cons_r = consensus_gap5(column, opts, cp_r);
 
     let mut cons = cons_p;
 
@@ -797,7 +791,7 @@ impl Caller {
             return consensus_simple(column, opts);
         }
 
-        let cons = consensus_gap5m(column, opts.use_mqual, opts, &self.recall, &self.precise);
+        let cons = consensus_gap5m(column, opts, &self.recall, &self.precise);
 
         let (mut cb, mut cq);
 

@@ -40,7 +40,13 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let mut failed = false;
 
     for path in &args.inputs {
-        if let Err(e) = check(path, args.unmapped) {
+        let targets = if args.unmapped {
+            Targets::Optional
+        } else {
+            Targets::Required
+        };
+
+        if let Err(e) = check(path, targets) {
             failed = true;
 
             if args.verbose > 0 {
@@ -62,7 +68,15 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     })
 }
 
-fn check(path: &std::path::Path, unmapped: bool) -> anyhow::Result<()> {
+/// Whether a file must have reference sequences (`@SQ` lines).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Targets {
+    Required,
+    /// `-u`: the file may be unmapped.
+    Optional,
+}
+
+fn check(path: &std::path::Path, targets: Targets) -> anyhow::Result<()> {
     let src = path.to_str().context("path is not valid UTF-8")?;
     let input = Input::open(src)?;
     let format = input.format;
@@ -70,7 +84,7 @@ fn check(path: &std::path::Path, unmapped: bool) -> anyhow::Result<()> {
     let mut reader = AlignmentReader::from_input(input, &ReadOptions::default())?;
     let header = reader.read_header()?;
 
-    if !unmapped && header.reference_sequences().is_empty() {
+    if targets == Targets::Required && header.reference_sequences().is_empty() {
         anyhow::bail!("no @SQ lines in the header");
     }
 

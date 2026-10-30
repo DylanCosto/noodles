@@ -185,6 +185,15 @@ struct Info {
     reference_lengths: Vec<u64>,
     /// Threads for per-cycle counts.
     workers: usize,
+    insert_size_rows: InsertSizeRows,
+}
+
+/// Which insert sizes the report lists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InsertSizeRows {
+    All,
+    /// Only insert sizes with pairs (`-x`).
+    WithPairs,
 }
 
 /// `gc_depth_t`
@@ -535,6 +544,11 @@ pub fn run(mut args: Args) -> anyhow::Result<()> {
             .map(|rs| rs.length().get() as u64)
             .collect(),
         workers: args.threads,
+        insert_size_rows: if args.sparse {
+            InsertSizeRows::WithPairs
+        } else {
+            InsertSizeRows::All
+        },
     };
 
     let mut all = Stats::new(
@@ -644,7 +658,7 @@ pub fn run(mut args: Args) -> anyhow::Result<()> {
         .join(" ");
 
     let mut out = BufWriter::new(output::raw_stdout()?);
-    all.output(&mut out, &info, &command_line, None, args.sparse)?;
+    all.output(&mut out, &info, &command_line, None)?;
     out.flush()?;
 
     for (name, mut stats) in splits {
@@ -655,13 +669,7 @@ pub fn run(mut args: Args) -> anyhow::Result<()> {
         let file =
             File::create(&path).with_context(|| format!("Could not open '{path}' for writing."))?;
         let mut out = BufWriter::new(file);
-        stats.output(
-            &mut out,
-            &info,
-            &command_line,
-            args.split_tag.as_deref(),
-            args.sparse,
-        )?;
+        stats.output(&mut out, &info, &command_line, args.split_tag.as_deref())?;
         out.flush()?;
     }
 

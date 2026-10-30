@@ -182,10 +182,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let filter = filter;
 
     let remove_tags = parse_tags(&args.remove_tags)?;
-    let can_parallelize = matches!(traversal, Traversal::All)
+    let decoding = if matches!(traversal, Traversal::All)
         && args.threads > 0
         && remove_tags.is_empty()
-        && args.unselected_output.is_none();
+        && args.unselected_output.is_none()
+    {
+        Decoding::Parallel
+    } else {
+        Decoding::Serial
+    };
 
     if args.count {
         let n = count(
@@ -195,7 +200,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             &header,
             &traversal,
             &filter,
-            can_parallelize,
+            decoding,
         )?;
         writeln!(io::stdout().lock(), "{n}")?;
         return Ok(());
@@ -242,8 +247,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     if !args.header_only {
         let parallel_kind = writer.preformatted_kind();
 
-        if let (AlignmentReader::Cram(cram_reader, repository, _), true, Some(kind)) =
-            (&mut reader, can_parallelize, parallel_kind)
+        if let (AlignmentReader::Cram(cram_reader, repository, _), Decoding::Parallel, Some(kind)) =
+            (&mut reader, decoding, parallel_kind)
         {
             write_cram_in_parallel(
                 cram_reader,
@@ -376,6 +381,13 @@ fn has_index(path: &Path) -> bool {
     }) || path.with_extension("bai").exists()
 }
 
+/// Whether CRAM containers are decoded on worker threads (whole-file reads with `-@`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Decoding {
+    Serial,
+    Parallel,
+}
+
 fn count(
     reader: &mut AlignmentReader,
     path: Option<&Path>,
@@ -383,12 +395,12 @@ fn count(
     header: &sam::Header,
     traversal: &Traversal,
     filter: &Filter,
-    can_parallelize: bool,
+    decoding: Decoding,
 ) -> anyhow::Result<u64> {
     let mut n = 0u64;
 
-    if let (AlignmentReader::Cram(cram_reader, repository, _), true) =
-        (&mut *reader, can_parallelize)
+    if let (AlignmentReader::Cram(cram_reader, repository, _), Decoding::Parallel) =
+        (&mut *reader, decoding)
     {
         parallel_cram::decode(
             cram_reader,

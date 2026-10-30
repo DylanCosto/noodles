@@ -11,6 +11,26 @@ static COMPLEMENTS: [u8; 256] = {
     table
 };
 
+/// The strand of a read, or a primer, relative to the reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Strand {
+    Forward,
+    Reverse,
+}
+
+impl Strand {
+    /// The strand of a record with these BAM flags.
+    pub fn of_flags(flags: u16) -> Self {
+        const REVERSE_COMPLEMENTED: u16 = 0x10;
+
+        if flags & REVERSE_COMPLEMENTED != 0 {
+            Self::Reverse
+        } else {
+            Self::Forward
+        }
+    }
+}
+
 /// Reverse complements IUPAC nucleotides in place, preserving case, as samtools does.
 pub fn reverse_complement(sequence: &mut [u8]) {
     sequence.reverse();

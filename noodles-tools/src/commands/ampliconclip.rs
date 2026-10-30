@@ -23,6 +23,7 @@ use crate::{
     bam_raw::{self, le_u16, le_u32},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     program,
+    sequence::Strand,
 };
 
 const CIGAR_SOFT_CLIP: u32 = 4;
@@ -144,7 +145,8 @@ struct Region {
     right: i64,
     name: Option<String>,
     score: Option<String>,
-    reverse: bool,
+    /// The primer's strand, unless strands are ignored.
+    strand: Option<Strand>,
     reads: i64,
 }
 
@@ -185,7 +187,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         args.tolerance
     };
 
-    let (names, mut beds) = read_bed(&args.bed, args.strand)
+    let strand_column = if args.strand {
+        StrandColumn::Required
+    } else {
+        StrandColumn::Ignored
+    };
+    let (names, mut beds) = read_bed(&args.bed, strand_column)
         .context("[ampliconclip] error: unable to load bed file.")?;
 
     let read_options = ReadOptions {
@@ -239,7 +246,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let options = ClipOptions {
         clipping,
         tolerance,
-        use_strand: args.strand,
         original: args.original,
         delete_tags: !args.keep_tag,
         reference_names: names_by_id,
@@ -250,7 +256,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut last_tid = None;
     let mut sites: Option<usize> = None;
 
-    reader.for_each(&header.clone(), |rec| {
+    let header = header;
+
+    reader.for_each(&header, |rec| {
         let mut raw: Vec<u8> = rec.encode_raw(&header, &mut encoder)?.to_vec();
 
         counts.reads += 1;
@@ -368,10 +376,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
         for (name, regions) in names.iter().zip(&beds) {
             for region in &regions.regions {
-                let strand = match (args.strand, region.reverse) {
-                    (false, _) => ".",
-                    (true, true) => "-",
-                    (true, false) => "+",
+                let strand = match region.strand {
+                    None => ".",
+                    Some(Strand::Reverse) => "-",
+                    Some(Strand::Forward) => "+",
                 };
 
                 // glibc prints NULL strings as "(null)".
@@ -404,7 +412,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 struct ClipOptions {
     clipping: Clipping,
     tolerance: i64,
-    use_strand: bool,
     original: bool,
     delete_tags: bool,
     /// Reference sequence names by ID, for `OA` tags.
@@ -421,27 +428,29 @@ fn clip_five_prime(
     let original = options
         .original
         .then(|| original_alignment(raw, &options.reference_names));
-    let reverse = le_u16(&raw[14..16]) & FLAG_REVERSE != 0;
+    let strand = Strand::of_flags(le_u16(&raw[14..16]));
 
-    let pos = if reverse {
-        end_position(raw)
-    } else {
-        position(raw)
+    let pos = match strand {
+        Strand::Forward => position(raw),
+        Strand::Reverse => end_position(raw),
     };
 
-    let size = matching_clip_site(regions, pos, reverse, options);
+    let size = matching_clip_site(regions, pos, strand, options);
 
     if size == 0 {
         counts.not_clipped += 1;
         return Ok(false);
     }
 
-    if reverse {
-        *raw = trim_right(raw, size as u32, options.clipping);
-        counts.reverse += 1;
-    } else {
-        *raw = trim_left(raw, size as u32, options.clipping);
-        counts.forward += 1;
+    match strand {
+        Strand::Forward => {
+            *raw = trim_left(raw, size as u32, options.clipping);
+            counts.forward += 1;
+        }
+        Strand::Reverse => {
+            *raw = trim_right(raw, size as u32, options.clipping);
+            counts.reverse += 1;
+        }
     }
 
     finish_clipped(raw, original.as_deref(), options)?;
@@ -459,7 +468,7 @@ fn clip_both_ends(
         .original
         .then(|| original_alignment(raw, &options.reference_names));
 
-    let size = matching_clip_site(regions, position(raw), false, options);
+    let size = matching_clip_site(regions, position(raw), Strand::Forward, options);
     let left = size > 0;
 
     if left {
@@ -467,7 +476,7 @@ fn clip_both_ends(
         counts.forward += 1;
     }
 
-    let size = matching_clip_site(regions, end_position(raw), true, options);
+    let size = matching_clip_site(regions, end_position(raw), Strand::Reverse, options);
     let right = size > 0;
 
     if right {
@@ -510,13 +519,15 @@ fn finish_clipped(
 }
 
 /// `matching_clip_site`: the length to clip for the longest region the read's end falls in
-/// (within the tolerance), or 0; counts the read against that region.
+/// (within the tolerance), or 0; counts the read against that region. `strand` is the end of the
+/// read: the start for [`Strand::Forward`] and the end for [`Strand::Reverse`].
 fn matching_clip_site(
     regions: &mut Regions,
     pos: i64,
-    reverse: bool,
+    strand: Strand,
     options: &ClipOptions,
 ) -> i64 {
+    let reverse = strand == Strand::Reverse;
     let tol = options.tolerance;
     let sites = &mut regions.regions;
     let longest = regions.longest;
@@ -545,7 +556,7 @@ fn matching_clip_site(
     let mut used = None;
 
     for (i, site) in sites.iter().enumerate().skip(l) {
-        if options.use_strand && reverse != site.reverse {
+        if site.strand.is_some_and(|s| s != strand) {
             continue;
         }
 
@@ -982,7 +993,18 @@ fn set_unknown_order(header: &mut sam::Header) {
 
 /// `load_bed_file_multi_ref`: regions by reference, in the order references first appear, each
 /// sorted by end.
-fn read_bed(path: &PathBuf, use_strand: bool) -> anyhow::Result<(Vec<String>, Vec<Regions>)> {
+/// Whether [`read_bed`] reads primer strands from the sixth column.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrandColumn {
+    Ignored,
+    Required,
+}
+
+fn read_bed(
+    path: &PathBuf,
+    strand_column: StrandColumn,
+) -> anyhow::Result<(Vec<String>, Vec<Regions>)> {
+    let use_strand = strand_column == StrandColumn::Required;
     let file = File::open(path)
         .with_context(|| format!("[amplicon] unable to open file {}.", path.display()))?;
 
@@ -1018,10 +1040,10 @@ fn read_bed(path: &PathBuf, use_strand: bool) -> anyhow::Result<(Vec<String>, Ve
             );
         }
 
-        let reverse = if use_strand {
+        let strand = if use_strand {
             match fields.strand {
-                Some('+') => false,
-                Some('-') => true,
+                Some('+') => Some(Strand::Forward),
+                Some('-') => Some(Strand::Reverse),
                 c => bail!(
                     "[amplicon] error: bad strand value in line {}, expecting '+' or '-', found '{}'.",
                     n + 1,
@@ -1029,7 +1051,7 @@ fn read_bed(path: &PathBuf, use_strand: bool) -> anyhow::Result<(Vec<String>, Ve
                 ),
             }
         } else {
-            false
+            None
         };
 
         let i = match names.iter().position(|name| *name == fields.reference) {
@@ -1048,7 +1070,7 @@ fn read_bed(path: &PathBuf, use_strand: bool) -> anyhow::Result<(Vec<String>, Ve
             right: fields.right,
             name: (columns >= 4).then(|| fields.name.clone()),
             score: (columns >= 5).then(|| fields.score.clone()),
-            reverse,
+            strand,
             reads: 0,
         });
     }

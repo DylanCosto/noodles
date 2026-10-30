@@ -175,7 +175,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     io::copy(reader.get_mut(), &mut io::sink())?;
     let file_size = reader.get_ref().get_ref().count;
 
-    let compressed_size = stats.write_report(&mut out, args.verbose)?;
+    let detail = if args.verbose {
+        Detail::PerMethod
+    } else {
+        Detail::Summary
+    };
+    let compressed_size = stats.write_report(&mut out, detail)?;
 
     writeln!(out)?;
     writeln!(out, "Number of containers  {:18}", stats.containers)?;
@@ -192,6 +197,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     out.flush()?;
 
     Ok(())
+}
+
+/// How the report breaks down each content ID's sizes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Detail {
+    /// One row, with the methods used as characters.
+    Summary,
+    /// A row per method (`-v`).
+    PerMethod,
 }
 
 /// A reader that counts the bytes read through it.
@@ -319,7 +333,9 @@ impl Stats {
     }
 
     /// Writes the per-content-ID table and returns the total compressed size.
-    fn write_report<W: Write>(&self, out: &mut W, verbose: bool) -> io::Result<u64> {
+    fn write_report<W: Write>(&self, out: &mut W, detail: Detail) -> io::Result<u64> {
+        let verbose = detail == Detail::PerMethod;
+
         writeln!(
             out,
             "#   Content_ID  Uncomp.size    Comp.size   Ratio Method{}  Data_series",

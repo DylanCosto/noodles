@@ -163,10 +163,16 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut encoder = RawEncoder::new();
     let mut record = Vec::new();
 
+    let duplicates = if args.dupflag {
+        Duplicates::Keep
+    } else {
+        Duplicates::Clear
+    };
+
     reader.for_each(&input_header, |rec| {
         let raw: &[u8] = rec.encode_raw(&input_header, &mut encoder)?;
 
-        if reset(raw, &filter, args.dupflag, &mut record)? {
+        if reset(raw, &filter, duplicates, &mut record)? {
             writer.write_raw(&header, &record)?;
         }
 
@@ -216,10 +222,17 @@ fn output_header(input: &sam::Header, args: &Args) -> anyhow::Result<sam::Header
 
 /// Resets one record into `dst`; returns `false` for records that are dropped (secondary and
 /// supplementary).
+/// What happens to the duplicate flag (`--dupflag` keeps it).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Duplicates {
+    Clear,
+    Keep,
+}
+
 fn reset(
     src: &[u8],
     filter: &TagFilter,
-    keep_duplicates: bool,
+    duplicates: Duplicates,
     dst: &mut Vec<u8>,
 ) -> anyhow::Result<bool> {
     let flags = u16::from_le_bytes([src[14], src[15]]);
@@ -236,7 +249,7 @@ fn reset(
 
     new_flags &= !FLAG_MATE_REVERSE;
 
-    if !keep_duplicates {
+    if duplicates == Duplicates::Clear {
         new_flags &= !FLAG_DUPLICATE;
     }
 

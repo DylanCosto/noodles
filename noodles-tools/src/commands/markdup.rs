@@ -510,7 +510,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut encoder = RawEncoder::new();
     let mut cleared = Vec::new();
 
-    reader.for_each(&header.clone(), |rec| {
+    let header = header;
+
+    reader.for_each(&header, |rec| {
         let mut raw: Vec<u8> = rec.encode_raw(&header, &mut encoder)?.to_vec();
 
         if args.clear && flags_of(&raw).is_duplicate() {
@@ -614,14 +616,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .collect();
 
         if args.json {
-            write_json_report(
-                &mut out,
-                &command_line,
-                &total,
-                args.use_read_groups,
-                &state.stats,
-                &group_names,
-            )?;
+            let read_groups = args
+                .use_read_groups
+                .then_some((&state.stats[..], &group_names[..]));
+            write_json_report(&mut out, &command_line, &total, read_groups)?;
         } else {
             write_stats(&mut out, "COMMAND: ", &command_line, &total)?;
             writeln!(out)?;

@@ -130,13 +130,13 @@ pub(super) fn write_json_stats<W: Write>(
 }
 
 /// The `--json` report. As in samtools, names are written without escaping.
+/// `read_groups` holds the ungrouped statistics, then those of each named read group, with
+/// `--use-read-groups`.
 pub(super) fn write_json_report<W: Write>(
     out: &mut W,
     command_line: &str,
     total: &Stats,
-    use_read_groups: bool,
-    group_stats: &[Stats],
-    group_names: &[String],
+    read_groups: Option<(&[Stats], &[String])>,
 ) -> io::Result<()> {
     pub(super) const INDENT_1: &str = "    ";
     pub(super) const INDENT_2: &str = "        ";
@@ -145,9 +145,9 @@ pub(super) fn write_json_report<W: Write>(
     writeln!(out, "{{")?;
     writeln!(out, "{INDENT_1}\"COMMAND\": \"{command_line}\",")?;
     write_json_stats(out, INDENT_1, None, total)?;
-    writeln!(out, "{}", if use_read_groups { "," } else { "" })?;
+    writeln!(out, "{}", if read_groups.is_some() { "," } else { "" })?;
 
-    if use_read_groups {
+    if let Some((group_stats, group_names)) = read_groups {
         writeln!(out, "{INDENT_1}\"READ GROUPS\": [")?;
 
         if group_stats[0].reading > 0 {

@@ -10,12 +10,12 @@ use super::{
     CIGAR_MATCH, CIGAR_PAD, CIGAR_SEQUENCE_MATCH, CIGAR_SEQUENCE_MISMATCH, CIGAR_SKIP,
     CIGAR_SOFT_CLIP, GC_IN_BYTE, INWARD, Info, OTHER, OUTWARD, PAIR_MAX, PENDING_BASES, Pair,
     QUALITY_BINS, Stats,
-    cycles::{BaseCounts, PendingRead, count_cycles},
+    cycles::{BaseCounts, PendingRead, Segment, count_cycles},
     record::{
         Bam, READ_ORDER_FIRST, READ_ORDER_LAST, consumes_reference, integer_field, string_value,
     },
 };
-use crate::bam_raw;
+use crate::{bam_raw, sequence::Strand};
 
 /// `cleanup_overlaps`: drops pairs whose chunks all end before `max`, returning how many.
 pub(super) fn cleanup_overlaps(pairs: &mut HashMap<Vec<u8>, Pair>, max: i64) -> u32 {
@@ -25,7 +25,7 @@ pub(super) fn cleanup_overlaps(pairs: &mut HashMap<Vec<u8>, Pair>, max: i64) -> 
 }
 
 /// `bwa_trim_read`: the number of bases BWA would trim from the 3' end.
-pub(super) fn bwa_trim_read(trim_qual: i32, quals: &[u8], len: usize, reverse: bool) -> usize {
+pub(super) fn bwa_trim_read(trim_qual: i32, quals: &[u8], len: usize, strand: Strand) -> usize {
     if len < BWA_MIN_READ_LENGTH {
         return 0;
     }
@@ -34,7 +34,11 @@ pub(super) fn bwa_trim_read(trim_qual: i32, quals: &[u8], len: usize, reverse: b
     let (mut sum, mut max_sum, mut max_l) = (0i32, 0i32, 0usize);
 
     for l in 0..max_trimmed {
-        sum += trim_qual - i32::from(quals[if reverse { l } else { len - 1 - l }]);
+        let i = match strand {
+            Strand::Forward => len - 1 - l,
+            Strand::Reverse => l,
+        };
+        sum += trim_qual - i32::from(quals[i]);
 
         if sum < 0 {
             break;
@@ -272,7 +276,7 @@ impl Stats {
         }
 
         let order = bam.order();
-        let reverse = bam.has(Flags::REVERSE_COMPLEMENTED);
+        let strand = Strand::of_flags(bam.flag);
         let mut gc_count = 0;
 
         if order == READ_ORDER_FIRST || order == READ_ORDER_LAST {
@@ -314,7 +318,7 @@ impl Stats {
         };
 
         if info.trim_qual > 0 {
-            self.nbases_trimmed += bwa_trim_read(info.trim_qual, bam.qual, seq_len, reverse) as u64;
+            self.nbases_trimmed += bwa_trim_read(info.trim_qual, bam.qual, seq_len, strand) as u64;
         }
 
         if let Some(order) = quals {
@@ -328,11 +332,15 @@ impl Stats {
 
             self.sum_qual += bam.qual.iter().map(|&q| u64::from(q)).sum::<u64>();
 
-            let first = order == READ_ORDER_FIRST;
+            let segment = if order == READ_ORDER_FIRST {
+                Segment::First
+            } else {
+                Segment::Other
+            };
 
             if self.workers == 0 {
                 let mut tables = self.cycle_tables();
-                count_cycles(bam.seq, bam.qual, reverse, first, &mut tables);
+                count_cycles(bam.seq, bam.qual, strand, segment, &mut tables);
             } else {
                 let pending = &mut self.pending;
                 let start = pending.data.len();
@@ -341,8 +349,8 @@ impl Stats {
                 pending.reads.push(PendingRead {
                     start,
                     len: seq_len,
-                    reverse,
-                    first,
+                    strand,
+                    segment,
                 });
                 pending.max_len = pending.max_len.max(seq_len);
 
@@ -927,11 +935,11 @@ mod tests {
     #[test]
     fn test_bwa_trim_read() {
         let quals = [30; 50];
-        assert_eq!(bwa_trim_read(20, &quals, 50, false), 0);
+        assert_eq!(bwa_trim_read(20, &quals, 50, Strand::Forward), 0);
 
         let mut quals = [30; 50];
         quals[45..].fill(2);
-        assert_eq!(bwa_trim_read(20, &quals, 50, false), 4);
-        assert_eq!(bwa_trim_read(20, &quals, 30, false), 0);
+        assert_eq!(bwa_trim_read(20, &quals, 50, Strand::Forward), 4);
+        assert_eq!(bwa_trim_read(20, &quals, 30, Strand::Forward), 0);
     }
 }

@@ -417,17 +417,18 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         workers: args.threads,
     };
 
+    let samples = if args.ignore_rg {
+        Samples::OnePerFile
+    } else {
+        Samples::FromReadGroups
+    };
+
     match whole_chromosomes(&args, &inputs, indexes.as_deref(), &read_options)? {
         Some((headers, names)) => {
-            report_samples(&headers, args.ignore_rg);
+            report_samples(&headers, samples);
             pileup_by_chromosome(&context, &names, args.threads, &mut out)?;
         }
-        None => pileup_region(
-            &context,
-            args.region.as_deref(),
-            Some(args.ignore_rg),
-            &mut out,
-        )?,
+        None => pileup_region(&context, args.region.as_deref(), Some(samples), &mut out)?,
     }
 
     out.flush()?;
@@ -451,11 +452,11 @@ struct PileupContext<'a> {
 }
 
 /// Runs the pileup of `region` (a samtools region, or every read) and writes it to `out`.
-/// `report` reports the number of samples, ignoring read groups if set.
+/// With `report`, the number of samples is reported first.
 fn pileup_region<W: Write>(
     context: &PileupContext<'_>,
     region: Option<&str>,
-    report: Option<bool>,
+    report: Option<Samples>,
     out: &mut W,
 ) -> anyhow::Result<()> {
     thread::scope(|scope| -> anyhow::Result<()> {
@@ -526,8 +527,8 @@ fn pileup_region<W: Write>(
             .map(|rs| rs.length().get() as i64)
             .collect();
 
-        if let Some(ignore_rg) = report {
-            report_samples(&headers, ignore_rg);
+        if let Some(samples) = report {
+            report_samples(&headers, samples);
         }
 
         // The requested region, 0-based and half-open, of the first file.
@@ -553,23 +554,32 @@ fn pileup_region<W: Write>(
     })
 }
 
-/// Reports the number of samples, as samtools does (read group samples, or one per file).
-fn report_samples(headers: &[sam::Header], ignore_rg: bool) {
+/// How samples are counted for the report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Samples {
+    /// The read groups' samples, or one for a file without any.
+    FromReadGroups,
+    /// One per file (`--ignore-RG`).
+    OnePerFile,
+}
+
+/// Reports the number of samples, as samtools does.
+fn report_samples(headers: &[sam::Header], samples: Samples) {
     use sam::header::record::value::map::read_group::tag::SAMPLE;
 
     let sample_count: usize = headers
         .iter()
         .map(|h| {
-            let samples: HashSet<_> = h
+            let read_group_samples: HashSet<_> = h
                 .read_groups()
                 .values()
                 .filter_map(|rg| rg.other_fields().get(&SAMPLE))
                 .collect();
 
-            if ignore_rg || samples.is_empty() {
+            if samples == Samples::OnePerFile || read_group_samples.is_empty() {
                 1
             } else {
-                samples.len()
+                read_group_samples.len()
             }
         })
         .sum();
@@ -720,7 +730,7 @@ fn mpileup<W: Write>(
                             name_of(last_tid),
                             last_pos,
                             n,
-                            &reference,
+                            reference.as_deref().map(Vec::as_slice),
                         )?;
                     }
                 }
@@ -772,7 +782,7 @@ fn mpileup<W: Write>(
                     name_of(tid),
                     last_pos,
                     n,
-                    &reference,
+                    reference.as_deref().map(Vec::as_slice),
                 )?;
             }
 
@@ -796,12 +806,11 @@ fn mpileup<W: Write>(
         for (i, source) in sources.iter_mut().enumerate() {
             write_sample(
                 &mut line,
-                &mut source.pileup,
-                active[i],
+                active[i].then_some(&mut source.pileup),
                 options,
                 names,
                 pos,
-                &reference,
+                reference.as_deref().map(Vec::as_slice),
                 &mut seq,
                 &mut qual,
                 &mut ins,
@@ -844,7 +853,7 @@ fn mpileup<W: Write>(
                     name_of(last_tid),
                     last_pos,
                     n,
-                    &reference,
+                    reference.as_deref().map(Vec::as_slice),
                 )?;
             }
 

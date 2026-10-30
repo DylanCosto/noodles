@@ -4,7 +4,7 @@ use std::io::{self, Write};
 
 use noodles_sam as sam;
 
-use super::{GcDepth, Info, QUALITY_BINS, Stats, cycles::BaseCounts};
+use super::{GcDepth, Info, InsertSizeRows, QUALITY_BINS, Stats, cycles::BaseCounts};
 
 /// `gcd_percentile`, in single precision.
 pub(super) fn gcd_percentile(gcd: &[GcDepth], n: usize, p: u32) -> f32 {
@@ -165,7 +165,6 @@ impl Stats {
         info: &Info,
         command_line: &str,
         split_tag: Option<&str>,
-        sparse: bool,
     ) -> io::Result<()> {
         self.flush_cycles();
 
@@ -664,7 +663,7 @@ impl Stats {
         for isize in 0..ibulk {
             let [i, o, x] = self.isize.get(isize);
 
-            if !sparse || i + o + x > 0 {
+            if info.insert_size_rows == InsertSizeRows::All || i + o + x > 0 {
                 writeln!(out, "IS\t{isize}\t{}\t{i}\t{o}\t{x}", i + o + x)?;
             }
         }

@@ -130,6 +130,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         program::add(&mut header)?;
     }
 
+    let header = header;
+
     let format = args
         .output_format
         .or_else(|| OutputFormat::from_path(&args.output))
@@ -195,7 +197,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             Ok(())
         };
 
-    reader.for_each(&header.clone(), |record| {
+    reader.for_each(&header, |record| {
         let mut record = match &record {
             // The BAM decoder builds record buffers much faster than the generic conversion.
             crate::alignment::Rec::Bam(r) => {

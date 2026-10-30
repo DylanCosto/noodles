@@ -128,16 +128,17 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut groups: Vec<Group> = Vec::new();
     let mut ids: HashMap<BString, usize> = HashMap::new();
 
+    let verbosity = if args.verbose {
+        Verbosity::Verbose
+    } else {
+        Verbosity::Quiet
+    };
+
     if splitting_by_read_group {
         for (i, id) in header.read_groups().keys().enumerate() {
             let group_header = read_group_header(&header, id);
             let path = output_path(&format, &basename, i, pad, id.as_ref(), extension)?;
-            groups.push(open_group(
-                &path,
-                group_header,
-                &write_options,
-                args.verbose,
-            )?);
+            groups.push(open_group(&path, group_header, &write_options, verbosity)?);
             ids.insert(id.clone(), i);
         }
     }
@@ -182,12 +183,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                         header.clone()
                     };
 
-                    groups.push(open_group(
-                        &path,
-                        group_header,
-                        &write_options,
-                        args.verbose,
-                    )?);
+                    groups.push(open_group(&path, group_header, &write_options, verbosity)?);
                     ids.insert(value, i);
                     Some(i)
                 }
@@ -227,13 +223,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether output paths are reported (`-v`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Verbosity {
+    Quiet,
+    Verbose,
+}
+
 fn open_group(
     path: &Path,
     header: sam::Header,
     options: &WriteOptions,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> anyhow::Result<Group> {
-    if verbose {
+    if verbosity == Verbosity::Verbose {
         eprintln!("{}", path.display());
     }
 

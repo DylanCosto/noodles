@@ -19,12 +19,12 @@ use crate::{
     bam_raw::{BASES, Record, field},
     commands::flags,
     sanitize::{Sanitize, sanitize_raw},
+    sequence::Strand,
 };
 
 /// The checksums' modulus.
 const PRIME: u64 = (1 << 31) - 1;
 
-const FLAG_REVERSE: u16 = 0x10;
 const FLAG_QC_FAIL: u16 = 0x200;
 
 const SEQ_NT16_COMPLEMENT_STR: &[u8; 16] = b"=TGKCYSBAWRDMHVN";
@@ -192,7 +192,7 @@ impl Sums {
     }
 
     /// `sums_update`: the all row, and the pass or fail row.
-    fn update(&mut self, qc_fail: bool, c: &Crcs, options: &Options, count: u64) {
+    fn update(&mut self, qc: Qc, c: &Crcs, options: &Options, count: u64) {
         let count_crc = match options.in_order {
             0 => 0,
             1 => crc32(0, &count.to_le_bytes()),
@@ -201,14 +201,30 @@ impl Sums {
 
         self.update_row(0, c, count_crc, 1);
 
-        if options.show_pass && !qc_fail {
+        if options.show_pass && qc == Qc::Pass {
             self.update_row(1, c, count_crc, 1);
         }
 
-        if options.show_fail && qc_fail {
+        if options.show_fail && qc == Qc::Fail {
             self.update_row(2, c, count_crc, 1);
         }
     }
+}
+
+/// Whether a read passed QC (its QC-fail flag is unset).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Qc {
+    Pass,
+    Fail,
+}
+
+/// Which tags `-t` selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TagSelection {
+    /// The listed tags.
+    Listed,
+    /// Every tag but those listed (a list starting with `*`).
+    AllExceptListed,
 }
 
 /// `update_hash`: multiplication modulo 2^31 - 1, with 0 (and the modulus) replaced by 1.
@@ -356,7 +372,11 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
     let mut seq = Vec::new();
     let mut qual = Vec::new();
     let mut aux = Vec::new();
-    let all_tags = options.tag_str.starts_with('*');
+    let selection = if options.tag_str.starts_with('*') {
+        TagSelection::AllExceptListed
+    } else {
+        TagSelection::Listed
+    };
 
     reader.for_each_while(&header, |rec| {
         record.clear();
@@ -379,12 +399,13 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
         let flags = r.flags();
         let masked = (i32::from(flags) & options.flag_mask) as u8;
 
-        let orientation = if flags & FLAG_REVERSE != 0 && options.rev_comp {
-            Orientation::Reverse
+        // The strand to undo: reverse-strand reads are reverse complemented unless `-c`.
+        let strand = if options.rev_comp {
+            Strand::of_flags(flags)
         } else {
-            Orientation::Forward
+            Strand::Forward
         };
-        fill_seq_qual(&r, orientation, &mut seq, &mut qual);
+        fill_seq_qual(&r, strand, &mut seq, &mut qual);
 
         let crc = crc32(0, &[masked]);
         let crc_seq = crc32(crc, &seq);
@@ -397,7 +418,13 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
 
         let crc_qual = crc32(crc_seq, &qual);
 
-        let read_group = select_tags(r.data(), all_tags, &tag_index, options.tags.len(), &mut aux)?;
+        let read_group = select_tags(
+            r.data(),
+            selection,
+            &tag_index,
+            options.tags.len(),
+            &mut aux,
+        )?;
         let crc_aux = crc32(crc_seq, &aux);
 
         let mut crcs = Crcs {
@@ -430,23 +457,27 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
             crcs.cigar = crc32(crc, r.raw_cigar());
         }
 
-        let qc_fail = flags & FLAG_QC_FAIL != 0;
+        let qc = if flags & FLAG_QC_FAIL != 0 {
+            Qc::Fail
+        } else {
+            Qc::Pass
+        };
 
         let count = match read_group {
             Some(read_group) => {
                 let sums = report.read_groups.entry(read_group).or_default();
                 let count = sums.count[0];
-                sums.update(qc_fail, &crcs, options, count);
+                sums.update(qc, &crcs, options, count);
                 count
             }
             None => {
                 let count = report.no_read_group.count[0];
-                report.no_read_group.update(qc_fail, &crcs, options, count);
+                report.no_read_group.update(qc, &crcs, options, count);
                 count
             }
         };
 
-        report.all.update(qc_fail, &crcs, options, count);
+        report.all.update(qc, &crcs, options, count);
 
         if remaining != 0 {
             remaining -= 1;
@@ -462,15 +493,8 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
     Ok(report)
 }
 
-/// Whether [`fill_seq_qual`] reverse complements a read.
-#[derive(Clone, Copy)]
-enum Orientation {
-    Forward,
-    Reverse,
-}
-
 /// `fill_seq_qual`: the bases (reverse complemented if asked) and qualities + 33.
-fn fill_seq_qual(r: &Record<'_>, orientation: Orientation, seq: &mut Vec<u8>, qual: &mut Vec<u8>) {
+fn fill_seq_qual(r: &Record<'_>, strand: Strand, seq: &mut Vec<u8>, qual: &mut Vec<u8>) {
     let len = r.sequence_len();
     let packed = r.packed_sequence();
     let quals = r.quality_scores();
@@ -480,7 +504,7 @@ fn fill_seq_qual(r: &Record<'_>, orientation: Orientation, seq: &mut Vec<u8>, qu
     seq.clear();
     qual.clear();
 
-    if let Orientation::Reverse = orientation {
+    if strand == Strand::Reverse {
         seq.extend((0..len).rev().map(|i| SEQ_NT16_COMPLEMENT_STR[code(i)]));
         qual.extend((0..len).rev().map(q));
     } else {
@@ -497,7 +521,7 @@ fn is_tag_char(c: u8) -> bool {
 /// `*` in tag order); returns the read group (the last `RG:Z` value).
 fn select_tags(
     data: &[u8],
-    all_tags: bool,
+    selection: TagSelection,
     tag_index: &HashMap<[u8; 2], usize>,
     n_tags: usize,
     dst: &mut Vec<u8>,
@@ -524,7 +548,7 @@ fn select_tags(
 
         let index = tag_index.get(&[field[0], field[1]]).copied();
 
-        if all_tags {
+        if selection == TagSelection::AllExceptListed {
             if index.is_none() {
                 fields.push((field, n));
                 n += 1;
@@ -536,7 +560,7 @@ fn select_tags(
 
     dst.clear();
 
-    if all_tags {
+    if selection == TagSelection::AllExceptListed {
         fields.sort_by_key(|&(field, n)| (field[0], field[1], n));
 
         for (field, _) in fields {

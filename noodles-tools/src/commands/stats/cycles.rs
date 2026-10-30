@@ -1,5 +1,7 @@
 //! Per-cycle base and quality counts, gathered in batches and counted on worker threads.
 
+use crate::sequence::Strand;
+
 use super::{COMPLEMENT, CodeCounts, Stats};
 
 /// `acgtno_count_t`
@@ -33,8 +35,17 @@ impl From<&CodeCounts> for BaseCounts {
 pub(super) struct PendingRead {
     pub(super) start: usize,
     pub(super) len: usize,
-    pub(super) reverse: bool,
-    pub(super) first: bool,
+    pub(super) strand: Strand,
+    pub(super) segment: Segment,
+}
+
+/// Which per-cycle tables a read is counted in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Segment {
+    /// The first segment of a template.
+    First,
+    /// Any other read.
+    Other,
 }
 
 /// Reads whose per-cycle counts are deferred so that worker threads can count them together,
@@ -64,8 +75,8 @@ pub(super) struct CycleTables<'a> {
 pub(super) fn count_cycles(
     seq: &[u8],
     qual: &[u8],
-    reverse: bool,
-    first: bool,
+    strand: Strand,
+    segment: Segment,
     tables: &mut CycleTables<'_>,
 ) {
     let len = qual.len();
@@ -76,12 +87,12 @@ pub(super) fn count_cycles(
         return;
     }
 
-    let (cycles, quals) = if first {
-        (&mut *tables.first, &mut *tables.quals_first)
-    } else {
-        (&mut *tables.last, &mut *tables.quals_last)
+    let (cycles, quals) = match segment {
+        Segment::First => (&mut *tables.first, &mut *tables.quals_first),
+        Segment::Other => (&mut *tables.last, &mut *tables.quals_last),
     };
 
+    let reverse = strand == Strand::Reverse;
     let complement: [u8; 16] = if reverse {
         COMPLEMENT
     } else {
@@ -205,7 +216,7 @@ impl Stats {
                         let seq_end = read.start + read.len.div_ceil(2);
                         let seq = &data[read.start..seq_end];
                         let qual = &data[seq_end..seq_end + read.len];
-                        count_cycles(seq, qual, read.reverse, read.first, &mut tables);
+                        count_cycles(seq, qual, read.strand, read.segment, &mut tables);
                     }
                 });
             }
