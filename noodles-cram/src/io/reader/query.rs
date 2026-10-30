@@ -156,12 +156,13 @@ where
                 let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
 
                 slice
-                    .records(
+                    .records_with_md_nm(
                         self.reader.reference_sequence_repository.clone(),
                         self.header,
                         &compression_header,
                         &core_data_src,
                         &external_data_srcs,
+                        self.reader.md_nm(),
                     )
                     .and_then(|records| {
                         records

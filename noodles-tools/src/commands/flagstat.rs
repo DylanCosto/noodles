@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::alignment::{AlignmentReader, ReadOptions, Rec};
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, Verbosity};
 
 /// Mate-on-another-reference records at or above this mapping quality are counted separately.
 const MIN_HQ_MAPPING_QUALITY: u8 = 5;
@@ -34,6 +35,15 @@ pub struct Args {
     /// Additional threads for BGZF decompression.
     #[arg(short = '@', long = "threads", default_value_t = 0)]
     threads: usize,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 #[derive(Debug, Default)]
@@ -214,12 +224,14 @@ impl fmt::Display for Percent {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let options = ReadOptions {
+    let mut options = ReadOptions {
         threads: args.threads,
         reference: args.reference,
     };
+    args.input_format_options.configure(&mut options)?;
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &options)?;
+    args.input_format_options.apply(&mut reader)?;
     let header = reader.read_header()?;
 
     let mut pass = Counts::default();

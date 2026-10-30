@@ -7,11 +7,13 @@ use noodles_sam as sam;
 
 use crate::{
     alignment::{AlignmentReader, RawEncoder, ReadOptions, Rec},
+    commands::index::{IndexKind, index_file},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     program,
     runs::{self, Chunk, SpillFile},
     sort_order::{Order, TagTieBreak},
     source::STDIN,
+    template_coordinate::{self, HexIds, Libraries},
 };
 
 /// samtools' default per-thread memory limit.
@@ -23,7 +25,8 @@ pub struct Args {
     #[arg(default_value = STDIN)]
     input: String,
 
-    /// Write output to this file instead of stdout.
+    /// Write output to this file instead of stdout (`FILE##idx##INDEX` also names the index for
+    /// --write-index).
     #[arg(short = 'o', long = "output")]
     output: Option<PathBuf>,
 
@@ -44,12 +47,21 @@ pub struct Args {
     memory_per_thread: usize,
 
     /// Sort by read name, comparing numbers naturally.
-    #[arg(short = 'n', conflicts_with = "name_ascii")]
+    #[arg(short = 'n', overrides_with = "template_coordinate")]
     name_natural: bool,
 
-    /// Sort by read name, bytewise.
-    #[arg(short = 'N')]
+    /// Sort by read name, bytewise (also with -n).
+    #[arg(short = 'N', overrides_with = "template_coordinate")]
     name_ascii: bool,
+
+    /// Sort by template-coordinate: the unclipped 5' positions of both ends of the template
+    /// (the mate's from its MC tag, as added by fixmate -m), library, CB, MI, then read name.
+    /// The last of -n, -N, and this option applies; -t overrides it.
+    #[arg(
+        long = "template-coordinate",
+        overrides_with_all = ["name_natural", "name_ascii"]
+    )]
+    template_coordinate: bool,
 
     /// Sort by the value of TAG (records without it first), then by position, or by read name
     /// with -n/-N.
@@ -78,6 +90,11 @@ pub struct Args {
     #[arg(short = '@', long = "threads", default_value_t = 0)]
     threads: usize,
 
+    /// Index the output (coordinate order only): CSI for BAM, or the index named with
+    /// `-o FILE##idx##INDEX` (BAI if it ends in .bai); CRAI for CRAM.
+    #[arg(long = "write-index")]
+    write_index: bool,
+
     /// Do not add an @PG line to the header.
     #[arg(long = "no-PG")]
     no_pg: bool,
@@ -86,10 +103,29 @@ pub struct Args {
 pub fn run(args: Args) -> anyhow::Result<()> {
     let order = order(&args);
 
+    let (output, index) = match args.output.as_deref() {
+        Some(path) => {
+            let (output, index) = split_index_path(path);
+            (Some(output), index)
+        }
+        None => (None, None),
+    };
+
     let format = args
         .output_format
-        .or_else(|| args.output.as_deref().and_then(OutputFormat::from_path))
+        .or_else(|| output.as_deref().and_then(OutputFormat::from_path))
         .unwrap_or(OutputFormat::Bam);
+
+    let index_request = if !args.write_index {
+        None
+    } else if order == Order::Coordinate {
+        Some(IndexRequest::new(output.as_deref(), index, format)?)
+    } else {
+        eprintln!(
+            "[W::bam_sort] Ignoring --write-index as it only works for position sorted files."
+        );
+        None
+    };
 
     let read_options = ReadOptions {
         threads: args.threads,
@@ -100,7 +136,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut header = reader.read_header()?;
 
     let memory_limit = args.memory_per_thread.saturating_mul(args.threads + 1);
-    let temp_dir = create_temp_dir(args.temp_prefix.as_deref(), args.output.as_deref())?;
+    let temp_dir = create_temp_dir(args.temp_prefix.as_deref(), output.as_deref())?;
 
     let sorted = SortedRecords::collect(
         &mut reader,
@@ -125,29 +161,97 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         reference: args.reference,
     };
 
-    let mut writer = AlignmentWriter::create(args.output.as_deref(), &write_options, &header)?;
+    let mut writer = AlignmentWriter::create(output.as_deref(), &write_options, &header)?;
     writer.write_header(&header)?;
     sorted.write_to(&mut writer, &header)?;
     writer.finish(&header)?;
 
+    if let Some(request) = index_request {
+        request.write(args.threads)?;
+    }
+
     Ok(())
 }
 
-/// The sort order, as samtools picks it: `-t` sorts by tag, then by name with `-n`/`-N`.
+/// The sort order, as samtools picks it: the last of `-n`/`-N` (bytewise if `-N` is given at
+/// all) and `--template-coordinate`, except that `-t` sorts by tag, then by name if `-n`/`-N`
+/// came last.
 fn order(args: &Args) -> Order {
-    let then = if args.name_natural {
-        TagTieBreak::NameNatural
-    } else if args.name_ascii {
-        TagTieBreak::NameAscii
-    } else {
-        TagTieBreak::Coordinate
-    };
+    let then = name_tie_break(args.name_natural, args.name_ascii);
 
     match (args.tag, then) {
         (Some(tag), then) => Order::Tag { tag, then },
         (None, TagTieBreak::NameNatural) => Order::NameNatural,
         (None, TagTieBreak::NameAscii) => Order::NameAscii,
+        (None, TagTieBreak::Coordinate) if args.template_coordinate => Order::TemplateCoordinate,
         (None, TagTieBreak::Coordinate) => Order::Coordinate,
+    }
+}
+
+/// The name order of `-n` and `-N` (bytewise if `-N` is given at all), or `Coordinate` for
+/// neither.
+pub fn name_tie_break(name_natural: bool, name_ascii: bool) -> TagTieBreak {
+    if name_ascii {
+        TagTieBreak::NameAscii
+    } else if name_natural {
+        TagTieBreak::NameNatural
+    } else {
+        TagTieBreak::Coordinate
+    }
+}
+
+/// The delimiter between an output file name and its index file name (`HTS_IDX_DELIM`).
+const INDEX_DELIMITER: &str = "##idx##";
+
+/// Splits `FILE##idx##INDEX` into the file and the index; other paths have no index.
+pub fn split_index_path(path: &Path) -> (PathBuf, Option<PathBuf>) {
+    match path.to_str().and_then(|s| s.split_once(INDEX_DELIMITER)) {
+        Some((file, index)) => (PathBuf::from(file), Some(PathBuf::from(index))),
+        None => (path.to_path_buf(), None),
+    }
+}
+
+/// An index to build for an output file once it is written (`--write-index`, `auto_index`).
+pub struct IndexRequest {
+    output: PathBuf,
+    index: Option<PathBuf>,
+    kind: IndexKind,
+}
+
+impl IndexRequest {
+    /// Checks that `output` (`None` or `-` for stdout) can be indexed. The index goes to
+    /// `index`, or next to the output: CSI for BAM unless `index` ends in `.bai`, and CRAI for
+    /// CRAM.
+    pub fn new(
+        output: Option<&Path>,
+        index: Option<PathBuf>,
+        format: OutputFormat,
+    ) -> anyhow::Result<Self> {
+        let Some(output) = output.filter(|p| *p != Path::new("-")) else {
+            bail!("--write-index needs an output file");
+        };
+
+        let is_bai = index
+            .as_deref()
+            .is_some_and(|p| p.as_os_str().as_encoded_bytes().ends_with(b".bai"));
+
+        let kind = match format {
+            OutputFormat::Bam if is_bai => IndexKind::Default,
+            OutputFormat::Bam => IndexKind::Csi,
+            OutputFormat::Cram => IndexKind::Default,
+            OutputFormat::Sam => bail!("--write-index needs BAM or CRAM output"),
+        };
+
+        Ok(Self {
+            output: output.to_path_buf(),
+            index,
+            kind,
+        })
+    }
+
+    /// Indexes the written output.
+    pub fn write(self, threads: usize) -> anyhow::Result<()> {
+        index_file(&self.output, self.index, self.kind, threads)
     }
 }
 
@@ -193,13 +297,28 @@ impl<'d> SortedRecords<'d> {
 
         let mut encoder = RawEncoder::new();
 
+        // Template-coordinate keys depend on the header, so records carry them.
+        let libraries =
+            (order == Order::TemplateCoordinate).then(|| Libraries::from_header(header));
+        let mut keyed = Vec::new();
+
         reader.for_each(header, |record| {
             if !keep(&record)? {
                 return Ok(());
             }
 
             // Non-BAM records are encoded once so sorting and spilling work on raw bytes.
-            sorted.chunk.push(record.encode_raw(header, &mut encoder)?);
+            let raw = record.encode_raw(header, &mut encoder)?;
+
+            match &libraries {
+                None => sorted.chunk.push(raw),
+                Some(libraries) => {
+                    keyed.clear();
+                    let library = libraries.get(raw, HexIds::Ignore)?;
+                    template_coordinate::push_keyed(&mut keyed, raw, library)?;
+                    sorted.chunk.push(&keyed);
+                }
+            }
 
             if sorted.chunk.size() >= memory_limit {
                 sorted.spill()?;
@@ -230,11 +349,12 @@ impl<'d> SortedRecords<'d> {
         writer: &mut AlignmentWriter,
         header: &sam::Header,
     ) -> anyhow::Result<()> {
+        let order = self.order;
+
         if self.spill_paths.is_empty() {
-            self.chunk
-                .drain_sorted(self.order, self.threads, |record| {
-                    writer.write_raw(header, record)
-                })?;
+            self.chunk.drain_sorted(order, self.threads, |record| {
+                writer.write_raw(header, unkeyed(order, record))
+            })?;
 
             return Ok(());
         }
@@ -251,18 +371,27 @@ impl<'d> SortedRecords<'d> {
             .collect::<Result<Vec<_>, _>>()
             .context("opening temporary files")?;
 
-        runs::merge(&mut sources, self.order, |record| {
-            writer.write_raw(header, record)?;
+        runs::merge(&mut sources, order, |record| {
+            writer.write_raw(header, unkeyed(order, record))?;
             Ok(())
         })
     }
 }
 
-/// Sets `@HD SO` (and `SS`) for `order` as samtools does, creating `@HD` if needed, and removes
-/// `GO`.
+/// A sorted record without the key that [`Order::TemplateCoordinate`] appends.
+pub fn unkeyed(order: Order, record: &[u8]) -> &[u8] {
+    match order {
+        Order::TemplateCoordinate => template_coordinate::record(record),
+        _ => record,
+    }
+}
+
+/// Sets `@HD SO` (and `SS`, and `GO` for template-coordinate) for `order` as samtools does,
+/// creating `@HD` if needed, and removes `GO` otherwise.
 pub fn set_sort_order(header: &mut sam::Header, order: Order) {
     let (sort_order, subsort_order) = order.header_values();
-    set_sort_fields(header, sort_order, subsort_order.as_deref(), None);
+    let group_order = (order == Order::TemplateCoordinate).then_some("query");
+    set_sort_fields(header, sort_order, subsort_order.as_deref(), group_order);
 }
 
 /// Sets `@HD SO`, `SS`, and `GO` (removing `SS` and `GO` when they are `None`), creating `@HD`

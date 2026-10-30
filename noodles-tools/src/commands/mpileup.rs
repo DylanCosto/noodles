@@ -37,6 +37,7 @@ use self::{
     reference::ReferenceCache,
     regions::{Bed, parse_region},
 };
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, Verbosity};
 
 /// Reads per batch sent from a reader thread.
 const BATCH_SIZE: usize = 4096;
@@ -227,6 +228,15 @@ pub struct Args {
     /// Print help.
     #[arg(long, action = clap::ArgAction::Help)]
     help: Option<bool>,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// `mplp_conf_t`, as the reader threads need it.
@@ -265,7 +275,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let exclude_rg = args.exclude_rg.as_deref().map(read_excluded_read_groups);
 
-    // As in samtools, `--reference` is also the FASTA reference when `-f` is not given.
+    // As in samtools, --reference stands in for -f.
     let fasta = args
         .fasta_ref
         .as_deref()
@@ -274,10 +284,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .transpose()?;
     let cram_reference = args.reference.clone().or_else(|| args.fasta_ref.clone());
 
-    let read_options = ReadOptions {
+    let mut read_options = ReadOptions {
         threads: args.threads,
         reference: cram_reference,
     };
+    args.input_format_options.configure(&mut read_options)?;
 
     let max_depth = max_depth(&args, inputs.len());
 

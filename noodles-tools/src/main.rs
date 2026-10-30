@@ -13,6 +13,7 @@ mod expr;
 mod file_list;
 mod filter;
 mod flags;
+mod global_args;
 mod hts_region;
 mod khash;
 mod output;
@@ -26,6 +27,7 @@ mod sanitize;
 mod sequence;
 mod sort_order;
 mod source;
+mod template_coordinate;
 
 use std::{io, process::ExitCode};
 

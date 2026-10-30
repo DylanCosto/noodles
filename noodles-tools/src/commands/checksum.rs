@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::{Context, bail};
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentReader, RawEncoder, ReadOptions},
     bam_raw::{BASES, Record, field},
@@ -113,6 +114,17 @@ pub struct Args {
     /// Additional threads for decompression.
     #[arg(short = '@', long = "threads", default_value_t = 0)]
     threads: usize,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
+
+    /// Input format option: `decode_md=0` keeps CRAM MD/NM tags as stored, `reference=FILE` is
+    /// --reference, and `nthreads=N` is ignored.
+    #[arg(long = "input-fmt-option", value_name = "OPT[=VAL]")]
+    input_format_options: Vec<String>,
 }
 
 /// `opts`
@@ -313,13 +325,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             args.inputs.clone()
         };
 
-        let read_options = ReadOptions {
+        let mut read_options = ReadOptions {
             threads: args.threads,
             reference: args.reference.clone(),
         };
+        let input_format = InputFormatOptions::new(args.input_format_options.clone());
+        input_format.configure(&mut read_options)?;
 
         inputs.iter().try_for_each(|input| {
-            let report = checksum(&options, &read_options, input)?;
+            let report = checksum(&options, &read_options, &input_format, input)?;
             report.write(input, &options, &mut out)?;
             Ok(())
         })
@@ -337,11 +351,17 @@ struct Report {
     read_groups: HashMap<Vec<u8>, Sums>,
 }
 
-fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow::Result<Report> {
+fn checksum(
+    options: &Options,
+    read_options: &ReadOptions,
+    input_format: &InputFormatOptions,
+    src: &str,
+) -> anyhow::Result<Report> {
     let tag_index = tag_index(options)?;
 
     let (mut reader, _) = AlignmentReader::open(src, read_options)
         .with_context(|| format!("[checksum] Cannot open input file \"{src}\""))?;
+    input_format.apply(&mut reader)?;
     let header = reader.read_header()?;
     let lengths: Vec<usize> = header
         .reference_sequences()

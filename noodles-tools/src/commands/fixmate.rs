@@ -23,6 +23,7 @@ use noodles_sam::{
     header::record::value::map::header::{sort_order::COORDINATE, tag::SORT_ORDER},
 };
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, OutputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentReader, ReadOptions},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
@@ -100,6 +101,18 @@ pub struct Args {
     /// Do not add an @PG line to the header.
     #[arg(long = "no-PG")]
     no_pg: bool,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -114,12 +127,14 @@ struct Options {
 pub fn run(args: Args) -> anyhow::Result<()> {
     let sanitize = Sanitize::parse(&args.sanitize)?;
 
-    let read_options = ReadOptions {
+    let mut read_options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    args.input_format_options.configure(&mut read_options)?;
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &read_options)?;
+    args.input_format_options.apply(&mut reader)?;
     let mut header = reader.read_header()?;
 
     let is_coordinate_sorted = header
@@ -144,7 +159,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let write_options = WriteOptions {
         format,
-        level: output::parse_level(if args.uncompressed { 0 } else { 6 })?,
+        level: output::parse_level(if args.uncompressed {
+            0
+        } else {
+            args.output_format_options.level(6)?
+        })?,
         threads: args.threads,
         reference: args.reference,
     };

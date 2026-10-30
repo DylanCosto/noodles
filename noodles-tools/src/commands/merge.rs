@@ -21,15 +21,16 @@ use crate::{
     alignment::{AlignmentIndex, AlignmentReader, Queries, RawEncoder, ReadOptions},
     bam_raw,
     bgzf_stream::BgzfReader,
-    commands::sort::parse_tag,
+    commands::sort::{IndexRequest, name_tie_break, parse_tag, split_index_path, unkeyed},
     file_list,
     hts_region::{self, POS_MAX},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     program,
     regions::RegionSet,
     runs::{self, RecordSource},
-    sort_order::{Order, TagTieBreak, remap_reference_sequence_ids},
+    sort_order::{Order, TagTieBreak, coordinate_key, remap_reference_sequence_ids},
     source::{Format, Stream},
+    template_coordinate::{self, HexIds, Libraries},
 };
 
 use self::header::{Collisions, HeaderMerger, Translation, mark_unsorted};
@@ -44,7 +45,8 @@ pub struct Args {
     /// are followed by their index files.
     files: Vec<PathBuf>,
 
-    /// Write output to this file; all positional arguments are then inputs.
+    /// Write output to this file; all positional arguments are then inputs. `FILE##idx##INDEX`
+    /// also names the index for --write-index.
     #[arg(short = 'o', long = "output")]
     output: Option<PathBuf>,
 
@@ -69,12 +71,20 @@ pub struct Args {
     uncompressed: bool,
 
     /// Inputs are sorted by read name, compared naturally.
-    #[arg(short = 'n', conflicts_with = "name_ascii")]
+    #[arg(short = 'n', overrides_with = "template_coordinate")]
     name_natural: bool,
 
-    /// Inputs are sorted by read name, bytewise.
-    #[arg(short = 'N')]
+    /// Inputs are sorted by read name, bytewise (also with -n).
+    #[arg(short = 'N', overrides_with = "template_coordinate")]
     name_ascii: bool,
+
+    /// Inputs are sorted by template-coordinate (sort --template-coordinate). The last of -n,
+    /// -N, and this option applies; -t overrides it.
+    #[arg(
+        long = "template-coordinate",
+        overrides_with_all = ["name_natural", "name_ascii"]
+    )]
+    template_coordinate: bool,
 
     /// Inputs are sorted by the value of TAG (then by position, or by name with -n/-N).
     #[arg(short = 't', value_name = "TAG", value_parser = parse_tag)]
@@ -125,6 +135,11 @@ pub struct Args {
     #[arg(short = '@', long = "threads", default_value_t = 0)]
     threads: usize,
 
+    /// Index the output: CSI for BAM, or the index named with `FILE##idx##INDEX` (BAI if it
+    /// ends in .bai); CRAI for CRAM.
+    #[arg(long = "write-index")]
+    write_index: bool,
+
     /// Do not add an @PG line to the header.
     #[arg(long = "no-PG")]
     no_pg: bool,
@@ -143,6 +158,7 @@ struct InputFile {
 pub fn run(args: Args) -> anyhow::Result<()> {
     let order = order(&args);
     let (output, inputs) = files(&args)?;
+    let (output, index) = split_index_path(&output);
 
     if !args.force && output != Path::new("-") && output.is_file() {
         bail!(
@@ -164,6 +180,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let selection = Selection::new(&args, &header)?;
 
     let write_options = write_options(&args, &output)?;
+
+    let index_request = args
+        .write_index
+        .then(|| IndexRequest::new(Some(&output), index, write_options.format))
+        .transpose()?;
+
+    // samtools computes template-coordinate keys with the merged header's libraries.
+    let libraries = (order == Order::TemplateCoordinate).then(|| Libraries::from_header(&header));
 
     if !args.no_pg {
         program::add(&mut header)?;
@@ -197,16 +221,43 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 }
             };
 
+            // Keys use the library of each record's translated read group.
+            let keys = libraries.as_ref().map(|libraries| Keys {
+                libraries: libraries.translated(&translation.read_groups),
+                record: Vec::new(),
+            });
+
             sources.push(MergeInput {
                 records,
                 translation: RecordTranslation::new(translation, read_group),
+                keys,
             });
         }
 
         let mut writer = AlignmentWriter::create(Some(&output), &write_options, &header)?;
         writer.write_header(&header)?;
 
+        // As in samtools, which indexes while writing, an index needs coordinate-sorted output.
+        let mut last_position = index_request.as_ref().map(|_| 0);
+
         runs::merge(&mut sources, order, |record| {
+            let record = unkeyed(order, record);
+
+            if let Some(last) = &mut last_position {
+                // The coordinate key without the strand: unplaced records last, then position.
+                let position = coordinate_key(record) >> 1;
+
+                if position < *last {
+                    bail!(
+                        "[E::bam_write_idx1] Read '{}' cannot be indexed: the output is not \
+                         sorted by coordinate",
+                        crate::sort_order::name(record).as_bstr()
+                    );
+                }
+
+                *last = position;
+            }
+
             writer.write_raw(&header, record)?;
             Ok(())
         })?;
@@ -220,7 +271,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
 
         Ok(())
-    })
+    })?;
+
+    if let Some(request) = index_request {
+        request.write(args.threads)?;
+    }
+
+    Ok(())
 }
 
 /// An opened input, with its header already merged.
@@ -335,25 +392,14 @@ fn write_options(args: &Args, output: &Path) -> anyhow::Result<WriteOptions> {
     })
 }
 
-/// The merge order, as samtools picks it.
+/// The merge order, as samtools picks it (as `sort` does).
 fn order(args: &Args) -> Order {
-    let name_order = if args.name_natural {
-        Some(TagTieBreak::NameNatural)
-    } else if args.name_ascii {
-        Some(TagTieBreak::NameAscii)
-    } else {
-        None
-    };
-
-    match (args.tag, name_order) {
-        (Some(tag), Some(then)) => Order::Tag { tag, then },
-        (Some(tag), None) => Order::Tag {
-            tag,
-            then: TagTieBreak::Coordinate,
-        },
-        (None, Some(TagTieBreak::NameAscii)) => Order::NameAscii,
-        (None, Some(_)) => Order::NameNatural,
-        (None, None) => Order::Coordinate,
+    match (args.tag, name_tie_break(args.name_natural, args.name_ascii)) {
+        (Some(tag), then) => Order::Tag { tag, then },
+        (None, TagTieBreak::NameNatural) => Order::NameNatural,
+        (None, TagTieBreak::NameAscii) => Order::NameAscii,
+        (None, TagTieBreak::Coordinate) if args.template_coordinate => Order::TemplateCoordinate,
+        (None, TagTieBreak::Coordinate) => Order::Coordinate,
     }
 }
 
@@ -608,15 +654,43 @@ impl Records {
 struct MergeInput {
     records: Records,
     translation: RecordTranslation,
+    /// For template-coordinate order, which keys records.
+    keys: Option<Keys>,
+}
+
+/// Template-coordinate keying for one input.
+struct Keys {
+    /// Libraries by the input's read group IDs.
+    libraries: Libraries,
+    /// The record being keyed.
+    record: Vec<u8>,
 }
 
 impl RecordSource for MergeInput {
     fn next_record(&mut self, buf: &mut Vec<u8>) -> io::Result<bool> {
-        if !self.records.next_record(buf)? {
+        let Some(keys) = &mut self.keys else {
+            if !self.records.next_record(buf)? {
+                return Ok(false);
+            }
+
+            self.translation.apply(buf)?;
+
+            return Ok(true);
+        };
+
+        let Keys { libraries, record } = keys;
+
+        if !self.records.next_record(record)? {
             return Ok(false);
         }
 
-        self.translation.apply(buf)?;
+        // The library is looked up before translation, which may replace `RG` (`-r`); samtools
+        // applies `-r` after computing the key.
+        let library = libraries.get(record, HexIds::Accept)?;
+        self.translation.apply(record)?;
+
+        buf.clear();
+        template_coordinate::push_keyed(buf, record, library)?;
 
         Ok(true)
     }

@@ -24,10 +24,11 @@ use crate::{
     alignment::{AlignmentReader, Queries, RawEncoder, ReadOptions, Rec, encode_cram_record},
     bam_raw,
     bam_sam::{self, Names},
-    commands::index::{IndexKind, index_file},
+    depth::format_g,
     expr::Expression,
     filter::{self, Filter, ReadGroupFilter, ReadGroupPresence, Subsample, TagFilter},
     flags,
+    global_args::{self, InputFormatOptions, OutputFormatOptions, Verbosity},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     parallel_cram, program,
     regions::{RegionSet, record_interval},
@@ -103,17 +104,27 @@ pub struct Args {
     #[arg(short = '1', long = "fast")]
     fast: bool,
 
-    /// Output format option; only `level=N`, the BGZF compression level, is supported.
-    #[arg(long = "output-fmt-option", value_name = "OPT=VAL")]
-    output_format_options: Vec<String>,
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
 
     /// Include the header in SAM output.
-    #[arg(short = 'h', long = "with-header")]
+    #[arg(short = 'h', long = "with-header", overrides_with = "no_header")]
     with_header: bool,
 
     /// Print the header only.
-    #[arg(short = 'H', long = "header-only")]
+    #[arg(short = 'H', long = "header-only", overrides_with = "no_header")]
     header_only: bool,
+
+    /// Print no header in SAM output (cancels an earlier -h or -H).
+    #[arg(long = "no-header", overrides_with_all = ["with_header", "header_only"])]
+    no_header: bool,
+
+    /// Write the numbers of records processed, accepted, and rejected to this file, as JSON.
+    #[arg(long = "save-counts", value_name = "FILE")]
+    save_counts: Option<PathBuf>,
 
     /// Print only the count of matching records.
     #[arg(short = 'c', long = "count")]
@@ -142,12 +153,24 @@ pub struct Args {
     #[arg(short = 'L', long = "target-file", visible_alias = "targets-file")]
     bed: Option<PathBuf>,
 
+    /// Only include reads overlapping this BED file, read through the index (`-L FILE -M`).
+    #[arg(long = "region-file", visible_alias = "regions-file")]
+    regions_file: Option<PathBuf>,
+
     /// Merge overlapping regions and output each record once, in file order.
     #[arg(short = 'M', long = "use-index")]
     merge_regions: bool,
 
-    /// Index file to use for region queries.
-    #[arg(short = 'X', long = "customized-index")]
+    /// The input is followed by its index file, then the regions.
+    #[arg(
+        short = 'X',
+        long = "customized-index",
+        visible_alias = "customised-index"
+    )]
+    customized_index: bool,
+
+    /// The index file given after the input with `-X`.
+    #[arg(skip)]
     index: Option<PathBuf>,
 
     /// Only include reads with all of these flags set.
@@ -161,6 +184,18 @@ pub struct Args {
     /// Exclude reads with all of these flags set.
     #[arg(short = 'G', value_parser = flags::parse)]
     exclude_all_flags: Option<Flags>,
+
+    /// Only include reads with any of these flags set.
+    #[arg(long = "rf", visible_aliases = ["incl-flags", "include-flags"], value_parser = flags::parse)]
+    require_any_flags: Option<Flags>,
+
+    /// Set these flags on the records written.
+    #[arg(long = "add-flags", value_parser = flags::parse)]
+    add_flags: Option<Flags>,
+
+    /// Clear these flags on the records written.
+    #[arg(long = "remove-flags", value_parser = flags::parse)]
+    remove_flags: Option<Flags>,
 
     /// Only include reads in this read group, or in no read group (may be repeated).
     #[arg(short = 'r', long = "read-group", visible_alias = "readgroup")]
@@ -210,12 +245,21 @@ pub struct Args {
     )]
     expression: Option<String>,
 
-    /// Subsample: keep a FRAC fraction of templates, seeded by INT (`INT.FRAC`).
-    #[arg(short = 's', long = "subsample", value_parser = Subsample::parse)]
-    subsample: Option<Subsample>,
+    /// Subsample: keep a FRAC fraction of templates, seeded by INT or, with `auto`, by the
+    /// header (`INT.FRAC` or `auto.FRAC`; --subsample FRAC --subsample-seed INT).
+    #[arg(short = 's', value_name = "INT.FRAC", value_parser = SeededFraction::parse)]
+    seeded_subsample: Option<SeededFraction>,
+
+    /// Keep only this fraction of templates.
+    #[arg(long = "subsample", value_name = "FLOAT", value_parser = parse_fraction)]
+    subsample: Option<f64>,
+
+    /// The --subsample seed, or `auto` to derive it from the header.
+    #[arg(long = "subsample-seed", value_name = "INT|auto", value_parser = SubsampleSeed::parse)]
+    subsample_seed: Option<SubsampleSeed>,
 
     /// Only include reads whose names are listed in this file.
-    #[arg(short = 'N', long = "qname-file")]
+    #[arg(short = 'N', long = "qname-file", visible_alias = "QNAME-file")]
     qname_file: Option<PathBuf>,
 
     /// Only include reads with this tag, and optionally this value (`TAG[:VALUE]`).
@@ -226,9 +270,14 @@ pub struct Args {
     #[arg(short = 'D', long = "tag-file", value_name = "TAG:FILE")]
     tag_files: Vec<String>,
 
-    /// Remove these tags from output records (comma-separated; may be repeated).
-    #[arg(short = 'x', long = "remove-tag", value_delimiter = ',')]
+    /// Remove these tags from output records (comma-separated; may be repeated); `^TAGS`
+    /// keeps only those tags instead.
+    #[arg(short = 'x', long = "remove-tag", value_name = "[^]TAGS")]
     remove_tags: Vec<String>,
+
+    /// Keep only these tags in output records (comma-separated; may be repeated); overrides -x.
+    #[arg(long = "keep-tag", value_name = "TAGS")]
+    keep_tags: Vec<String>,
 
     /// Collapse the backward (`B`) CIGAR operation.
     #[arg(short = 'B', long = "remove-B")]
@@ -254,6 +303,9 @@ pub struct Args {
     #[arg(short = 'S')]
     sam_input: bool,
 
+    #[command(flatten)]
+    verbosity: Verbosity,
+
     /// Print long help, including notes on regions and filter expressions.
     #[arg(short = '?', long = "help", action = clap::ArgAction::HelpLong)]
     help: Option<bool>,
@@ -271,7 +323,26 @@ enum Traversal {
     Pairs(RegionSet),
 }
 
-pub fn run(args: Args) -> anyhow::Result<()> {
+pub fn run(mut args: Args) -> anyhow::Result<()> {
+    // `--region-file FILE` is `-L FILE -M`.
+    if let Some(regions_file) = args.regions_file.take() {
+        args.bed = Some(regions_file);
+        args.merge_regions = true;
+    }
+
+    if args.no_header {
+        args.with_header = false;
+        args.header_only = false;
+    }
+
+    if args.customized_index {
+        if args.regions.is_empty() {
+            bail!("Incorrect number of arguments for -X option. Aborting.");
+        }
+
+        args.index = Some(PathBuf::from(args.regions.remove(0)));
+    }
+
     if args.unmap && args.unselected_output.is_some() {
         bail!("Options --unoutput and --unmap are mutually exclusive.");
     }
@@ -283,12 +354,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let format = output_format(&args)?;
     let reference = reference(&args);
 
-    let read_options = ReadOptions {
+    let mut read_options = ReadOptions {
         threads: args.threads,
         reference: reference.clone(),
     };
+    args.input_format_options.configure(&mut read_options)?;
 
     let (mut reader, path) = AlignmentReader::open(&args.input, &read_options)?;
+    args.input_format_options.apply(&mut reader)?;
     let mut header = reader.read_header()?;
 
     if reader.format() == Format::Sam
@@ -302,13 +375,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     configure_filter(&mut filter, &args, &mut header)?;
     let filter = filter;
 
-    let remove_tags = parse_tags(&args.remove_tags)?;
+    let output_edits = OutputEdits::new(&args)?;
     let edits = Edits::new(&args);
 
     let decoding = if matches!(traversal, Traversal::All)
         && args.threads > 0
-        && remove_tags.is_empty()
+        && output_edits.is_none()
         && args.unselected_output.is_none()
+        && args.save_counts.is_none()
         && edits.is_none()
     {
         Decoding::Parallel
@@ -318,7 +392,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     if args.count {
         let mut selector = Selector::new(&filter, edits);
-        let n = count(
+        let counts = count(
             &mut reader,
             path.as_deref(),
             &args,
@@ -327,7 +401,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             &mut selector,
             decoding,
         )?;
-        writeln!(io::stdout().lock(), "{n}")?;
+        writeln!(io::stdout().lock(), "{}", counts.accepted)?;
+
+        if let Some(dst) = &args.save_counts {
+            write_counts(dst, counts)?;
+        }
+
         return Ok(());
     }
 
@@ -359,6 +438,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         unselected.write_header(&header)?;
     }
 
+    let mut counts = Counts::default();
+
     if !args.header_only {
         let parallel_kind = writer.preformatted_kind();
 
@@ -379,9 +460,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 selector: Selector::new(&filter, edits),
                 writer: &mut writer,
                 rejected: &mut rejected,
-                remove_tags: &remove_tags,
+                output_edits: output_edits.as_ref(),
                 encoder: RawEncoder::new(),
-                stripped: Vec::new(),
+                edited: Vec::new(),
+                counts: Counts::default(),
             };
 
             if let Traversal::Pairs(regions) = &traversal {
@@ -403,6 +485,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     |rec| sink.emit(rec, &header),
                 )?;
             }
+
+            counts = sink.counts;
         }
     }
 
@@ -413,10 +497,33 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     if args.write_index {
-        write_output_index(&args, format)?;
+        global_args::write_index(args.output.as_deref(), format, args.threads)?;
+    }
+
+    if let Some(dst) = &args.save_counts {
+        write_counts(dst, counts)?;
     }
 
     Ok(())
+}
+
+/// The numbers of records the filters saw and accepted (`--save-counts`).
+#[derive(Clone, Copy, Debug, Default)]
+struct Counts {
+    processed: u64,
+    accepted: u64,
+}
+
+/// Writes `--save-counts` JSON, as samtools formats it.
+fn write_counts(dst: &Path, counts: Counts) -> anyhow::Result<()> {
+    let text = format!(
+        "{{\n    \"records_processed\" : {},\n    \"records_filter_accepted\" : {},\n    \"records_filter_rejected\" : {}\n}}\n",
+        counts.processed,
+        counts.accepted,
+        counts.processed - counts.accepted
+    );
+
+    fs::write(dst, text).with_context(|| format!("failed to open \"{}\"", dst.display()))
 }
 
 /// Sets the record filter's options (`-f`, `-F`, `-G`, `-q`, `-m`, `-r`/`-R`, `-n`, `-l`, `-s`,
@@ -442,13 +549,14 @@ fn configure_filter(
     filter.require = args.require_flags.unwrap_or_else(Flags::empty);
     filter.exclude = args.exclude_flags.unwrap_or_else(Flags::empty);
     filter.exclude_all = args.exclude_all_flags;
+    filter.require_any = args.require_any_flags;
     filter.min_mapping_quality = args.min_mapping_quality;
     filter.min_query_length = args.min_query_length;
     filter.read_groups = args
         .library
         .as_deref()
         .map(|library| filter::library_read_groups(header, library));
-    filter.subsample = args.subsample;
+    filter.subsample = subsample(args, header)?;
     filter.tag = TagFilter::from_args(&args.tags, &args.tag_files)?;
     filter.names = args
         .qname_file
@@ -462,6 +570,147 @@ fn configure_filter(
         .transpose()?;
 
     Ok(())
+}
+
+/// The subsample (`-s`, `--subsample`, `--subsample-seed`). As samtools does, its fraction and
+/// seed are recorded in a `@CO` header line; an `auto` seed is the FNV-1a hash of the header
+/// text, before the line (and the `@PG` line) is added.
+fn subsample(args: &Args, header: &mut sam::Header) -> anyhow::Result<Option<Subsample>> {
+    let (mut seed, mut fraction) = match args.seeded_subsample {
+        Some(SeededFraction { seed, fraction }) => (seed, fraction),
+        None => (SubsampleSeed::Auto, 0.0),
+    };
+
+    if let Some(f) = args.subsample {
+        fraction = f;
+    }
+
+    if let Some(s) = args.subsample_seed {
+        seed = s;
+    }
+
+    if fraction <= 0.0 {
+        return Ok(None);
+    }
+
+    let seed = match seed {
+        SubsampleSeed::Value(n) => n,
+        SubsampleSeed::Auto => {
+            let mut writer = sam::io::Writer::new(Vec::new());
+            writer.write_header(header)?;
+            fnv1a(&writer.into_inner())
+        }
+    };
+
+    header.add_comment(format!(
+        "Sub-sampled fraction={} seed={seed}",
+        format_g(fraction, 6)
+    ));
+
+    Ok(Some(Subsample::new(seed, fraction)))
+}
+
+/// khash's `__ac_FNV1a_hash_string`.
+fn fnv1a(s: &[u8]) -> u32 {
+    s.iter().fold(2_166_136_261, |h: u32, &b| {
+        (h ^ u32::from(b)).wrapping_mul(16_777_619)
+    })
+}
+
+/// The seed of a subsample.
+#[derive(Clone, Copy, Debug)]
+enum SubsampleSeed {
+    Value(u32),
+    /// Derived from the header.
+    Auto,
+}
+
+impl SubsampleSeed {
+    /// Parses `auto` or an integer (`strtol` with base 0, so `0x` prefixes work), which `srand`
+    /// truncates to 32 bits.
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        if s.eq_ignore_ascii_case("auto") {
+            return Ok(Self::Auto);
+        }
+
+        let n = parse_c_long(s).with_context(|| format!("Incorrect seed argument \"{s}\""))?;
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "samtools stores the seed in a uint32_t"
+        )]
+        Ok(Self::Value(n as u32))
+    }
+}
+
+/// `strtol(s, &end, 0)` that must consume the whole string.
+fn parse_c_long(s: &str) -> Option<i64> {
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+
+    let n = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        i64::from_str_radix(hex, 16).ok()?
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        i64::from_str_radix(&digits[1..], 8).ok()?
+    } else {
+        digits.parse().ok()?
+    };
+
+    Some(if negative { -n } else { n })
+}
+
+/// `-s INT.FRAC` or `-s auto.FRAC`.
+#[derive(Clone, Copy, Debug)]
+struct SeededFraction {
+    seed: SubsampleSeed,
+    fraction: f64,
+}
+
+impl SeededFraction {
+    fn parse(s: &str) -> anyhow::Result<Self> {
+        let invalid = || format!("Incorrect sampling argument \"{s}\"");
+
+        let (seed, fraction) = if s.len() > 4 && s[..4].eq_ignore_ascii_case("auto") {
+            (SubsampleSeed::Auto, &s[4..])
+        } else {
+            let i = s.find('.').with_context(invalid)?;
+            let raw_seed = &s[..i];
+
+            let seed: i64 = if raw_seed.is_empty() || raw_seed == "-" || raw_seed == "+" {
+                0
+            } else {
+                raw_seed.parse().with_context(invalid)?
+            };
+
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "samtools stores the seed in a uint32_t"
+            )]
+            (SubsampleSeed::Value(seed as u32), &s[i..])
+        };
+
+        if !fraction.starts_with('.') {
+            bail!(invalid());
+        }
+
+        let fraction = fraction.parse().with_context(invalid)?;
+        Ok(Self { seed, fraction })
+    }
+}
+
+/// `--subsample FLOAT`, between 0 and 1.
+fn parse_fraction(s: &str) -> anyhow::Result<f64> {
+    s.parse()
+        .ok()
+        .filter(|f| (0.0..=1.0).contains(f))
+        .with_context(|| format!("Incorrect sampling argument \"{s}\""))
 }
 
 /// The CRAM reference: `-T`, or else the FASTA of a `-t` index (`ref.fa` for `ref.fa.fai`), as
@@ -529,18 +778,7 @@ fn write_options(
     format: OutputFormat,
     reference: Option<PathBuf>,
 ) -> anyhow::Result<WriteOptions> {
-    let mut level = DEFAULT_LEVEL;
-
-    for option in &args.output_format_options {
-        match option.split_once('=') {
-            Some(("level", value)) => {
-                level = value
-                    .parse()
-                    .with_context(|| format!("invalid compression level: {value}"))?;
-            }
-            _ => bail!("unsupported output format option: {option}"),
-        }
-    }
+    let mut level = args.output_format_options.level(DEFAULT_LEVEL)?;
 
     if args.uncompressed {
         level = 0;
@@ -554,23 +792,6 @@ fn write_options(
         threads: args.threads,
         reference,
     })
-}
-
-/// Indexes the output file (`--write-index`).
-fn write_output_index(args: &Args, format: OutputFormat) -> anyhow::Result<()> {
-    let Some(output) = args.output.as_deref().filter(|p| *p != Path::new("-")) else {
-        bail!("--write-index needs an output file (-o)");
-    };
-
-    let kind = match format {
-        OutputFormat::Bam => IndexKind::Csi,
-        OutputFormat::Cram => IndexKind::Default,
-        OutputFormat::Sam => bail!("--write-index needs BAM or CRAM output"),
-    };
-
-    index_file(output, None, kind, args.threads)?;
-
-    Ok(())
 }
 
 /// Chooses the traversal and any region filter: `-M` merges the regions given; `-L` restricts to
@@ -776,29 +997,106 @@ enum Rejected {
     Written(AlignmentWriter),
 }
 
+/// Edits samtools makes to the records it writes (`adjust_tags`, `change_flag`).
+struct OutputEdits {
+    tags: TagEdit,
+    add_flags: u16,
+    remove_flags: u16,
+}
+
+/// Which tags the records written keep.
+enum TagEdit {
+    All,
+    /// Drop these (`-x`).
+    Remove(Vec<[u8; 2]>),
+    /// Keep only these (`--keep-tag`, `-x ^TAGS`).
+    Keep(Vec<[u8; 2]>),
+}
+
+impl OutputEdits {
+    /// Returns `None` when records are written as they are.
+    fn new(args: &Args) -> anyhow::Result<Option<Self>> {
+        let mut remove = Vec::new();
+        let mut keep = Vec::new();
+
+        for raw in &args.remove_tags {
+            match raw.strip_prefix('^') {
+                Some(tags) => keep.extend(parse_tags(tags)?),
+                None => remove.extend(parse_tags(raw)?),
+            }
+        }
+
+        for raw in &args.keep_tags {
+            keep.extend(parse_tags(raw)?);
+        }
+
+        let tags = if !keep.is_empty() {
+            TagEdit::Keep(keep)
+        } else if !remove.is_empty() {
+            TagEdit::Remove(remove)
+        } else {
+            TagEdit::All
+        };
+
+        let bits = |flags: Option<Flags>| flags.map_or(0, |f| f.bits());
+        let add_flags = bits(args.add_flags);
+        let remove_flags = bits(args.remove_flags);
+
+        Ok(
+            (!matches!(tags, TagEdit::All) || add_flags != 0 || remove_flags != 0).then_some(
+                Self {
+                    tags,
+                    add_flags,
+                    remove_flags,
+                },
+            ),
+        )
+    }
+
+    /// Writes the edited copy of the raw record `src` to `dst`.
+    fn apply(&self, src: &[u8], dst: &mut Vec<u8>) -> io::Result<()> {
+        match &self.tags {
+            TagEdit::All => {
+                dst.clear();
+                dst.extend_from_slice(src);
+            }
+            TagEdit::Remove(tags) => bam_raw::strip_fields(src, dst, |tag| tags.contains(&tag))?,
+            TagEdit::Keep(tags) => bam_raw::strip_fields(src, dst, |tag| !tags.contains(&tag))?,
+        }
+
+        if self.add_flags != 0 || self.remove_flags != 0 {
+            bam_raw::edit_flags(dst, self.add_flags, self.remove_flags)?;
+        }
+
+        Ok(())
+    }
+}
+
 /// Filters records and writes them.
 struct Sink<'a, 'f> {
     selector: Selector<'f>,
     writer: &'a mut AlignmentWriter,
     rejected: &'a mut Rejected,
-    remove_tags: &'a [[u8; 2]],
+    output_edits: Option<&'a OutputEdits>,
     encoder: RawEncoder,
-    stripped: Vec<u8>,
+    edited: Vec<u8>,
+    counts: Counts,
 }
 
 impl Sink<'_, '_> {
     fn emit(&mut self, rec: Rec<'_>, header: &sam::Header) -> anyhow::Result<()> {
         let (selected, rec) = self.selector.select(rec, header)?;
 
+        self.counts.processed += 1;
+        self.counts.accepted += u64::from(selected);
+
         if selected {
-            if self.remove_tags.is_empty() {
-                self.writer.write(header, &rec)?;
-            } else {
+            if let Some(edits) = self.output_edits {
                 let raw = rec.encode_raw(header, &mut self.encoder)?;
-                bam_raw::strip_fields(raw, &mut self.stripped, |tag| {
-                    self.remove_tags.contains(&tag)
-                })?;
-                self.writer.write_raw(header, &self.stripped)?;
+                edits.apply(raw, &mut self.edited)?;
+                self.writer.write_raw(header, &self.edited)?;
+            } else {
+                self.writer.write(header, &rec)?;
             }
 
             return Ok(());
@@ -825,8 +1123,9 @@ fn count(
     traversal: &Traversal,
     selector: &mut Selector<'_>,
     decoding: Decoding,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<Counts> {
     let mut n = 0u64;
+    let mut processed = 0u64;
 
     if let (AlignmentReader::Cram(cram_reader, repository, _), Decoding::Parallel) =
         (&mut *reader, decoding)
@@ -850,7 +1149,10 @@ fn count(
             },
         )?;
 
-        return Ok(n);
+        return Ok(Counts {
+            processed: n,
+            accepted: n,
+        });
     }
 
     visit(
@@ -860,6 +1162,7 @@ fn count(
         header,
         traversal,
         |rec| {
+            processed += 1;
             if selector.select(rec, header)?.0 {
                 n += 1;
             }
@@ -867,7 +1170,10 @@ fn count(
         },
     )?;
 
-    Ok(n)
+    Ok(Counts {
+        processed,
+        accepted: n,
+    })
 }
 
 /// `-P` (`fetch_pairs_collect_mates`): reads the regions once to collect the names and mate
@@ -962,13 +1268,14 @@ fn record_name(rec: &Rec<'_>) -> BString {
         .map_or_else(|| BString::from("*"), |name| name.to_owned())
 }
 
-fn parse_tags(raw: &[String]) -> anyhow::Result<Vec<[u8; 2]>> {
-    raw.iter()
+/// Parses a comma-separated tag list (`parse_aux_list`).
+fn parse_tags(raw: &str) -> anyhow::Result<Vec<[u8; 2]>> {
+    raw.split(',')
         .filter(|s| !s.is_empty())
         .map(|s| {
-            s.as_bytes()
-                .try_into()
-                .with_context(|| format!("invalid tag: {s}"))
+            s.as_bytes().try_into().with_context(
+                || "Error parsing option, auxiliary tags should be exactly two characters long",
+            )
         })
         .collect()
 }

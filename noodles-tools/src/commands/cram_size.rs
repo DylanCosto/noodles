@@ -19,6 +19,7 @@ use noodles_cram::{
 };
 
 use crate::cram_raw::{invalid_data, read_itf8, read_len, read_slice_header, take};
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, Verbosity};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -36,6 +37,15 @@ pub struct Args {
     /// Describe each container's encodings.
     #[arg(short = 'e', long = "encodings")]
     encodings: bool,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// The number of expanded compression methods (samtools' `COMP_MAX`).
@@ -129,6 +139,8 @@ const ARITH_EXTERNAL: u8 = 0x04;
 const CORE: i32 = -1;
 
 pub fn run(args: Args) -> anyhow::Result<()> {
+    args.input_format_options.validate()?;
+
     let input: Box<dyn Read> = match &args.input {
         Some(path) if path.as_os_str() != "-" => {
             Box::new(File::open(path).with_context(|| format!("opening {}", path.display()))?)

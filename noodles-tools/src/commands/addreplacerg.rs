@@ -7,6 +7,7 @@ use anyhow::{Context, bail};
 use bstr::BString;
 use noodles_sam as sam;
 
+use crate::global_args::{self, InputFormatOptions, OutputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentReader, RawEncoder, ReadOptions},
     bam_raw,
@@ -67,15 +68,38 @@ pub struct Args {
     /// Do not add an @PG line to the header.
     #[arg(long = "no-PG")]
     no_pg: bool,
+
+    /// Index the output file (CSI for BAM, CRAI for CRAM).
+    #[arg(long = "write-index")]
+    write_index: bool,
+
+    /// Input format; the format is detected, and any options (`FORMAT,OPT=VAL`) are applied as
+    /// --input-fmt-option.
+    #[arg(long = "input-fmt", value_name = "FORMAT[,OPT[=VAL]]...")]
+    input_format: Option<String>,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let read_options = ReadOptions {
+    let mut read_options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    let input_format_options = args
+        .input_format_options
+        .with_input_format(args.input_format.as_deref());
+    input_format_options.configure(&mut read_options)?;
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &read_options)?;
+    input_format_options.apply(&mut reader)?;
     let input_header = reader.read_header()?;
     let mut header = input_header.clone();
 
@@ -92,7 +116,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let write_options = WriteOptions {
         format,
-        level: output::parse_level(if args.uncompressed { 0 } else { 6 })?,
+        level: output::parse_level(if args.uncompressed {
+            0
+        } else {
+            args.output_format_options.level(6)?
+        })?,
         threads: args.threads,
         reference: args.reference,
     };
@@ -127,6 +155,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     })?;
 
     writer.finish(&header)?;
+
+    if args.write_index {
+        global_args::write_index(args.output.as_deref(), format, args.threads)?;
+    }
 
     Ok(())
 }

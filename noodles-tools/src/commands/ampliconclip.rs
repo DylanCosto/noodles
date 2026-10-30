@@ -19,6 +19,7 @@ use std::{
 use anyhow::{Context, bail};
 use noodles_sam as sam;
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, OutputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentReader, RawEncoder, ReadOptions},
     bam_raw::{self, le_u16, le_u32},
@@ -130,6 +131,18 @@ pub struct Args {
     /// Do not add an @PG line to the header.
     #[arg(long = "no-PG")]
     no_pg: bool,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// `clipping_type`
@@ -180,12 +193,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let (names, mut beds) = read_bed(&args.bed, strand_column)
         .context("[ampliconclip] error: unable to load bed file.")?;
 
-    let read_options = ReadOptions {
+    let mut read_options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    args.input_format_options.configure(&mut read_options)?;
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &read_options)?;
+    args.input_format_options.apply(&mut reader)?;
     let mut header = reader
         .read_header()
         .context("[ampliconclip] error: could not read header")?;
@@ -197,7 +212,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         program::add(&mut header)?;
     }
 
-    let level = output::parse_level(if args.uncompressed { 0 } else { 6 })?;
+    let level = output::parse_level(if args.uncompressed {
+        0
+    } else {
+        args.output_format_options.level(6)?
+    })?;
     let write_options = |path: &PathBuf| WriteOptions {
         format: args
             .output_format

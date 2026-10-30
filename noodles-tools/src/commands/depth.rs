@@ -12,6 +12,7 @@ use anyhow::{Context, bail};
 use crossbeam_channel::{Receiver, Sender};
 use noodles_sam::{self as sam, alignment::record::Flags};
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentReader, Queries, RawEncoder, ReadOptions, Rec},
     bam_raw::Record,
@@ -116,19 +117,32 @@ pub struct Args {
     /// Additional decompression threads per input.
     #[arg(short = '@', long = "threads", default_value_t = 0)]
     threads: usize,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let options = ReadOptions {
+    let mut options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    args.input_format_options.configure(&mut options)?;
 
     let (sources, indexes) = input_files(&args)?;
     let mut inputs = Vec::with_capacity(sources.len());
 
     for (i, src) in sources.iter().enumerate() {
         let (mut reader, path) = AlignmentReader::open(src, &options)?;
+        args.input_format_options.apply(&mut reader)?;
+        // As in samtools (CRAM_OPT_DECODE_MD set to 0); depth never reads MD or NM.
+        reader.keep_stored_md_nm();
         let header = reader.read_header()?;
         let index = indexes.as_ref().map(|indexes| PathBuf::from(&indexes[i]));
         inputs.push((reader, path, header, index));

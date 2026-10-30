@@ -51,8 +51,6 @@ known() {
             echo "HTSlib fails on CRAM slices with reads past the reference end (README)" ;;
         "coverage"*".cram" | "coverage"*" noseq bam" | "coverage"*" longcigar bam")
             echo "coverage meanbaseq leaves out missing qualities and decodes CRAM qualities (README)" ;;
-        "mpileup -B -a -Q 0 --ff 0 -x "*".cram")
-            echo "samtools mpileup turns off CRAM MD regeneration, so its MD column is *" ;;
         "reference cigarops 3.1.cram") echo "reference advances over N operations (README)" ;;
         *" flags 3.0.cram" | *" flags 3.1.cram" | *" flags embed.cram" | "view regions flags 3.1.cram")
             echo "HTSlib's CRAM decoder sets PAIRED on a detached read with only MREVERSE (52 -> 53)" ;;

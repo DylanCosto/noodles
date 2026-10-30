@@ -23,6 +23,7 @@ use std::{
 use anyhow::bail;
 use noodles_sam::{self as sam, header::record::value::map::read_group::tag::LIBRARY};
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, OutputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentReader, RawEncoder, ReadOptions},
     bam_raw::{self, Record},
@@ -64,6 +65,18 @@ pub struct Args {
     /// Additional threads for compression and decompression.
     #[arg(short = '@', long = "threads", default_value_t = 0)]
     threads: usize,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// Which records `-s`/`-S` deduplicate.
@@ -76,12 +89,14 @@ enum SingleEnd {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let read_options = ReadOptions {
+    let mut read_options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    args.input_format_options.configure(&mut read_options)?;
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &read_options)?;
+    args.input_format_options.apply(&mut reader)?;
     let header = reader.read_header()?;
 
     if header.reference_sequences().is_empty() {
@@ -93,7 +108,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .output_format
             .or_else(|| OutputFormat::from_path(&args.output))
             .unwrap_or(OutputFormat::Bam),
-        level: output::parse_level(6)?,
+        level: output::parse_level(args.output_format_options.level(6)?)?,
         threads: args.threads,
         reference: args.reference.clone(),
     };

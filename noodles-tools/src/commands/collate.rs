@@ -16,6 +16,7 @@ use noodles_sam::{
     },
 };
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, OutputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentReader, ReadOptions},
     commands::sort::{SortedRecords, create_temp_dir, parse_memory},
@@ -88,6 +89,18 @@ pub struct Args {
     /// Do not add an @PG line to the header.
     #[arg(long = "no-PG")]
     no_pg: bool,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -107,12 +120,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         (false, None, None) => bail!("give an output prefix, -o FILE, or -O for stdout"),
     };
 
-    let options = ReadOptions {
+    let mut options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    args.input_format_options.configure(&mut options)?;
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &options)?;
+    args.input_format_options.apply(&mut reader)?;
     let mut header = reader.read_header()?;
 
     let temp_dir = create_temp_dir(
@@ -141,7 +156,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let write_options = WriteOptions {
         format: args.output_format,
-        level: output::parse_level(if args.uncompressed { 0 } else { args.level })?,
+        level: output::parse_level(if args.uncompressed {
+            0
+        } else {
+            args.output_format_options.level(args.level)?
+        })?,
         threads: args.threads,
         reference: args.reference,
     };

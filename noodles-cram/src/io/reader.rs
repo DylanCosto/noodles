@@ -4,6 +4,7 @@ mod builder;
 pub(crate) mod collections;
 pub(crate) mod container;
 pub mod header;
+mod md_nm;
 pub(crate) mod num;
 pub(crate) mod query;
 mod records;
@@ -17,6 +18,7 @@ use noodles_sam as sam;
 pub use self::{
     builder::Builder,
     container::{Block, Container, read_block},
+    md_nm::MdNm,
     query::Query,
     records::Records,
 };
@@ -48,6 +50,7 @@ use crate::{FileDefinition, crai};
 pub struct Reader<R> {
     inner: R,
     reference_sequence_repository: fasta::Repository,
+    md_nm: MdNm,
 }
 
 impl<R> Reader<R> {
@@ -129,6 +132,33 @@ where
     /// ```
     pub fn set_reference_sequence_repository(&mut self, repository: fasta::Repository) {
         self.reference_sequence_repository = repository;
+    }
+
+    /// Returns whether decoded records get the MD and NM tags the file left out.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use noodles_cram::{self as cram, io::reader::MdNm};
+    /// let reader = cram::io::Reader::new(&[][..]);
+    /// assert_eq!(reader.md_nm(), MdNm::Regenerate);
+    /// ```
+    pub fn md_nm(&self) -> MdNm {
+        self.md_nm
+    }
+
+    /// Sets whether decoded records get the MD and NM tags the file left out.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use noodles_cram::{self as cram, io::reader::MdNm};
+    /// let mut reader = cram::io::Reader::new(&[][..]);
+    /// reader.set_md_nm(MdNm::AsStored);
+    /// assert_eq!(reader.md_nm(), MdNm::AsStored);
+    /// ```
+    pub fn set_md_nm(&mut self, md_nm: MdNm) {
+        self.md_nm = md_nm;
     }
 
     /// Returns a CRAM header reader.

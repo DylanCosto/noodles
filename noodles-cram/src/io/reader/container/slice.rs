@@ -19,7 +19,7 @@ use crate::{
         block::{self, ContentType},
         slice::Header,
     },
-    io::BitReader,
+    io::{BitReader, reader::MdNm},
     record::Feature,
 };
 
@@ -101,6 +101,29 @@ impl<'c> Slice<'c> {
         core_data_src: &'c [u8],
         external_data_srcs: &'c [(block::ContentId, Cow<'c, [u8]>)],
     ) -> io::Result<Vec<Record<'c>>> {
+        self.records_with_md_nm(
+            reference_sequence_repository,
+            header,
+            compression_header,
+            core_data_src,
+            external_data_srcs,
+            MdNm::Regenerate,
+        )
+    }
+
+    /// Reads and returns a list of raw records in this slice, adding the MD and NM tags the
+    /// slice left out only if `md_nm` is [`MdNm::Regenerate`].
+    ///
+    /// [`Self::records`] always regenerates them.
+    pub fn records_with_md_nm<'h: 'c, 'ch: 'c>(
+        &self,
+        reference_sequence_repository: fasta::Repository,
+        header: &'h sam::Header,
+        compression_header: &'ch CompressionHeader,
+        core_data_src: &'c [u8],
+        external_data_srcs: &'c [(block::ContentId, Cow<'c, [u8]>)],
+        md_nm: MdNm,
+    ) -> io::Result<Vec<Record<'c>>> {
         let core_data_reader = BitReader::new(core_data_src);
 
         let mut external_data_readers = ExternalDataReaders::new();
@@ -173,10 +196,47 @@ impl<'c> Slice<'c> {
         }
 
         for record in &mut records {
-            crate::record::md_nm::add_missing_md_nm(record);
+            crate::record::md_nm::add_missing_md_nm(record, md_nm);
         }
 
         resolve_mates(&mut records)?;
+
+        Ok(records)
+    }
+}
+
+impl<'c> Slice<'c> {
+    /// Decodes the records without reference sequences, mates, or `MD`/`NM` tags.
+    ///
+    /// Their positions, read lengths, and features are set, which is enough to compute
+    /// alignment spans (e.g., for indexing) without a reference sequence repository.
+    pub(crate) fn records_without_reference_sequences<'ch: 'c>(
+        &self,
+        compression_header: &'ch CompressionHeader,
+        core_data_src: &'c [u8],
+        external_data_srcs: &'c [(block::ContentId, Cow<'c, [u8]>)],
+    ) -> io::Result<Vec<Record<'c>>> {
+        let core_data_reader = BitReader::new(core_data_src);
+
+        let mut external_data_readers = ExternalDataReaders::new();
+
+        for (block_content_id, src) in external_data_srcs {
+            external_data_readers.insert(*block_content_id, src);
+        }
+
+        let mut reader = Records::new(
+            compression_header,
+            core_data_reader,
+            external_data_readers,
+            self.header.reference_sequence_context(),
+            self.header.record_counter(),
+        )?;
+
+        let mut records: Vec<Record<'c>> = vec![Record::default(); self.header.record_count()];
+
+        for record in &mut records {
+            reader.read_record(record)?;
+        }
 
         Ok(records)
     }
@@ -676,12 +736,22 @@ fn get_record_reference_sequence<'c>(
         .reference_sequence(header)
         .transpose()?
         .map(|(name, _)| name)
-        .expect("invalid reference sequence ID");
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid record reference sequence ID",
+            )
+        })?;
 
     let sequence = reference_sequence_repository
         .get(reference_sequence_name)
         .transpose()?
-        .expect("invalid reference sequence name");
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing reference sequence: {reference_sequence_name}"),
+            )
+        })?;
 
     Ok(Some(ReferenceSequence::External { sequence }))
 }

@@ -5,7 +5,10 @@
 
 use std::cmp::Ordering;
 
-use crate::bam_raw::{self, field, le_u16, le_u32};
+use crate::{
+    bam_raw::{self, field, le_u16, le_u32},
+    template_coordinate,
+};
 
 const REVERSE_COMPLEMENTED: u16 = 0x10;
 
@@ -24,6 +27,10 @@ pub enum Order {
     /// By the value of an auxiliary field, with records lacking it first, then by `then`
     /// (`samtools sort -t`).
     Tag { tag: [u8; 2], then: TagTieBreak },
+    /// By the coordinates of both ends of the template, library, `CB`, `MI`, name, and end
+    /// (`samtools sort --template-coordinate`). Records must be keyed (see
+    /// [`crate::template_coordinate`]).
+    TemplateCoordinate,
 }
 
 /// The order of records with equal [`Order::Tag`] values.
@@ -52,6 +59,7 @@ impl Order {
             Self::NameNatural => ("queryname", Some("queryname:natural".into())),
             Self::NameAscii => ("queryname", Some("queryname:lexicographical".into())),
             Self::Collate => ("unsorted", None),
+            Self::TemplateCoordinate => ("unsorted", Some("unsorted:template-coordinate".into())),
             Self::Tag { tag, then } => {
                 let then = match then {
                     TagTieBreak::Coordinate => "coordinate",
@@ -80,6 +88,7 @@ impl Order {
             Self::Tag { tag, .. } => {
                 self.compare_tagged(a, tag_value(a, tag), b, tag_value(b, tag))
             }
+            Self::TemplateCoordinate => template_coordinate::compare(a, b),
         }
     }
 
