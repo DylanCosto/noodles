@@ -73,6 +73,10 @@ pub struct Args {
     #[arg(short = 'm')]
     mate_score: bool,
 
+    /// Fix base modification tags (MM/ML/MN).
+    #[arg(short = 'M')]
+    base_mods: bool,
+
     /// Output uncompressed BAM.
     #[arg(short = 'u')]
     uncompressed: bool,
@@ -104,6 +108,7 @@ struct Options {
     proper_pair_check: bool,
     template_cigar: bool,
     mate_score: bool,
+    base_mods: bool,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -152,6 +157,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         proper_pair_check: !args.no_proper_pair_check,
         template_cigar: args.template_cigar,
         mate_score: args.mate_score,
+        base_mods: args.base_mods,
     };
 
     let lengths: Vec<usize> = header
@@ -181,7 +187,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let flush =
         |template: &mut Vec<RecordBuf>, writer: &mut AlignmentWriter| -> anyhow::Result<()> {
-            fix_template(template, options)?;
+            fix_template(template, options, &header)?;
 
             for record in template.iter() {
                 let flags = record.flags();
@@ -345,7 +351,7 @@ fn fix_batch(batch: &[u8], config: &BatchConfig<'_>) -> anyhow::Result<Vec<u8>> 
     let mut template: Vec<RecordBuf> = Vec::new();
 
     let mut flush = |template: &mut Vec<RecordBuf>| -> anyhow::Result<()> {
-        fix_template(template, config.options)?;
+        fix_template(template, config.options, config.header)?;
 
         for record in template.iter() {
             let removed = config.options.remove_reads
@@ -748,7 +754,11 @@ fn pair_mut(records: &mut [RecordBuf], i: usize, j: usize) -> (&mut RecordBuf, &
 }
 
 /// Fixes one template (records sharing a name), as `bam_mating_core` does.
-fn fix_template(records: &mut [RecordBuf], options: Options) -> anyhow::Result<()> {
+fn fix_template(
+    records: &mut [RecordBuf],
+    options: Options,
+    header: &sam::Header,
+) -> anyhow::Result<()> {
     let not_primary = Flags::SECONDARY | Flags::SUPPLEMENTARY;
 
     let mut pre: Option<usize> = None;
@@ -764,6 +774,10 @@ fn fix_template(records: &mut [RecordBuf], options: Options) -> anyhow::Result<(
         }
 
         let is_r2 = usize::from(flags.is_last_segment());
+
+        if options.base_mods {
+            base_mods::fix_primary(&mut records[n], header)?;
+        }
 
         let Some(p) = pre else {
             pre = Some(n);
@@ -871,9 +885,430 @@ fn fix_template(records: &mut [RecordBuf], options: Options) -> anyhow::Result<(
                 sync_mq_mc(mate, record);
             }
         }
+
+        if options.base_mods {
+            match by_segment[usize::from(flags.is_last_segment())] {
+                Some(p) => {
+                    let (primary, record) = pair_mut(records, p, n);
+                    base_mods::fix_secondary(primary, record, header)?;
+                }
+                // Records with base modifications but no known primary are only validated.
+                None => base_mods::validate(&mut records[n], header)?,
+            }
+        }
     }
 
     Ok(())
+}
+
+/// `fix_MM` and its helpers: base modification tags are checked against the sequence, and those
+/// of secondary and supplementary alignments trimmed where hard clips removed bases.
+mod base_mods {
+    use anyhow::bail;
+    use noodles_pileup::{Read, baq::SEQ_NT16_TABLE, mods::BaseMods};
+    use noodles_sam::{
+        self as sam,
+        alignment::{
+            RecordBuf,
+            io::Write as _,
+            record::{cigar::op::Kind, data::field::Tag},
+            record_buf::data::field::{Value, value::Array},
+        },
+    };
+
+    const MM: Tag = Tag::new(b'M', b'M');
+    const ML: Tag = Tag::new(b'M', b'L');
+    const MN: Tag = Tag::new(b'M', b'N');
+
+    /// The tags `delete_mod_tags` removes.
+    const MOD_TAGS: [Tag; 5] = [MM, Tag::new(b'M', b'm'), ML, Tag::new(b'M', b'l'), MN];
+
+    /// `fix_MM` for a primary alignment.
+    pub(super) fn fix_primary(record: &mut RecordBuf, header: &sam::Header) -> anyhow::Result<()> {
+        rename_draft_tags(record);
+
+        if record.data().get(&MM).is_none() {
+            delete_tags(record);
+            return Ok(());
+        }
+
+        let (end5, end3) = hard_clips(record);
+        let mn = mn_value(record);
+        let len = record.sequence().len();
+
+        if end5 == 0 && end3 == 0 && mn <= 0 {
+            // No MN tag, but also no clipping: the MM tag is assumed to be valid.
+            if len > 0 {
+                set_mn(record, len)?;
+            }
+        } else if (end5 > 0 || end3 > 0) && i64::try_from(len).ok() != Some(mn) {
+            // The bases were hard clipped after the modifications were called.
+            delete_tags(record);
+        }
+
+        validate(record, header)
+    }
+
+    /// `fix_MM` for a secondary or supplementary alignment with a known primary.
+    pub(super) fn fix_secondary(
+        primary: &RecordBuf,
+        record: &mut RecordBuf,
+        header: &sam::Header,
+    ) -> anyhow::Result<()> {
+        rename_draft_tags(record);
+
+        if record.data().get(&MM).is_none() {
+            delete_tags(record);
+            return Ok(());
+        }
+
+        let (end5, end3) = hard_clips(record);
+        let mn = mn_value(record);
+        let len = record.sequence().len();
+        let primary_len = primary.sequence().len();
+
+        // An MN matching the sequence length means the tags are already valid.
+        if i64::try_from(len).ok() == Some(mn) {
+            return validate(record, header);
+        }
+
+        if primary_len != len + end3 + end5 {
+            delete_tags(record);
+            return Ok(());
+        }
+
+        if (end5 > 0 || end3 > 0) && (mn < 0 || i64::try_from(primary_len).ok() == Some(mn)) {
+            trim(primary, record, end5, end3);
+        }
+
+        // samtools ignores this failure (a non-integer MN) for these records, skipping the
+        // validation.
+        if len > 0 && set_mn(record, len).is_err() {
+            return Ok(());
+        }
+
+        validate(record, header)
+    }
+
+    /// Removes the base modification tags if they do not parse or do not fit the sequence.
+    pub(super) fn validate(record: &mut RecordBuf, header: &sam::Header) -> anyhow::Result<()> {
+        let mut writer = noodles_bam::io::Writer::from(Vec::new());
+        writer.write_alignment_record(header, record)?;
+        let mut raw = writer.into_inner();
+        raw.drain(..size_of::<u32>());
+
+        let read = Read::new(raw)?;
+
+        let is_valid = BaseMods::parse(&read).and_then(|mut mods| mods.validate(&read));
+
+        if is_valid.is_err() {
+            delete_tags(record);
+        }
+
+        Ok(())
+    }
+
+    /// `find_tags`: the draft tags Mm, Ml, and Mn become MM, ML, and MN, in place.
+    fn rename_draft_tags(record: &mut RecordBuf) {
+        let upgrade = |tag: Tag| match *tag.as_ref() {
+            [b'M', c @ (b'm' | b'l' | b'n')] => Tag::new(b'M', c.to_ascii_uppercase()),
+            _ => tag,
+        };
+
+        let data = record.data_mut();
+
+        if data.keys().all(|tag| upgrade(tag) == tag) {
+            return;
+        }
+
+        let fields: Vec<(Tag, Value)> = data
+            .iter()
+            .map(|(tag, value)| (upgrade(tag), value.clone()))
+            .collect();
+
+        *data = fields.into_iter().collect();
+    }
+
+    /// `delete_mod_tags`
+    fn delete_tags(record: &mut RecordBuf) {
+        let data = record.data_mut();
+
+        for tag in MOD_TAGS {
+            data.shift_remove(&tag);
+        }
+    }
+
+    /// The MN value, or -1 if it is absent or not an integer.
+    fn mn_value(record: &RecordBuf) -> i64 {
+        record.data().get(&MN).and_then(Value::as_int).unwrap_or(-1)
+    }
+
+    /// `bam_aux_update_int`: sets MN in place, or appends it, with HTSlib's smallest type.
+    fn set_mn(record: &mut RecordBuf, len: usize) -> anyhow::Result<()> {
+        let value = match u32::try_from(len)? {
+            n if n < u32::from(u8::MAX) => Value::UInt8(u8::try_from(n)?),
+            n if n < u32::from(u16::MAX) => Value::UInt16(u16::try_from(n)?),
+            n => Value::UInt32(n),
+        };
+
+        let data = record.data_mut();
+
+        match data.get_mut(&MN) {
+            Some(old) if old.is_int() => *old = value,
+            Some(_) => bail!("MN tag is not an integer"),
+            None => {
+                data.insert(MN, value);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The 5' and 3' hard clip lengths.
+    fn hard_clips(record: &RecordBuf) -> (usize, usize) {
+        let ops = record.cigar().as_ref();
+
+        let left = match ops.first() {
+            Some(op) if op.kind() == Kind::HardClip => op.len(),
+            _ => 0,
+        };
+
+        let right = match ops {
+            [_, .., last] if last.kind() == Kind::HardClip => last.len(),
+            _ => 0,
+        };
+
+        if record.flags().is_reverse_complemented() {
+            (right, left)
+        } else {
+            (left, right)
+        }
+    }
+
+    /// `trim_MM`: drops the MM deltas and ML likelihoods of the bases hard clipped from
+    /// `record`, using its primary's sequence to count them, and removes MN (to be set again).
+    fn trim(primary: &RecordBuf, record: &mut RecordBuf, end5: usize, end3: usize) {
+        let mut counts5 = [0i64; 16];
+
+        let bases = primary.sequence().as_ref();
+        let code = |i: usize| usize::from(SEQ_NT16_TABLE[usize::from(bases[i])]);
+
+        for i in 0..end5 {
+            counts5[code(i)] += 1;
+        }
+
+        let mut counts3 = counts5;
+
+        for i in end5..bases.len() - end3 {
+            counts3[code(i)] += 1;
+        }
+
+        let data = record.data_mut();
+
+        let Some(Value::String(mm)) = data.get(&MM) else {
+            return;
+        };
+
+        // samtools ignores ML unless it is a B:C array.
+        let ml = match data.get(&ML) {
+            Some(Value::Array(Array::UInt8(ml))) => Some(&ml[..]),
+            _ => None,
+        };
+
+        let (mm, ml) = trim_values(mm, ml, &counts5, &counts3);
+
+        if let Some(value) = data.get_mut(&MM) {
+            *value = Value::String(mm.into());
+        }
+
+        if let (Some(ml), Some(value)) = (ml, data.get_mut(&ML)) {
+            *value = Value::Array(Array::UInt8(ml));
+        }
+
+        data.shift_remove(&MN);
+    }
+
+    /// The trimming of `trim_MM` on the MM and ML values, given the counts of each base type
+    /// before the 5' clip point (`counts5`) and before the 3' one (`counts3`).
+    fn trim_values(
+        mm: &[u8],
+        ml: Option<&[u8]>,
+        counts5: &[i64; 16],
+        counts3: &[i64; 16],
+    ) -> (Vec<u8>, Option<Vec<u8>>) {
+        let at = |i: usize| mm.get(i).copied().unwrap_or(0);
+        let ml_at = |i: usize| ml.and_then(|ml| ml.get(i)).copied().unwrap_or(0);
+
+        let mut out = Vec::with_capacity(mm.len());
+        let mut ml_out = Vec::new();
+        let mut ml_pos = 0;
+        let mut p = 0;
+
+        while at(p) != 0 {
+            let fundamental = usize::from(SEQ_NT16_TABLE[usize::from(at(p))]);
+
+            // The base, strand, and codes, and the comma after them.
+            while at(p) != 0 && at(p) != b',' {
+                out.push(at(p));
+                p += 1;
+            }
+
+            if at(p) != 0 {
+                out.push(at(p));
+                p += 1;
+            }
+
+            let mut n = 0;
+
+            // Drop the deltas within the 5' clip, shortening the one crossing it.
+            while at(p) != b';' && n < counts5[fundamental] {
+                let (delta, end) = strtol(mm, p);
+
+                if counts5[fundamental] - n > delta {
+                    n += delta + 1;
+                    ml_pos += 1;
+                } else if counts3[fundamental] > counts5[fundamental] {
+                    out.extend_from_slice(
+                        (delta - (counts5[fundamental] - n)).to_string().as_bytes(),
+                    );
+                    out.push(at(end));
+                    n += delta + 1;
+
+                    if ml.is_some() {
+                        ml_out.push(ml_at(ml_pos));
+                    }
+
+                    ml_pos += 1;
+                } else {
+                    // The next call is on the 3' clip point.
+                    break;
+                }
+
+                p = end;
+
+                if at(p) != b',' {
+                    break;
+                }
+
+                p += 1;
+            }
+
+            // Copy the deltas up to the 3' clip point.
+            while at(p) != b';' && n < counts3[fundamental] {
+                let (delta, end) = strtol(mm, p);
+
+                if counts3[fundamental] - n > delta {
+                    out.extend((p..=end).map(at));
+                    n += delta + 1;
+
+                    if ml.is_some() {
+                        ml_out.push(ml_at(ml_pos));
+                    }
+                } else {
+                    n = counts3[fundamental];
+                }
+
+                ml_pos += 1;
+                p = end;
+
+                if at(p) != b',' {
+                    break;
+                }
+
+                p += 1;
+            }
+
+            // Skip the rest of the entry.
+            while at(p) != 0 && at(p) != b';' {
+                while at(p) != 0 && at(p) != b',' && at(p) != b';' {
+                    p += 1;
+                }
+
+                if at(p) == b',' {
+                    p += 1;
+                }
+
+                ml_pos += 1;
+            }
+
+            // A trailing comma (clipping on the right) becomes the entry's semicolon.
+            if let Some(last) = out.last_mut() {
+                *last = b';';
+            }
+
+            if at(p) != 0 {
+                p += 1;
+            }
+        }
+
+        (out, ml.map(|_| ml_out))
+    }
+
+    /// C's `strtol` (base 10): the value and the index after it, or `(0, start)` if there are no
+    /// digits.
+    fn strtol(s: &[u8], start: usize) -> (i64, usize) {
+        let at = |i: usize| s.get(i).copied().unwrap_or(0);
+
+        let mut i = start;
+
+        while matches!(at(i), b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) {
+            i += 1;
+        }
+
+        let negative = at(i) == b'-';
+
+        if matches!(at(i), b'+' | b'-') {
+            i += 1;
+        }
+
+        if !at(i).is_ascii_digit() {
+            return (0, start);
+        }
+
+        let mut n: i64 = 0;
+
+        while at(i).is_ascii_digit() {
+            n = n.saturating_mul(10).saturating_add(i64::from(at(i) - b'0'));
+            i += 1;
+        }
+
+        (if negative { -n } else { n }, i)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_trim_values() {
+            let counts = |c: usize| {
+                let mut counts = [0; 16];
+                counts[2] = c as i64;
+                counts
+            };
+
+            // Two C bases clipped at the 5' end, ten kept: the first call is dropped.
+            let (mm, ml) = trim_values(b"C+m,1,3,2;", Some(&[10, 20, 30]), &counts(2), &counts(12));
+            assert_eq!(mm, b"C+m,3,2;");
+            assert_eq!(ml, Some(vec![20, 30]));
+
+            // A clip point within a gap shortens it.
+            let (mm, ml) = trim_values(b"C+m,1,3,2;", Some(&[10, 20, 30]), &counts(3), &counts(12));
+            assert_eq!(mm, b"C+m,2,2;");
+            assert_eq!(ml, Some(vec![20, 30]));
+
+            // Bases clipped at the 3' end.
+            let (mm, ml) = trim_values(b"C+m,1,3,2;", Some(&[10, 20, 30]), &counts(0), &counts(5));
+            assert_eq!(mm, b"C+m,1;");
+            assert_eq!(ml, Some(vec![10]));
+        }
+
+        #[test]
+        fn test_strtol() {
+            assert_eq!(strtol(b"12,3", 0), (12, 2));
+            assert_eq!(strtol(b";", 0), (0, 0));
+        }
+    }
 }
 
 /// samtools appends mate scores as `i` (32-bit) values.

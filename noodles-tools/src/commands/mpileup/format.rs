@@ -428,7 +428,7 @@ pub(super) fn push_int(dst: &mut Vec<u8>, n: i64) {
 
 /// htslib's `kputd`: up to six significant digits, trailing zeros dropped, and `%g` outside
 /// [0.0001, 999999].
-pub(super) fn push_kputd(dst: &mut Vec<u8>, d: f64) {
+pub(crate) fn push_kputd(dst: &mut Vec<u8>, d: f64) {
     if d == 0.0 {
         dst.extend_from_slice(if d.is_sign_negative() { b"-0" } else { b"0" });
         return;

@@ -26,14 +26,14 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `idxstats` | `idxstats` | from BAM index metadata; scans CRAM/SAM |
 | `depth` | `depth` | `-a/-aa`, `-r`, `-b`, `-J`, `-s`, `-q/-Q`, `-g/-G`, `-l`, `-H`, several inputs |
 | `coverage` | `coverage` | per reference or `-r` region; `-q/-Q`, `-l`, flag filters (no `-m` histogram) |
-| `fastq`, `fasta` | `fastq`, `fasta` | `-0/-1/-2/-s/-o`, `-n/-N`, `-t/-T`, `-F/-f/-G`, `.gz` output |
+| `fastq`, `fasta` | `fastq`, `fasta` | `-0/-1/-2/-s/-o`, `-n/-N`, `-t/-T` (`*` for all tags), `-F/-f/-G/--rf`, `-d/-D` (tag filters), `-O` (OQ qualities), `-i` (CASAVA), `--i1/--i2`, `--index-format`, `--barcode-tag/--quality-tag`, `-v`, `-U/--UMI-tag`, `--no-sc/--sc-aux/--no-sc-bkp`, `-c`, `.gz` output |
 | `quickcheck` | `quickcheck` | `-v`, `-q`, `-u` |
 | `reheader` | `reheader` | BAM; copies compressed blocks |
 | `cat` | `cat` | BAM; copies compressed blocks |
 | `split` | `split` | by read group or `-d` tag; `-f`, `-p`, `-u`, `-M` |
 | `collate` | `collate` | groups templates by name; `-f`, `-O/-o`, `-u`, `-l`, `-m`, `-T` |
-| `fixmate` | `fixmate` | `-m`, `-c`, `-r`, `-p`, `-z`; parallel with `-@` |
-| `dict` | `dict` | `-a`, `-s`, `-u`, `-H`, `-o` |
+| `fixmate` | `fixmate` | `-m`, `-c`, `-r`, `-p`, `-z`, `-M` (base modification tags); parallel with `-@` |
+| `dict` | `dict` | `-a`, `-s`, `-u`, `-H`, `-o`, `-A` (`AN` aliases), `-l` (`AH` for alternate loci) |
 | `bedcov` | `bedcov` | `-c`, `-d`, `-j`, `-Q`, `-g/-G`, `-H`; several inputs |
 | `addreplacerg` | `addreplacerg` | `-r` (repeatable, `\t` escapes), `-R`, `-m overwrite_all\|orphan_only`, `-w` |
 | `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-S`, `-t`, `-d` (optical duplicates), `-T`, `-s/-f`, `--json`, `--no-multi-dup`, `--include-fails`, `--use-read-groups`, `--duplicate-count`, `--read-coords`/`--coords-order`, `--barcode-tag`/`-name`/`-rgx`, `--move-umi-to-tag`, `--umi-separator` |
@@ -134,6 +134,17 @@ Intentional differences:
   bases on the tagged corpus, against none for ntools). A region with no data is labelled with
   its range (`>chr:1-100`), as one with data is; samtools labels it as the whole sequence. An
   `MD` tag that runs past the CIGAR is reported as an error; samtools fails without a message.
+- `fastq`/`fasta` group records by name. samtools compares each record with a name it can
+  overwrite: after a copy of a read without qualities is replaced by one with them, the next
+  template is merged into the group, losing reads or pairing reads of different templates.
+  Index reads (`--i1/--i2`) end with the barcode tag: samtools reads on past its end (as with
+  `i*i*` and a barcode without a separator) and writes the following tag bytes as an index
+  read. Barcodes that are not strings give no index reads; samtools reads their binary values
+  as text. As in samtools, reads without qualities are written with `B` qualities, and `-v`
+  applies only to index reads.
+- `fixmate -M`: a hard-clipped secondary or supplementary alignment whose `ML` tag is not a
+  `B:C` array loses its base modification tags, as invalid ones are; samtools drops `ML` and
+  every tag after it, and writes corrupt records when `ML` has fewer values than `MM` calls.
 
 ## Performance
 

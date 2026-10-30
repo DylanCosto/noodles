@@ -424,6 +424,35 @@ impl BaseMods {
         Ok(())
     }
 
+    /// Walks the rest of the read as repeated `bam_next_basemod` calls do (samtools fixmate's
+    /// `validate_MM`), which also checks that a forward read's MM tag does not refer to bases
+    /// past its end.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the MM tag is malformed or runs past the sequence.
+    pub fn validate(&mut self, read: &Read) -> Result<(), ParseError> {
+        /// `bam_next_basemod` treats counts at least this large as "no more calls".
+        const NO_MORE_CALLS: i64 = 0x7f00_0000;
+
+        let mut calls = Vec::new();
+
+        while self.seq_pos < read.sequence_len() {
+            self.next_position(read, &mut calls)?;
+        }
+
+        // The reverse strand's run-overs are found when parsing.
+        if read.sequence_len() > 0 && read.flags() & REVERSE == 0 {
+            for state in &self.mods {
+                if state.count < NO_MORE_CALLS || !matches!(self.mm[state.mm], 0 | b';') {
+                    return Err(ParseError("MM tag refers to bases beyond sequence length"));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn call(&self, i: usize) -> BaseModification {
         let state = &self.mods[i];
 

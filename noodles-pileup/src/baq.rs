@@ -23,6 +23,13 @@ pub const SEQ_NT16_TABLE: [u8; 256] = {
 
     table[b'U' as usize] = 8;
     table[b'u' as usize] = 8;
+
+    // htslib also reads 0-3 as A, C, G, and T.
+    table[b'0' as usize] = 1;
+    table[b'1' as usize] = 2;
+    table[b'2' as usize] = 4;
+    table[b'3' as usize] = 8;
+
     table
 };
 

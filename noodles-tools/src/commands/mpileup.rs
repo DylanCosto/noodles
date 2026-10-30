@@ -22,6 +22,8 @@ mod input;
 mod reference;
 mod regions;
 
+pub(crate) use format::push_kputd;
+
 use anyhow::{Context, bail};
 use noodles_pileup::{Overlaps, Pileup};
 use noodles_sam as sam;

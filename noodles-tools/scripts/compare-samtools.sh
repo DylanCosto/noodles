@@ -174,6 +174,41 @@ check "merge" "$st merge -c -p --no-PG -f -o - p1.bam p2.bam | $st view --no-PG 
 # duplicate marking pipeline
 check "fixmate" "$st fixmate --no-PG short.name.bam - | $st view --no-PG -h -" "$nt fixmate --no-PG short.name.bam /dev/stdout | $st view --no-PG -h -"
 check "fixmate -m -c -r -@4" "$st fixmate --no-PG -m -c -r short.name.bam - | $st view --no-PG -h -" "$nt fixmate --no-PG -m -c -r -@ 4 short.name.bam /dev/stdout | $st view --no-PG -h -"
+
+# fixmate -M: base modification tags on long reads, and synthetic primaries, hard-clipped
+# supplementary and secondary alignments (both strands), draft Mm/Ml tags, and invalid tags
+fm_long_name=$("$st" idxstats "$long" | head -1 | cut -f1)
+"$st" view -u "$long" "$fm_long_name:1-300000" | "$st" sort -n --no-PG -o fm.long.bam -
+{
+    printf '@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:c1\tLN:1000\n'
+    s=ACGTCCGACGTCAACGCCGA q=IIIIIIIIIIIIIIIIIIII mm='MM:Z:C+m,0,2,1;\tML:B:C,10,20,30'
+    printf "t1\t0\tc1\t100\t60\t20M\t*\t0\t0\t$s\t$q\t$mm\tXX:i:1\n"
+    printf "t1\t2048\tc1\t300\t60\t5H10M5H\t*\t0\t0\tCGACGTCAAC\tIIIIIIIIII\t$mm\tXX:i:2\n"
+    printf "t1\t2064\tc1\t500\t60\t4H13M3H\t*\t0\t0\tCGTTGACGTCGGA\tIIIIIIIIIIIII\t$mm\tXX:i:3\n"
+    printf "t1\t256\tc1\t600\t60\t20M\t*\t0\t0\t$s\t$q\t$mm\tMN:i:20\n"
+    printf "t1\t256\tc1\t700\t60\t3H10M\t*\t0\t0\tTCCGACGTCA\tIIIIIIIIII\t$mm\n"
+    printf "t2\t0\tc1\t100\t60\t20M\t*\t0\t0\t$s\t$q\tMm:Z:C+m,0,2,1;\tMl:B:C,10,20,30\tXX:i:1\n"
+    printf "t2\t2048\tc1\t300\t60\t5H10M5H\t*\t0\t0\tCGACGTCAAC\tIIIIIIIIII\tMm:Z:C+m,0,2,1;\tMl:B:C,10,20,30\tMn:i:20\n"
+    printf "t3\t0\tc1\t100\t60\t5H15M\t*\t0\t0\tCGACGTCAACGCCGA\tIIIIIIIIIIIIIII\t$mm\n"
+    printf "t4\t0\tc1\t100\t60\t5H15M\t*\t0\t0\tCGACGTCAACGCCGA\tIIIIIIIIIIIIIII\tMM:Z:C+m,0,1;\tML:B:C,10,20\tMN:i:15\n"
+    printf "t5\t0\tc1\t100\t60\t20M\t*\t0\t0\t$s\t$q\tMM:Z:C+m,0,2,9;\tML:B:C,10,20,30\n"
+    printf "t6\t0\tc1\t100\t60\t20M\t*\t0\t0\t$s\t$q\tML:B:C,10,20,30\tMN:i:20\tXX:i:6\n"
+    printf "t7\t65\tc1\t100\t60\t20M\t=\t200\t0\t$s\t$q\tMM:Z:C+m?,0,2,1;A+a,1;\tML:B:C,10,20,30,40\n"
+    printf "t7\t129\tc1\t200\t60\t20M\t=\t100\t0\t$s\t$q\t$mm\n"
+    printf "t7\t2113\tc1\t400\t60\t10H10M\t=\t200\t0\tTCAACGCCGA\tIIIIIIIIII\tMM:Z:C+m?,0,2,1;A+a,1;\tML:B:C,10,20,30,40\n"
+    printf "t7\t2177\tc1\t400\t60\t10M10H\t=\t100\t0\tACGTCCGACG\tIIIIIIIIII\t$mm\n"
+    printf "t8\t256\tc1\t100\t60\t20M\t*\t0\t0\t$s\t$q\t$mm\n"
+    printf "t8\t256\tc1\t100\t60\t20M\t*\t0\t0\t$s\t$q\tMM:Z:C+m,0,2,9;\tML:B:C,10,20,30\n"
+    printf "t9\t16\tc1\t100\t60\t20M\t*\t0\t0\tTCGGCGTTGACGTCGGACGT\t$q\t$mm\n"
+    printf "t9\t2064\tc1\t300\t60\t5H10M5H\t*\t0\t0\tGTTGACGTCG\tIIIIIIIIII\t$mm\n"
+    printf "t10\t0\tc1\t100\t60\t20M\t*\t0\t0\t$s\t*\tMM:Z:C+m.,0,2,1;\tML:B:C,10,20,30\n"
+    printf 't11\t4\t*\t0\t0\t*\t*\t0\t0\t*\t*\tMM:Z:C+m;\tMN:i:0\n'
+} > fm-mods.sam
+for opts in "-M" "-M -r -m -c -@2"; do
+    check "fixmate $opts (synthetic mods)" "$st fixmate --no-PG $opts fm-mods.sam - | $st view --no-PG -h -" "$nt fixmate --no-PG $opts fm-mods.sam /dev/stdout | $st view --no-PG -h -"
+done
+check "fixmate -M (long)" "$st fixmate --no-PG -M fm.long.bam - | $st view --no-PG -h -" "$nt fixmate --no-PG -M fm.long.bam /dev/stdout | $st view --no-PG -h -"
+check "fixmate -M -@4 (long)" "$st fixmate --no-PG -M fm.long.bam - | $st view --no-PG -h -" "$nt fixmate --no-PG -M -@ 4 fm.long.bam /dev/stdout | $st view --no-PG -h -"
 "$st" fixmate -m --no-PG short.name.bam - | "$st" sort --no-PG -o fixed.bam -
 check "markdup" "$st markdup --no-PG fixed.bam - | $st view --no-PG -h -" "$nt markdup --no-PG fixed.bam /dev/stdout | $st view --no-PG -h -"
 check "markdup -c -m s" "$st markdup --no-PG -c -m s fixed.bam - | $st view --no-PG -h -" "$nt markdup --no-PG -c -m s fixed.bam /dev/stdout | $st view --no-PG -h -"
@@ -220,6 +255,48 @@ check "fastq" "$st fastq short.name.bam" "$nt fastq short.name.bam"
 check "fastq -n -t" "$st fastq -n -t $tagged" "$nt fastq -n -t $tagged"
 check "fasta" "$st fasta short.name.bam" "$nt fasta short.name.bam"
 
+# fastq/fasta options: tag filters, OQ, soft-clip removal, routing, CASAVA and index reads, UMIs.
+# samtools reads index reads past the end of the barcode tag ("i*i*" after a barcode without a
+# separator), so only formats that stay within it are compared.
+{
+    printf '@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:c1\tLN:1000\n'
+    printf 'a1\t99\tc1\t1\t60\t2S6M2S\t=\t20\t30\tACGTACGTAC\tABCDEFGHIJ\tRG:Z:g1\tXI:i:5\tXF:f:0.5\tOQ:Z:##########\ts0:Z:old\tBC:Z:AAAA-CCCC\tQT:Z:12345678.\n'
+    printf 'a1\t147\tc1\t20\t60\t3S5M1I1S\t=\t1\t-30\tTTTTGGGGCA\tJIHGFEDCBA\tRG:Z:g2\tXI:i:5\tOQ:Z:!!!\tBC:Z:AAAA-CCCC\n'
+    printf 'a2\t77\t*\t0\t0\t*\t*\t0\t0\tACGTA\t*\tRG:Z:g1\tXA:A:x\tXH:H:1AFF\n'
+    printf 'a2\t141\t*\t0\t0\t*\t*\t0\t0\tACGTA\t*\tRG:Z:g3\tXI:i:-7\n'
+    printf 'a3\t0\tc1\t5\t60\t10S\t*\t0\t0\tACGTACGTAC\tABCDEFGHIJ\tRG:Z:g1\tXI:i:200\n'
+    printf 'a4\t16\tc1\t5\t60\t4M2D4M2S\t*\t0\t0\tACGTACGTAC\tABCDEFGHIJ\tRG:Z:g2\tXI:i:5\tXF:f:0.5\n'
+    printf 'a5\t1\t*\t0\t0\t*\t*\t0\t0\t*\t*\tRG:Z:g1\n'
+    printf 'a6\t129\tc1\t5\t60\t4M\t*\t0\t0\tACGT\tABCD\tXI:i:-300\tXF:f:1e-07\n'
+    printf 'a7\t65\tc1\t5\t60\t4M\t*\t0\t0\tACGT\tABCD\tXI:i:5\tXF:f:3.25\tBC:Z:GGTT\tQT:Z:9999\n'
+    printf 'a7\t129\tc1\t5\t60\t4M\t*\t0\t0\tACGT\tABCD\tXF:f:0.5\tBC:Z:TT\n'
+    printf 'a8\t1105\tc1\t5\t60\t4M\t*\t0\t0\tACGT\tABCD\tXB:B:f,1.5,0.25\tXC:B:S,1,65535\n'
+    printf 'p3\t589\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\tBC:Z:acgtNN\tQT:Z:######\n'
+    printf 'p4\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\tBC:Z:1CG\n'
+    printf 'p6#ACG\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\tOX:Z:TT\tRX:Z:aa-cc\n'
+    printf 'p7:x\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\tRX:Z:GG\n'
+} > fq-opts.sam
+printf 'g1\ng3\r\n' > fq-rg.txt
+for opts in "-T '*'" "-t -T XI,XF" "-d RG:g1 -d RG:g2" "-d XF:0.500000 -T XF" "-d XA" "-D RG:fq-rg.txt" \
+    "-O -T '*'" "--no-sc -T '*'" "--no-sc --no-sc-bkp --sc-aux xx -O" "--no-sc --sc-aux xx -T xx" \
+    "--rf 0x10 -F 0" "--incl-flags 0x80 -G 0xc0" "-U" "-U --UMI-tag RX -N" \
+    "-i --index-format 'i4n1i*'" "-i --barcode-tag RG --if 'n1i*'"; do
+    check "fastq $opts (synthetic)" "$st fastq $opts fq-opts.sam" "$nt fastq $opts fq-opts.sam"
+done
+check "fasta -T * --no-sc (synthetic)" "$st fasta -T '*' --no-sc fq-opts.sam" "$nt fasta -T '*' --no-sc fq-opts.sam"
+check "fastq -1 -2 -0 -s (synthetic)" \
+    "$st fastq -1 st.fq1 -2 st.fq2 -0 st.fq0 -s st.fqs fq-opts.sam; cat st.fq1 st.fq2 st.fq0 st.fqs" \
+    "$nt fastq -1 nt.fq1 -2 nt.fq2 -0 nt.fq0 -s nt.fqs fq-opts.sam; cat nt.fq1 nt.fq2 nt.fq0 nt.fqs"
+check "fastq --i1 --i2 -i -T BC,QT (synthetic)" \
+    "$st fastq -i --index-format 'i4n1i*' --i1 st.i1.fq --i2 st.i2.fq -T BC,QT fq-opts.sam; cat st.i1.fq st.i2.fq" \
+    "$nt fastq -i --index-format 'i4n1i*' --i1 nt.i1.fq --i2 nt.i2.fq -T BC,QT fq-opts.sam; cat nt.i1.fq nt.i2.fq"
+check "fastq --i1 -1 shared, --quality-tag (synthetic)" \
+    "$st fastq --IF 'i*' --quality-tag OQ --I1 st.ix.fq -1 st.ix.fq -v 30 fq-opts.sam; cat st.ix.fq" \
+    "$nt fastq --IF 'i*' --quality-tag OQ --I1 nt.ix.fq -1 nt.ix.fq -v 30 fq-opts.sam; cat nt.ix.fq"
+check "fastq -T * (long)" "$st fastq -T '*' $long" "$nt fastq -T '*' $long"
+check "fastq --no-sc -O -t (tagged)" "$st fastq --no-sc -O -t $tagged" "$nt fastq --no-sc -O -t $tagged"
+check "fastq -i -d RG -U (short)" "$st fastq -t -i --index-format 'i*' -d RG:synthetic -U short.name.bam" "$nt fastq -t -i --index-format 'i*' -d RG:synthetic -U short.name.bam"
+
 # indexes and FASTA
 cp "$corpus/fragmented-reference.fa" frag.fa
 "$st" faidx frag.fa && mv frag.fa.fai expected.fai
@@ -260,6 +337,15 @@ done
 
 # dict, bedcov, addreplacerg
 check "dict" "$st dict -a A -s S -u U frag.fa" "$nt dict -a A -s S -u U frag.fa"
+
+# dict -A (chr aliases) and -l (alternate loci, plain or gzipped)
+printf '>chr1 desc\nACGT\n>chrM\nAC\n>MT\nGG\n>X\nTT\n>chr_alt1\nAA\n>M\nCC\n' > alias.fa
+printf '@SQ\tSN:chr1\tLN:4\nchr_alt1\t0\tchr1\t1\t60\t2M\t*\t0\t0\tAA\t*\nX\n\nMT\t4\r\n' > alias.alt
+gzip -c alias.alt > alias.alt.gz
+check "dict -A" "$st dict -A -u U alias.fa" "$nt dict -A -u U alias.fa"
+check "dict -l" "$st dict --alt alias.alt -H -u U alias.fa" "$nt dict --alt alias.alt -H -u U alias.fa"
+check "dict -l (gzip) --alias" "$st dict -l alias.alt.gz --alias -u U alias.fa" "$nt dict -l alias.alt.gz --alias -u U alias.fa"
+check "dict -A frag.fa" "$st dict -A -u U frag.fa" "$nt dict -A -u U frag.fa"
 check "bedcov -c -d 5" "$st bedcov -c -d 5 q.bed $short" "$nt bedcov -c -d 5 q.bed $short"
 check "bedcov long -j" "$st bedcov -j $(head -30 "$corpus/long/queries.100.bed" > lq.bed; echo lq.bed) $long" "$nt bedcov -j lq.bed $long"
 check "addreplacerg records" "$st addreplacerg --no-PG -r 'ID:z\tSM:z' multi.bam | grep -v '^@'" "$nt addreplacerg --no-PG -r 'ID:z\tSM:z' multi.bam | grep -v '^@'"
