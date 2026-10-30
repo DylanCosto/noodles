@@ -431,6 +431,8 @@ struct Buffers {
     seq: Vec<u8>,
     qual: Vec<u8>,
     aux: Vec<u8>,
+    /// The auxiliary data without a `CG` field that holds the CIGAR.
+    data: Vec<u8>,
 }
 
 /// One read's checksums, and its read group (the last `RG:Z` value among the selected tags).
@@ -463,8 +465,24 @@ fn read_crcs(
 
     let crc_qual = crc32(crc_seq, &buffers.qual);
 
+    // As in HTSlib, a CIGAR held in a `CG` tag replaces the placeholder and is not a tag.
+    let long_cigar = r.long_cigar_field()?;
+
+    let data = match &long_cigar {
+        Some(range) => {
+            let data_start = r.as_bytes().len() - r.data().len();
+            buffers.data.clear();
+            buffers
+                .data
+                .extend_from_slice(&r.as_bytes()[data_start..range.start]);
+            buffers.data.extend_from_slice(&r.as_bytes()[range.end..]);
+            &buffers.data[..]
+        }
+        None => r.data(),
+    };
+
     let read_group = select_tags(
-        r.data(),
+        data,
         selection,
         tag_index,
         options.tags.len(),
@@ -499,7 +517,10 @@ fn read_crcs(
 
     if options.check_cigar {
         let crc = crc32(crc_seq, &u32::from(r.mapping_quality()).to_le_bytes());
-        crcs.cigar = crc32(crc, r.raw_cigar());
+        crcs.cigar = match long_cigar {
+            Some(range) => crc32(crc, &r.as_bytes()[range.start + 8..range.end]),
+            None => crc32(crc, r.raw_cigar()),
+        };
     }
 
     Ok((crcs, read_group))

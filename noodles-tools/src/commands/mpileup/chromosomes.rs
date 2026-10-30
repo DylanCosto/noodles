@@ -9,7 +9,7 @@ use std::{
 
 use noodles_sam as sam;
 
-use super::{Args, PileupContext, pileup_region};
+use super::{Args, PileupContext, check_reference_sequences, pileup_region};
 use crate::alignment::{AlignmentReader, ReadOptions};
 
 /// The output a chromosome keeps in memory before spilling the rest to a temporary file.
@@ -59,6 +59,8 @@ pub(super) fn whole_chromosomes(
 
         headers.push(header);
     }
+
+    check_reference_sequences(&headers, inputs)?;
 
     let names: Vec<Vec<u8>> = headers[0]
         .reference_sequences()

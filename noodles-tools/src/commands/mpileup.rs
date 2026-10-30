@@ -528,6 +528,8 @@ fn pileup_region<W: Write>(
             }
         }
 
+        check_reference_sequences(&headers, context.inputs)?;
+
         let header: &sam::Header = &headers[0];
         let names: Vec<Vec<u8>> = header
             .reference_sequences()
@@ -565,6 +567,34 @@ fn pileup_region<W: Write>(
         drop(sources);
         result
     })
+}
+
+/// Checks that each input's reference sequences are those of the first, in the same order,
+/// as positions are compared by reference sequence index. (samtools mixes up inputs whose
+/// sequences differ, or fails reading one with more.)
+pub(super) fn check_reference_sequences(
+    headers: &[sam::Header],
+    inputs: &[String],
+) -> anyhow::Result<()> {
+    let first = headers[0].reference_sequences();
+
+    for (header, input) in headers.iter().zip(inputs).skip(1) {
+        let matches = header.reference_sequences().len() <= first.len()
+            && header
+                .reference_sequences()
+                .keys()
+                .zip(first.keys())
+                .all(|(a, b)| a == b);
+
+        if !matches {
+            bail!(
+                "[mpileup] the reference sequences of {input} differ from those of {}",
+                inputs[0]
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// How samples are counted for the report.

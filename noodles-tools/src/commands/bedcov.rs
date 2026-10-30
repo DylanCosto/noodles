@@ -4,9 +4,10 @@ use std::{
     fs,
     io::{self, BufWriter, Write},
     path::PathBuf,
+    process::ExitCode,
 };
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use noodles_sam::alignment::record::Flags;
 
 use crate::{
@@ -76,7 +77,7 @@ struct RegionCounts {
     reads: u64,
 }
 
-pub fn run(args: Args) -> anyhow::Result<()> {
+pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
@@ -118,29 +119,24 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let mut counts = vec![RegionCounts::default(); inputs.len()];
 
-    for (i, line) in text.lines().enumerate() {
+    let mut status = ExitCode::SUCCESS;
+
+    for line in text.lines() {
         let line = line.trim_end_matches('\r');
 
-        if line.is_empty() || line.starts_with('#') || line.starts_with("track") {
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with("track ")
+            || line.starts_with("browser ")
+        {
             continue;
         }
 
-        let mut fields = line.split('\t');
-        let (Some(name), Some(start), Some(end)) = (fields.next(), fields.next(), fields.next())
-        else {
-            bail!(
-                "{}:{}: expected at least 3 fields",
-                args.bed.display(),
-                i + 1
-            );
+        let Some((name, start, end)) = parse_bed_line(line, &inputs[0].2) else {
+            eprintln!("Errors in BED line '{line}'");
+            status = ExitCode::from(2);
+            continue;
         };
-
-        let start: usize = start
-            .parse()
-            .with_context(|| format!("{}:{}: invalid start", args.bed.display(), i + 1))?;
-        let end: usize = end
-            .parse()
-            .with_context(|| format!("{}:{}: invalid end", args.bed.display(), i + 1))?;
 
         for ((reader, index, header), counts) in inputs.iter_mut().zip(counts.iter_mut()) {
             *counts = count_region(
@@ -177,7 +173,46 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     out.flush()?;
 
-    Ok(())
+    Ok(status)
+}
+
+/// A BED line's reference sequence name and 0-based start and end, read as samtools does: the
+/// name up to the first whitespace, then two integers. `None` if they are missing, the name is
+/// not a reference sequence of `header`, or the end comes before the start.
+fn parse_bed_line<'l>(
+    line: &'l str,
+    header: &noodles_sam::Header,
+) -> Option<(&'l str, usize, usize)> {
+    let (name, rest) = line.split_once(|c: char| c.is_ascii_whitespace())?;
+
+    header.reference_sequences().get_index_of(name.as_bytes())?;
+
+    let (start, rest) = scan_integer(rest)?;
+    let (end, _) = scan_integer(rest)?;
+
+    if end < start {
+        return None;
+    }
+
+    // Like HTSlib's iterators, negative coordinates count from 0.
+    let clamp = |n: i64| usize::try_from(n.max(0)).unwrap_or(usize::MAX);
+    Some((name, clamp(start), clamp(end)))
+}
+
+/// `sscanf("%ld")`: skips leading whitespace and reads an optionally signed integer prefix;
+/// returns it and the rest of the string.
+fn scan_integer(s: &str) -> Option<(i64, &str)> {
+    let s = s.trim_start();
+    let sign_len = usize::from(s.starts_with(['+', '-']));
+    let digits = s[sign_len..].bytes().take_while(u8::is_ascii_digit).count();
+
+    if digits == 0 {
+        return None;
+    }
+
+    let (number, rest) = s.split_at(sign_len + digits);
+    let n = number.parse().ok()?;
+    Some((n, rest))
 }
 
 /// Sums depth over the 0-based half-open region `[start, end)` of one input.
@@ -210,7 +245,15 @@ fn count_region(
         if rid == id && (first..=last).contains(&position) {
             counts.depth_sum += u64::from(cell.depth);
 
-            if depth_threshold.is_some_and(|d| cell.depth >= d) {
+            // As in samtools, the threshold applies to aligned bases, without deletions and
+            // reference skips.
+            let aligned = if count_options.include_deletions {
+                cell.depth - cell.gaps
+            } else {
+                cell.depth
+            };
+
+            if depth_threshold.is_some_and(|d| aligned >= d) {
                 counts.deep_bases += 1;
             }
         }

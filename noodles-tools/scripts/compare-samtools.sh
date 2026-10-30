@@ -466,6 +466,38 @@ for input in md.bam md.lb.bam; do
 done
 check "rmdup -s long" "$st rmdup -s $long - 2>/dev/null | $st view --no-PG -h -" "$nt rmdup -s $long - 2>/dev/null | $st view --no-PG -h -"
 
+# Records whose CIGAR (over 65,535 operations) is held in a CG tag
+python3 "$scripts/long-cigar-test-data.py" > cg.sam
+"$st" view -b -o cg.bam cg.sam && "$st" index cg.bam
+for opts in "-C" "-t '*' -a" "-P -M -C -B"; do
+    check "checksum $opts (CG CIGAR)" "$st checksum $opts cg.bam" "$nt checksum $opts cg.bam"
+done
+check "view SAM (CG CIGAR)" "$st view --no-PG cg.bam" "$nt view --no-PG cg.bam"
+check "sort -O sam (CG CIGAR)" "$st sort --no-PG -O sam cg.bam" "$nt sort --no-PG -O sam cg.bam"
+
+# bedcov: bad BED lines are reported and skipped; -d counts aligned bases (as samtools; ntools
+# keeps deletions and skips in the depth sum unless -j)
+printf "chrS 1000  5000 extra\nchrX\t1\t5\nchrS\t9000\t8000\nchrS\nbrowser x\n#c\nchrS\t20000x\t21000y\nchrS\t-5\t100\n" > bad.bed
+check "bedcov bad BED lines" "$st bedcov bad.bed $short 2>&1; echo \$?" "$nt bedcov bad.bed $short 2>&1; echo \$?"
+printf "chrS\t0\t300000\nchrS\t5000\t9000\n" > dcov.bed
+check "bedcov -d (threshold column)" "$st bedcov -d 5 dcov.bed $tagged | cut -f5" "$nt bedcov -d 5 dcov.bed $tagged | cut -f5"
+check "bedcov -j -d" "$st bedcov -j -d 5 dcov.bed $tagged" "$nt bedcov -j -d 5 dcov.bed $tagged"
+
+# depth: -s (overlapping mates), -l (soft clips excluded), deletions' qualities with -J -q, and
+# spliced reads' skips
+for opts in "-s" "-s -J -q 30 -Q 20" "-l 100" "-J -q 30 -Q 20"; do
+    for input in $tagged $long; do
+        check "depth $opts $(basename "$(dirname "$input")")" "$st depth $opts $input" "$nt depth $opts $input"
+    done
+done
+
+# coverage -q is the minimum mapping quality, -Q the minimum base quality
+check "coverage -q 20 -Q 10" "$st coverage -q 20 -Q 10 $short" "$nt coverage -q 20 -Q 10 $short"
+check "coverage -l 120 -q 10 long" "$st coverage -l 120 -q 10 $long" "$nt coverage -l 120 -q 10 $long"
+
+# mpileup refuses inputs whose reference sequences differ from the first's
+check "mpileup mismatched references" "echo 1" "$nt mpileup mp.short.bam md.bam > /dev/null 2>&1; echo \$?"
+
 echo "Slowest checks (seconds, samtools run or cached):"
 sort -rn "$timings" | head -15
 awk -F'\t' '{ t += $1; if ($2 == "cache") c++ } END { printf "Total %.0f s over %d checks, %d from cache\n", t, NR, c }' "$timings"

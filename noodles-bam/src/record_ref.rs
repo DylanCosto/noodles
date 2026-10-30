@@ -129,7 +129,25 @@ impl<'a> RecordRef<'a> {
     }
 
     /// Returns the CIGAR operations.
+    ///
+    /// For more than 65,535 operations, BAM stores a `kSmN` placeholder and the operations in a
+    /// `CG` field; these are the operations from the `CG` field.
     pub fn cigar(&self) -> Cigar<'a> {
+        match self.long_cigar() {
+            Some(buf) => Cigar::new(buf),
+            None => Cigar::new(self.raw_cigar()),
+        }
+    }
+
+    fn raw_cigar(&self) -> &'a [u8] {
+        let start = self.name_length();
+        let end = start + (self.cigar_op_count() * mem::size_of::<u32>());
+        &self.rest[start..end]
+    }
+
+    /// The operations of a CIGAR held in a `CG` field, if the stored CIGAR is the `kSmN`
+    /// placeholder.
+    fn long_cigar(&self) -> Option<&'a [u8]> {
         use crate::record::data::get_raw_cigar;
 
         const SKIP: u8 = 3;
@@ -140,26 +158,19 @@ impl<'a> RecordRef<'a> {
             ((n & 0x0f) as u8, usize::try_from(n >> 4).unwrap())
         }
 
-        let start = self.name_length();
-        let end = start + (self.cigar_op_count() * mem::size_of::<u32>());
-        let src = &self.rest[start..end];
+        let ([chunk_0, chunk_1], []) = self.raw_cigar().as_chunks() else {
+            return None;
+        };
 
-        if let ([chunk_0, chunk_1], []) = src.as_chunks() {
-            let k = self.base_count();
+        let op_1 = decode_op(chunk_0);
+        let op_2 = decode_op(chunk_1);
 
-            let op_1 = decode_op(chunk_0);
-            let op_2 = decode_op(chunk_1);
-
-            if op_1 == (SOFT_CLIP, k) && matches!(op_2, (SKIP, _)) {
-                let mut data_src = self.raw_data();
-
-                if let Ok(Some(buf)) = get_raw_cigar(&mut data_src) {
-                    return Cigar::new(buf);
-                }
-            }
+        if op_1 == (SOFT_CLIP, self.base_count()) && matches!(op_2, (SKIP, _)) {
+            let mut data_src = self.raw_data();
+            get_raw_cigar(&mut data_src).ok().flatten()
+        } else {
+            None
         }
-
-        Cigar::new(src)
     }
 
     /// Returns the sequence.
@@ -207,7 +218,11 @@ impl<'a> RecordRef<'a> {
 
     /// Returns the data.
     pub fn data(&self) -> Data<'a> {
-        Data::new(self.raw_data())
+        if self.long_cigar().is_some() {
+            Data::with_cigar(self.raw_data())
+        } else {
+            Data::new(self.raw_data())
+        }
     }
 
     fn raw_data(&self) -> &'a [u8] {
@@ -440,6 +455,12 @@ mod tests {
 
         let record = RecordRef::new_unchecked(SRC);
         assert_eq!(record.cigar().as_ref(), [0x40, 0x00, 0x00, 0x00]);
+
+        // The CG field holds the CIGAR, so it is not a data field.
+        let data = record.data();
+        assert!(data.is_empty());
+        assert!(data.get(b"CG").is_none());
+        assert_eq!(data.as_bytes().len(), 12);
 
         Ok(())
     }

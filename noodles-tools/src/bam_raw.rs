@@ -144,6 +144,36 @@ impl<'a> Record<'a> {
         &self.buf[field::NAME + name_len..self.seq_start]
     }
 
+    /// The byte range (in [`Self::as_bytes`]) of the `CG` field holding the CIGAR, when the
+    /// stored CIGAR is the `kSmN` placeholder BAM uses for more than 65,535 operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the auxiliary data is malformed.
+    pub fn long_cigar_field(&self) -> io::Result<Option<Range<usize>>> {
+        const SOFT_CLIP: u32 = 4;
+        const SKIP: u32 = 3;
+
+        let ops = self.raw_cigar().as_chunks::<4>().0;
+
+        let [first, second] = ops else {
+            return Ok(None);
+        };
+
+        let (first, second) = (u32::from_le_bytes(*first), u32::from_le_bytes(*second));
+
+        if first & 0xf != SOFT_CLIP
+            || first >> 4 != le_u32(&self.buf[field::SEQUENCE_LENGTH])
+            || second & 0xf != SKIP
+        {
+            return Ok(None);
+        }
+
+        Ok(self
+            .find_field(*b"CG")?
+            .filter(|range| self.buf[range.start + 2] == b'B' && self.buf[range.start + 3] == b'I'))
+    }
+
     /// Reads the CIGAR operations into `dst`, replacing a `kSmN` placeholder with the `CG` tag's
     /// operations as HTSlib does when it reads a record.
     ///
@@ -151,35 +181,18 @@ impl<'a> Record<'a> {
     ///
     /// Returns an error if the auxiliary data is malformed.
     pub fn read_cigar(&self, dst: &mut Vec<u32>) -> io::Result<()> {
-        const SOFT_CLIP: u32 = 4;
-        const SKIP: u32 = 3;
+        let ops = match self.long_cigar_field()? {
+            Some(range) => &self.buf[range.start + 8..range.end],
+            None => self.raw_cigar(),
+        };
 
         dst.clear();
         dst.extend(
-            self.raw_cigar()
-                .as_chunks::<4>()
+            ops.as_chunks::<4>()
                 .0
                 .iter()
                 .map(|b| u32::from_le_bytes(*b)),
         );
-
-        if dst.len() == 2
-            && dst[0] & 0xf == SOFT_CLIP
-            && dst[0] >> 4 == le_u32(&self.buf[field::SEQUENCE_LENGTH])
-            && dst[1] & 0xf == SKIP
-            && let Some(range) = self.find_field(*b"CG")?
-            && self.buf[range.start + 2] == b'B'
-            && self.buf[range.start + 3] == b'I'
-        {
-            dst.clear();
-            dst.extend(
-                self.buf[range.start + 8..range.end]
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| u32::from_le_bytes(*b)),
-            );
-        }
 
         Ok(())
     }

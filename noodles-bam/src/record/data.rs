@@ -12,21 +12,48 @@ use noodles_sam::{
 use self::field::decode_field;
 
 /// BAM record data.
-pub struct Data<'r>(&'r [u8]);
+///
+/// When a record's CIGAR is held in a `CG` field (for more than 65,535 operations), that field is
+/// part of the CIGAR, not of the data, as in HTSlib: [`Self::get`] and [`Self::iter`] leave it
+/// out. [`Self::as_bytes`] returns the encoded data as stored.
+pub struct Data<'r> {
+    src: &'r [u8],
+    holds_cigar: bool,
+}
 
 impl<'r> Data<'r> {
     pub(crate) fn new(src: &'r [u8]) -> Self {
-        Self(src)
+        Self {
+            src,
+            holds_cigar: false,
+        }
     }
 
-    /// Returns a byte slice of the raw data.
+    /// Data whose `CG` field holds the record's CIGAR.
+    pub(crate) fn with_cigar(src: &'r [u8]) -> Self {
+        Self {
+            src,
+            holds_cigar: true,
+        }
+    }
+
+    /// Whether a `CG` field holds the record's CIGAR (and is left out of the fields).
+    pub(crate) fn holds_cigar(&self) -> bool {
+        self.holds_cigar
+    }
+
+    /// Returns a byte slice of the raw data, including a `CG` field that holds the CIGAR.
     pub fn as_bytes(&self) -> &'r [u8] {
-        self.0
+        self.src
     }
 
     /// Returns whether there are any fields.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        if self.holds_cigar {
+            self.iter().next().is_none()
+        } else {
+            self.src.is_empty()
+        }
     }
 
     /// Returns the value of the given tag.
@@ -50,7 +77,8 @@ impl<'r> Data<'r> {
 
     /// Returns an iterator over all tag-value pairs.
     pub fn iter(&self) -> impl Iterator<Item = io::Result<(Tag, Value<'r>)>> + 'r {
-        let mut src = self.0;
+        let mut src = self.src;
+        let holds_cigar = self.holds_cigar;
 
         iter::from_fn(move || {
             if src.is_empty() {
@@ -58,6 +86,9 @@ impl<'r> Data<'r> {
             } else {
                 Some(decode_field(&mut src))
             }
+        })
+        .filter(move |result| {
+            !(holds_cigar && matches!(result, Ok((tag, _)) if *tag == Tag::CIGAR))
         })
     }
 }
@@ -91,7 +122,7 @@ impl<'r> sam::alignment::record::Data<'r> for Data<'r> {
 
 impl AsRef<[u8]> for Data<'_> {
     fn as_ref(&self) -> &[u8] {
-        self.0
+        self.src
     }
 }
 
@@ -101,10 +132,14 @@ impl<'a> TryFrom<Data<'a>> for sam::alignment::record_buf::Data {
     fn try_from(bam_data: Data<'a>) -> Result<Self, Self::Error> {
         use crate::record::codec::decoder::read_data;
 
-        let mut src = bam_data.0;
+        let mut src = bam_data.src;
         let mut sam_data = Self::default();
         read_data(&mut src, &mut sam_data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        if bam_data.holds_cigar {
+            sam_data.remove(&Tag::CIGAR);
+        }
 
         Ok(sam_data)
     }

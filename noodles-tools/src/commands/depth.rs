@@ -1,6 +1,7 @@
 //! `ntools depth`: per-position read depth (samtools depth).
 
 use std::{
+    collections::HashMap,
     fs::File,
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
@@ -12,8 +13,9 @@ use crossbeam_channel::{Receiver, Sender};
 use noodles_sam::{self as sam, alignment::record::Flags};
 
 use crate::{
-    alignment::{AlignmentReader, Queries, ReadOptions, Rec},
-    depth::{CountOptions, DEFAULT_EXCLUDE_FLAGS, DepthWindow},
+    alignment::{AlignmentReader, Queries, RawEncoder, ReadOptions, Rec},
+    bam_raw::Record,
+    depth::{CountOptions, DEFAULT_EXCLUDE_FLAGS, DepthWindow, used_query_length},
     filter::Filter,
     flags, output,
     regions::RegionSet,
@@ -56,6 +58,10 @@ pub struct Args {
     min_mapping_quality: u8,
 
     /// Count deletions.
+    /// Do not count bases of a read that overlap its mate (the read seen first keeps them).
+    #[arg(short = 's')]
+    remove_overlaps: bool,
+
     #[arg(short = 'J')]
     include_deletions: bool,
 
@@ -150,6 +156,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let region_queries = domain.queries();
     let min_read_length = args.min_read_length;
+    let remove_overlaps = args.remove_overlaps;
 
     thread::scope(|scope| -> anyhow::Result<()> {
         let mut streams = Vec::with_capacity(inputs.len());
@@ -169,6 +176,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     filter,
                     count_options,
                     min_read_length,
+                    remove_overlaps,
                     &tx,
                 )
             }));
@@ -208,6 +216,7 @@ fn read_depths(
     filter: &Filter,
     count_options: CountOptions,
     min_read_length: usize,
+    overlaps: bool,
     tx: &Sender<Vec<Point>>,
 ) -> anyhow::Result<()> {
     let mut window = DepthWindow::new(count_options);
@@ -225,16 +234,28 @@ fn read_depths(
         Ok(())
     };
 
+    let mut mates = overlaps.then(MateEnds::default);
+    let mut encoder = RawEncoder::new();
+    let mut cigar = Vec::new();
+
     let mut visit = |record: Rec<'_>| -> anyhow::Result<()> {
         if !filter.matches(&record, header)? {
             return Ok(());
         }
 
-        if min_read_length > 0 && record.as_dyn().sequence().len() < min_read_length {
+        if min_read_length > 0 && used_query_length(&record)? < min_read_length {
             return Ok(());
         }
 
-        window.add(&record, header, &mut emit)?;
+        let clip = match &mut mates {
+            Some(mates) => {
+                let raw = Record::new(record.encode_raw(header, &mut encoder)?)?;
+                mates.clip(&raw, &mut cigar)?
+            }
+            None => 0,
+        };
+
+        window.add_clipped(&record, header, clip, &mut emit)?;
         Ok(())
     };
 
@@ -253,6 +274,51 @@ fn read_depths(
     }
 
     Ok(())
+}
+
+/// The 0-based end of each paired read whose mate may still overlap it, by name
+/// (samtools depth `-s`).
+#[derive(Default)]
+struct MateEnds(HashMap<Vec<u8>, i64>);
+
+impl MateEnds {
+    /// Returns the 1-based position before which the record's bases overlap its mate seen
+    /// earlier (0 for none), and records its end for its mate otherwise.
+    fn clip(&mut self, record: &Record<'_>, cigar: &mut Vec<u32>) -> io::Result<usize> {
+        const PAIRED: u16 = 0x1;
+        const MATE_UNMAPPED: u16 = 0x8;
+
+        let flags = record.flags();
+
+        if flags & PAIRED == 0 || flags & MATE_UNMAPPED != 0 {
+            return Ok(0);
+        }
+
+        if let Some(end) = self.0.remove(record.name()) {
+            // The mate's 0-based exclusive end is the 1-based position of its last base + 1.
+            return Ok(usize::try_from(end).unwrap_or(0) + 1);
+        }
+
+        record.read_cigar(cigar)?;
+        let span: i64 = cigar
+            .iter()
+            .filter(|&&op| matches!(op & 0xf, 0 | 2 | 3 | 7 | 8))
+            .map(|&op| i64::from(op >> 4))
+            .sum();
+        let end = i64::from(record.position()) + span.max(1);
+
+        // Mates known not to overlap are not recorded.
+        let mate_position = i64::from(record.mate_position());
+
+        if mate_position == -1
+            || (record.reference_sequence_id() == record.mate_reference_sequence_id()
+                && mate_position <= end)
+        {
+            self.0.insert(record.name().to_vec(), end);
+        }
+
+        Ok(0)
+    }
 }
 
 /// One input's ordered depths.

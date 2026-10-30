@@ -41,6 +41,8 @@ pub struct CountOptions {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Cell {
     pub depth: u32,
+    /// Deletions and reference skips at this position, whether or not `depth` counts them.
+    pub gaps: u32,
     pub quality_sum: u64,
     /// Whether any read aligns here, counted or not (e.g., a filtered base or a deletion).
     /// samtools reports touched positions even at depth 0.
@@ -78,6 +80,21 @@ impl DepthWindow {
     where
         F: FnMut(usize, usize, Cell) -> io::Result<()>,
     {
+        self.add_clipped(record, header, 0, emit)
+    }
+
+    /// [`Self::add`], leaving out the aligned bases (and counted deletions) before the 1-based
+    /// position `clip`, where they overlap the read's mate (samtools depth `-s`).
+    pub fn add_clipped<F>(
+        &mut self,
+        record: &Rec<'_>,
+        header: &sam::Header,
+        clip: usize,
+        emit: &mut F,
+    ) -> io::Result<()>
+    where
+        F: FnMut(usize, usize, Cell) -> io::Result<()>,
+    {
         // BAM records are read raw; others through the record trait.
         let raw = match record {
             Rec::Bam(b) => Some(Record::new(b.as_ref())?),
@@ -102,7 +119,7 @@ impl DepthWindow {
         self.flush_before(start, emit)?;
 
         let needs_quality = self.load_record(record, raw.as_ref())?;
-        self.count_bases(start, needs_quality);
+        self.count_bases(start, needs_quality, clip);
 
         Ok(())
     }
@@ -149,7 +166,7 @@ impl DepthWindow {
 
     /// Counts the bases of the record in [`Self::ops`] and [`Self::quality_scores`], which
     /// starts at the 1-based `start`.
-    fn count_bases(&mut self, start: usize, needs_quality: bool) {
+    fn count_bases(&mut self, start: usize, needs_quality: bool, clip: usize) {
         let CountOptions {
             min_base_quality,
             include_deletions,
@@ -183,17 +200,25 @@ impl DepthWindow {
         for &op in &ops {
             let len = (op >> 4) as usize;
             let offset = reference_position - self.start;
+            // Bases before `clip` overlap the mate and are not counted.
+            let clipped = clip.saturating_sub(reference_position).min(len);
 
             match op & 0xf {
                 CIGAR_MATCH | CIGAR_SEQUENCE_MATCH | CIGAR_SEQUENCE_MISMATCH => {
-                    let cells = &mut window[offset..offset + len];
+                    // Clipped positions are still reported, at the depth of the other reads.
+                    for cell in &mut window[offset..offset + clipped] {
+                        cell.touched = true;
+                    }
+
+                    let cells = &mut window[offset + clipped..offset + len];
+                    let first_base = read_position + clipped;
 
                     if needs_quality {
                         for (i, cell) in cells.iter_mut().enumerate() {
                             cell.touched = true;
 
                             // Missing qualities (0xff) count, as in samtools.
-                            let q = match quality_scores.get(read_position + i) {
+                            let q = match quality_scores.get(first_base + i) {
                                 Some(&q) if q != 0xff => q,
                                 _ => {
                                     cell.depth += 1;
@@ -218,20 +243,43 @@ impl DepthWindow {
                     reference_position += len;
                     read_position += len;
                 }
-                CIGAR_DELETION => {
-                    for cell in &mut window[offset..offset + len] {
+                CIGAR_DELETION if include_deletions => {
+                    for cell in &mut window[offset..offset + clipped] {
                         cell.touched = true;
+                    }
 
-                        if include_deletions {
+                    // As in samtools, a deletion takes the quality of the base after it.
+                    let passes = !needs_quality
+                        || quality_scores
+                            .get(read_position)
+                            .is_none_or(|&q| q == 0xff || q >= min_base_quality);
+
+                    for cell in &mut window[offset + clipped..offset + len] {
+                        cell.touched = true;
+                        cell.gaps += 1;
+
+                        if passes {
                             cell.depth += 1;
                         }
                     }
 
                     reference_position += len;
                 }
+                CIGAR_DELETION => {
+                    for cell in &mut window[offset..offset + len] {
+                        cell.touched = true;
+                        cell.gaps += 1;
+                    }
+
+                    reference_position += len;
+                }
                 CIGAR_SKIP => {
-                    if include_skips {
-                        for cell in &mut window[offset..offset + len] {
+                    // Reference skips are within the read's span, so they are reported too.
+                    for cell in &mut window[offset..offset + len] {
+                        cell.touched = true;
+                        cell.gaps += 1;
+
+                        if include_skips {
                             cell.depth += 1;
                         }
                     }
@@ -317,6 +365,52 @@ fn record_position(
     };
 
     Ok(Some(position))
+}
+
+/// samtools depth's `qlen_used`: the sequence length without leading and trailing soft clips,
+/// or, without a sequence, the query length of the CIGAR.
+pub fn used_query_length(record: &Rec<'_>) -> io::Result<usize> {
+    let r = record.as_dyn();
+    let ops = r.cigar().iter().collect::<io::Result<Vec<_>>>()?;
+    let sequence_len = r.sequence().len();
+
+    if sequence_len == 0 {
+        return Ok(query_length(&ops));
+    }
+
+    let leading = ops
+        .iter()
+        .take_while(|op| op.kind() == Kind::SoftClip)
+        .count();
+    let soft_clipped: usize = ops[..leading]
+        .iter()
+        .chain(
+            ops[leading..]
+                .iter()
+                .rev()
+                .take_while(|op| op.kind() == Kind::SoftClip),
+        )
+        .map(|op| op.len())
+        .sum();
+
+    Ok(sequence_len.saturating_sub(soft_clipped))
+}
+
+/// HTSlib's `bam_cigar2qlen`: the query length of a record's CIGAR, soft clips included.
+pub fn cigar_query_length(record: &Rec<'_>) -> io::Result<usize> {
+    let ops = record
+        .as_dyn()
+        .cigar()
+        .iter()
+        .collect::<io::Result<Vec<_>>>()?;
+    Ok(query_length(&ops))
+}
+
+fn query_length(ops: &[noodles_sam::alignment::record::cigar::Op]) -> usize {
+    ops.iter()
+        .filter(|op| op.kind().consumes_read())
+        .map(|op| op.len())
+        .sum()
 }
 
 /// The BAM code of a CIGAR operation.

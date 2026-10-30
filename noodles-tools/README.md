@@ -24,8 +24,8 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `faidx`, `fqidx` | `faidx`, `fqidx` | FASTA and FASTQ, plain or BGZF (`.fai` and `.gzi` as HTSlib builds them); regions as HTSlib parses them (`{name}` quoting, `1,000`, `2k`), `-r`, `-o` (BGZF for `.gz`), `-n`, `-c`, `-i`, `--mark-strand`, `--fai-idx/--gzi-idx`, `--write-index`, `-f` |
 | `flagstat` | `flagstat` | default, `-O tsv`, `-O json` |
 | `idxstats` | `idxstats` | from BAM index metadata; scans CRAM/SAM |
-| `depth` | `depth` | `-a/-aa`, `-r`, `-b`, `-J`, `-q/-Q`, `-g/-G`, `-l`, `-H`, several inputs |
-| `coverage` | `coverage` | per reference or `-r` region |
+| `depth` | `depth` | `-a/-aa`, `-r`, `-b`, `-J`, `-s`, `-q/-Q`, `-g/-G`, `-l`, `-H`, several inputs |
+| `coverage` | `coverage` | per reference or `-r` region; `-q/-Q`, `-l`, flag filters (no `-m` histogram) |
 | `fastq`, `fasta` | `fastq`, `fasta` | `-0/-1/-2/-s/-o`, `-n/-N`, `-t/-T`, `-F/-f/-G`, `.gz` output |
 | `quickcheck` | `quickcheck` | `-v`, `-q`, `-u` |
 | `reheader` | `reheader` | BAM; copies compressed blocks |
@@ -123,6 +123,12 @@ Intentional differences:
   records), and qualities above 100 use the tables' quality-100 values instead of reading past
   them. With `-@` and a `-T` FASTA that lacks a needed sequence, ntools stops with an error where
   samtools writes truncated or garbage sequence.
+- `bedcov -d` adds its column without changing the depth sum, which counts deletions and
+  reference skips unless `-j`, as documented; samtools also drops them from the sum when `-d`
+  is given. The `-d` column counts aligned bases, as in samtools.
+- `mpileup` stops with an error when an input's reference sequences differ from the first
+  input's (positions are compared by reference index). samtools mixes up such inputs, or fails
+  partway when one has more sequences.
 - `reference` advances the reference position over `N` (reference skip) CIGAR operations;
   samtools does not, so it writes the bases after a splice at the wrong positions (76 wrong
   bases on the tagged corpus, against none for ntools). A region with no data is labelled with
@@ -208,6 +214,8 @@ ntools relies on these changes to the noodles crates, which downstream tools get
 - CRAM: `io::reader::read_block`, `Block`, and `Container::src` expose a container's raw blocks
   (method as stored, content type and ID, sizes, compressed bytes) for block-level tools such
   as `cram-size`.
+- BAM: a record whose CIGAR is held in a `CG` field (over 65,535 operations) no longer lists
+  that field in its data, as in HTSlib; `Record::cigar` already returned its operations.
 - New crate `noodles-pileup`: HTSlib-compatible pileup (`bam_plp`), BAQ, mapping quality capping,
   MD/NM calculation, and MM/ML base modifications over encoded BAM records, which `mpileup` and
   `calmd` use. Positions inside a CIGAR operation are resolved from a cached

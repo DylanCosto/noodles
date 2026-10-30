@@ -11,7 +11,7 @@ use noodles_sam::alignment::record::Flags;
 
 use crate::{
     alignment::{AlignmentReader, Queries, ReadOptions},
-    depth::{CountOptions, DEFAULT_EXCLUDE_FLAGS, DepthWindow, format_g},
+    depth::{CountOptions, DEFAULT_EXCLUDE_FLAGS, DepthWindow, cigar_query_length, format_g},
     filter::Filter,
     flags, output,
     regions::{RegionSet, record_interval},
@@ -28,11 +28,11 @@ pub struct Args {
     region: Option<String>,
 
     /// Exclude bases with base quality below this value.
-    #[arg(short = 'q', long = "min-BQ", default_value_t = 0)]
+    #[arg(short = 'Q', long = "min-BQ", default_value_t = 0)]
     min_base_quality: u8,
 
     /// Exclude reads with mapping quality below this value.
-    #[arg(short = 'Q', long = "min-MQ", default_value_t = 0)]
+    #[arg(short = 'q', long = "min-MQ", default_value_t = 0)]
     min_mapping_quality: u8,
 
     /// Exclude reads shorter than this.
@@ -141,7 +141,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        if args.min_read_length > 0 && record.as_dyn().sequence().len() < args.min_read_length {
+        if args.min_read_length > 0 && cigar_query_length(&record)? < args.min_read_length {
             return Ok(());
         }
 

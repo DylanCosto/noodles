@@ -371,8 +371,14 @@ impl sam::alignment::Record for Record {
     }
 
     fn data_ref(&self) -> sam::alignment::record::DataRef<'_> {
-        let src = self.data().as_bytes();
-        sam::alignment::record::DataRef::TypedMapEncoded(src)
+        let data = self.data();
+
+        // Raw data is used as is unless it holds the CIGAR.
+        if data.holds_cigar() {
+            sam::alignment::record::DataRef::Data(Box::new(data))
+        } else {
+            sam::alignment::record::DataRef::TypedMapEncoded(data.as_bytes())
+        }
     }
 }
 

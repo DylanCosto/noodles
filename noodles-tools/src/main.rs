@@ -142,7 +142,7 @@ fn main() -> ExitCode {
         Command::Mpileup(args) => commands::mpileup::run(args).map(|()| ExitCode::SUCCESS),
         Command::Stats(args) => commands::stats::run(args).map(|()| ExitCode::SUCCESS),
         Command::Dict(args) => commands::dict::run(args).map(|()| ExitCode::SUCCESS),
-        Command::Bedcov(args) => commands::bedcov::run(args).map(|()| ExitCode::SUCCESS),
+        Command::Bedcov(args) => commands::bedcov::run(args),
         Command::Addreplacerg(args) => {
             commands::addreplacerg::run(args).map(|()| ExitCode::SUCCESS)
         }
