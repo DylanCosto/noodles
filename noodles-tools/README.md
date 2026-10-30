@@ -18,8 +18,8 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | Command | samtools equivalent | Notes |
 |---|---|---|
 | `view` | `view` | SAM/BAM/CRAM conversion; `-c`, `-f/-F/-G`, `-q`, `-m`, `-e` (filter expressions), `-L`, `-M`, `-P`, `-s`, `-N`, `-r/-R/-n`, `-d/-D`, `-x`, `-U`, `-p`, `-B`, `-t`, `-X`, `-l` (library), `-h/-H`, `-b/-C/-u/-1`, `--output-fmt-option level=N`, `--write-index`, `-?`, `-S`, regions and `*` |
-| `sort` | `sort` | coordinate, `-n` (natural), `-N` (bytewise); `-m`, `-T`, `-@`; stable, like samtools |
-| `merge` | `merge -c -p` | BAM inputs; reference dictionaries are merged and IDs translated |
+| `sort` | `sort` | coordinate, `-n` (natural), `-N` (bytewise), `-t TAG` (then by position, or by name with `-n`/`-N`); `-m`, `-T`, `-@`; stable, like samtools. No minimiser order (`-M`, `-I`, `-K`, `-w`); `-H` and `-R`, which only modify it, are accepted and ignored |
+| `merge` | `merge` | SAM, BAM, and CRAM inputs; headers merged as samtools does, renaming colliding `@RG`/`@PG` IDs (`-s` seed) or combining them (`-c`, `-p`), with `RG`/`PG` tags translated; `-n/-N`, `-t`, `-r`, `-R`/`-L` (indexed inputs, `-X` index files), `-b`, `-h`, `-1/-l/-u`, `-f`, `-o` |
 | `index` | `index` | BAI (default) or CSI (`-c`, `-m` minimum shift, with HTSlib's level count) for BAM; CRAI for CRAM; `-M` (several inputs), `-o` or a second argument naming the index |
 | `faidx`, `fqidx` | `faidx`, `fqidx` | FASTA and FASTQ, plain or BGZF (`.fai` and `.gzi` as HTSlib builds them); regions as HTSlib parses them (`{name}` quoting, `1,000`, `2k`), `-r`, `-o` (BGZF for `.gz`), `-n`, `-c`, `-i`, `--mark-strand`, `--fai-idx/--gzi-idx`, `--write-index`, `-f` |
 | `flagstat` | `flagstat` | default, `-O tsv`, `-O json` |
@@ -28,10 +28,10 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `coverage` | `coverage` | per reference or `-r` region; `-q/-Q`, `-l`, `--rf/--incl-flags`, `--ff/--excl-flags`, `-d` (the pileup's limit, applied as HTSlib does), `--min-depth`, `-m/-D/-A/-w` histograms (sized to the terminal like samtools), `-H`, `-o`, several inputs or `-b` list |
 | `fastq`, `fasta` | `fastq`, `fasta` | `-0/-1/-2/-s/-o`, `-n/-N`, `-t/-T` (`*` for all tags), `-F/-f/-G/--rf`, `-d/-D` (tag filters), `-O` (OQ qualities), `-i` (CASAVA), `--i1/--i2`, `--index-format`, `--barcode-tag/--quality-tag`, `-v`, `-U/--UMI-tag`, `--no-sc/--sc-aux/--no-sc-bkp`, `-c`, `.gz` output |
 | `quickcheck` | `quickcheck` | `-v`, `-q`, `-u` |
-| `reheader` | `reheader` | BAM; copies compressed blocks |
-| `cat` | `cat` | BAM; copies compressed blocks |
+| `reheader` | `reheader` | BAM and CRAM; `-P`, `-c CMD`, `-i` (CRAM in place); copies compressed blocks and containers |
+| `cat` | `cat` | BAM and CRAM; `-b`, `-h`, `-o`, later inputs' `@RG` lines added; CRAM `-r` (region, `*`, or `#:start-end` containers), `-p N/M`, `-f`, `-q`; copies compressed blocks and containers, re-encoding only CRAM containers that must be filtered or get new read group numbers |
 | `split` | `split` | by read group or `-d` tag; `-f`, `-p`, `-u`, `-M` |
-| `collate` | `collate` | groups templates by name; `-f`, `-O/-o`, `-u`, `-l`, `-m`, `-T` |
+| `collate` | `collate` | groups templates by name; `-f`, `-O/-o`, `-u`, `-l`, `-m`, `-T`; `-n` and `-r` are accepted and ignored (they size samtools' temporary files) |
 | `fixmate` | `fixmate` | `-m`, `-c`, `-r`, `-p`, `-z`, `-M` (base modification tags); parallel with `-@` |
 | `dict` | `dict` | `-a`, `-s`, `-u`, `-H`, `-o`, `-A` (`AN` aliases), `-l` (`AH` for alternate loci) |
 | `bedcov` | `bedcov` | `-c`, `-d`, `-j`, `-Q`, `-g/-G`, `-H`; several inputs; `-X` (index files after the inputs) |
@@ -102,9 +102,8 @@ Intentional differences:
   noodles cannot parse `B` operations in SAM text, so `-B` needs BAM input.
 - `view -T ref.fa` on SAM without `@SQ` lines uses `ref.fa.fai` only if it exists; HTSlib
   builds it.
-- `merge` combines `@RG`/`@PG` lines with the same ID, like `samtools merge -c -p`, and keeps
-  each record's tag order. Plain `samtools merge` renames clashing IDs with random suffixes and
-  moves `RG` to the last tag.
+- `merge` renames clashing `@RG`/`@PG` IDs with the same random suffixes as samtools for a
+  given `-s` seed; without `-s`, both seed from the clock, so suffixes differ between runs.
 - BAI/CSI bins are written in insertion order, not HTSlib's hash order. samtools reads them and
   returns identical query results.
 - CRAM written by ntools keeps `MD`/`NM` tags as stored; HTSlib drops and regenerates them.
@@ -116,6 +115,14 @@ Intentional differences:
   must regenerate `MD`.
 - `reheader` and `cat` recompress the block holding the end of the header with noodles' encoder,
   so files can differ in size by a few bytes; records are identical.
+- `cat` on CRAM re-encodes the containers it filters to a region (`-r` without `-f`) and those
+  whose single read group gets a new number with noodles' encoder (which needs the reference,
+  from `--reference` or the `@SQ` `UR` fields, and does not write CRAM 2.1); HTSlib edits the
+  compression header for the latter. Decoded records are the same, and `MD`/`NM` tags are dropped
+  where HTSlib would regenerate them. `cat -p N/M` without `-r` divides all of a file's
+  containers; samtools 1.24 divides a single container, so part 1 copies the whole file and the
+  others nothing. Containers are numbered (`-q`, `-p`, `#:`) by the index's entries for each
+  reference in turn, then unplaced ones, which is HTSlib's order unless slices nest.
 - `collate` groups each template's records together, in input order, as samtools does, but
   templates come out in a different (hash) order.
 - Header lines are written grouped by type (`@HD`, `@SQ`, `@RG`, `@PG`, `@CO`). HTSlib keeps

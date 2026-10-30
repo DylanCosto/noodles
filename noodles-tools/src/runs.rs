@@ -16,7 +16,7 @@ use noodles_bgzf::io::writer::CompressionLevel;
 
 use crate::{
     bgzf_stream::{BgzfReader, BgzfWriter},
-    sort_order::{Order, coordinate_key, name_hash},
+    sort_order::{Order, coordinate_key, name_hash, tag_offset},
 };
 
 /// The fixed-size prefix of every encoded BAM record, up to the read name.
@@ -55,13 +55,28 @@ pub fn write_raw_record<W: Write>(writer: &mut W, record: &[u8]) -> io::Result<(
     writer.write_all(record)
 }
 
-/// The precomputed integer key of an order, if it has one.
+/// [`Entry::key`] for records without the sort tag of [`Order::Tag`].
+const NO_TAG: u64 = u64::MAX;
+
+/// The precomputed integer key of an order, if it has one: the coordinate key, the name hash, or
+/// the offset of the sort tag's value.
 fn integer_key(order: Order, record: &[u8]) -> u64 {
     match order {
         Order::Coordinate => coordinate_key(record),
         Order::Collate => name_hash(record),
+        Order::Tag { tag, .. } => tag_offset(record, tag)
+            .and_then(|offset| u64::try_from(offset).ok())
+            .unwrap_or(NO_TAG),
         Order::NameNatural | Order::NameAscii => 0,
     }
+}
+
+/// The sort tag value at the offset that `key` holds.
+fn tag_at(record: &[u8], key: u64) -> Option<&[u8]> {
+    usize::try_from(key)
+        .ok()
+        .filter(|_| key != NO_TAG)
+        .map(|offset| &record[offset..])
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -129,6 +144,16 @@ impl Chunk {
                 .key
                 .cmp(&b.key)
                 .then_with(|| order.compare(&data[a.start..a.end], &data[b.start..b.end])),
+            Order::Tag { .. } => {
+                let (a_record, b_record) = (&data[a.start..a.end], &data[b.start..b.end]);
+
+                order.compare_tagged(
+                    a_record,
+                    tag_at(a_record, a.key),
+                    b_record,
+                    tag_at(b_record, b.key),
+                )
+            }
             _ => order.compare(&data[a.start..a.end], &data[b.start..b.end]),
         };
 

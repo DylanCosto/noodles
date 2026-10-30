@@ -6,6 +6,7 @@ mod bam_raw;
 mod bam_sam;
 mod bgzf_stream;
 mod commands;
+mod cram_file;
 mod cram_raw;
 mod depth;
 mod expr;

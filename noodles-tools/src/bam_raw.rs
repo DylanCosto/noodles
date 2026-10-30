@@ -365,6 +365,29 @@ pub fn find_field(record: &[u8], tag: [u8; 2]) -> io::Result<Option<Range<usize>
     find_field_from(record, data.start, tag)
 }
 
+/// Returns the byte ranges of the first auxiliary fields with each of `tags`, in one pass.
+pub fn find_fields<const N: usize>(
+    record: &[u8],
+    tags: [[u8; 2]; N],
+) -> io::Result<[Option<Range<usize>>; N]> {
+    let mut ranges = [const { None }; N];
+    let mut start = data_range(record)?.start;
+
+    while start < record.len() {
+        let (field_tag, len) = next_field(&record[start..])?;
+
+        for (tag, range) in tags.iter().zip(&mut ranges) {
+            if *tag == field_tag && range.is_none() {
+                *range = Some(start..start + len);
+            }
+        }
+
+        start += len;
+    }
+
+    Ok(ranges)
+}
+
 /// [`find_field`] with the auxiliary data starting at `start`.
 fn find_field_from(
     record: &[u8],
