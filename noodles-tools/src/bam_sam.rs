@@ -6,7 +6,8 @@
 
 use crate::bam_raw::{BASE_PAIRS, field, le_u16, le_u32};
 
-const CIGAR_OPS: &[u8; 9] = b"MIDNSHP=X";
+/// SAM CIGAR operations by BAM code, with `B` (backward), which HTSlib also prints.
+const CIGAR_OPS: &[u8; 10] = b"MIDNSHP=XB";
 
 /// `,N` for every byte value, with its length, for formatting `B:C` arrays (e.g., `ML`).
 static U8_ITEMS: [([u8; 4], u8); 256] = {
