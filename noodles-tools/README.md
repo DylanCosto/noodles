@@ -17,7 +17,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 
 | Command | samtools equivalent | Notes |
 |---|---|---|
-| `view` | `view` | SAM/BAM/CRAM conversion; `-c`, `-f/-F/-G`, `-q`, `-L`, `-M`, `-s`, `-N`, `-d`, `-x`, `-U`, `-X`, `-h/-H`, `-b/-C/-u/-1/-l`, `--write-index`, regions and `*` |
+| `view` | `view` | SAM/BAM/CRAM conversion; `-c`, `-f/-F/-G`, `-q`, `-L`, `-M`, `-s`, `-N`, `-d`, `-x`, `-U`, `-X`, `-l` (library), `-h/-H`, `-b/-C/-u/-1`, `--output-fmt-option level=N`, `--write-index`, regions and `*` |
 | `sort` | `sort` | coordinate, `-n` (natural), `-N` (bytewise); `-m`, `-T`, `-@`; stable, like samtools |
 | `merge` | `merge -c -p` | BAM inputs; reference dictionaries are merged and IDs translated |
 | `index` | `index` | BAI (default) or CSI (`-c`) for BAM; CRAI for CRAM |

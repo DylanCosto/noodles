@@ -27,6 +27,9 @@ use crate::{
     source::Format,
 };
 
+/// The BGZF compression level htslib uses by default (zlib's).
+const DEFAULT_LEVEL: u8 = 6;
+
 #[derive(Debug, clap::Args)]
 #[command(disable_help_flag = true)]
 pub struct Args {
@@ -61,9 +64,9 @@ pub struct Args {
     #[arg(short = '1', long = "fast")]
     fast: bool,
 
-    /// BGZF compression level for BAM output.
-    #[arg(short = 'l', default_value_t = 6)]
-    level: u8,
+    /// Output format option; only `level=N`, the BGZF compression level, is supported.
+    #[arg(long = "output-fmt-option", value_name = "OPT=VAL")]
+    output_format_options: Vec<String>,
 
     /// Include the header in SAM output.
     #[arg(short = 'h', long = "with-header")]
@@ -104,6 +107,10 @@ pub struct Args {
     /// Exclude reads with all of these flags set.
     #[arg(short = 'G', value_parser = flags::parse)]
     exclude_all_flags: Option<Flags>,
+
+    /// Only include reads whose read group belongs to this library (`LB`).
+    #[arg(short = 'l', long = "library")]
+    library: Option<String>,
 
     /// Exclude reads with mapping quality below this value.
     #[arg(short = 'q', long = "min-MQ", default_value_t = 0)]
@@ -168,7 +175,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut header = reader.read_header()?;
 
     let (traversal, mut filter) = plan(&args, &header, &reader, path.as_deref())?;
-    configure_filter(&mut filter, &args)?;
+    configure_filter(&mut filter, &args, &header)?;
     let filter = filter;
 
     let remove_tags = parse_tags(&args.remove_tags)?;
@@ -283,12 +290,16 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Sets the record filter's options (`-f`, `-F`, `-G`, `-q`, `-s`, `-d`/`-D`, `-N`).
-fn configure_filter(filter: &mut Filter, args: &Args) -> anyhow::Result<()> {
+/// Sets the record filter's options (`-f`, `-F`, `-G`, `-q`, `-l`, `-s`, `-d`/`-D`, `-N`).
+fn configure_filter(filter: &mut Filter, args: &Args, header: &sam::Header) -> anyhow::Result<()> {
     filter.require = args.require_flags.unwrap_or_else(Flags::empty);
     filter.exclude = args.exclude_flags.unwrap_or_else(Flags::empty);
     filter.exclude_all = args.exclude_all_flags;
     filter.min_mapping_quality = args.min_mapping_quality;
+    filter.read_groups = args
+        .library
+        .as_deref()
+        .map(|library| filter::library_read_groups(header, library));
     filter.subsample = args.subsample;
     filter.tag = TagFilter::from_args(&args.tags)?;
     filter.names = args
@@ -300,15 +311,26 @@ fn configure_filter(filter: &mut Filter, args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The output options, with the compression level from `-u`, `-1`, or `-l`.
+/// The output options, with the compression level from `-u`, `-1`, or `--output-fmt-option`.
 fn write_options(args: &Args, format: OutputFormat) -> anyhow::Result<WriteOptions> {
-    let level = if args.uncompressed {
-        0
+    let mut level = DEFAULT_LEVEL;
+
+    for option in &args.output_format_options {
+        match option.split_once('=') {
+            Some(("level", value)) => {
+                level = value
+                    .parse()
+                    .with_context(|| format!("invalid compression level: {value}"))?;
+            }
+            _ => bail!("unsupported output format option: {option}"),
+        }
+    }
+
+    if args.uncompressed {
+        level = 0;
     } else if args.fast {
-        1
-    } else {
-        args.level
-    };
+        level = 1;
+    }
 
     Ok(WriteOptions {
         format,

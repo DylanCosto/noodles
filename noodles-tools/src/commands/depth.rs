@@ -57,11 +57,11 @@ pub struct Args {
     #[arg(short = 'Q', long = "min-MQ", default_value_t = 0)]
     min_mapping_quality: u8,
 
-    /// Count deletions.
     /// Do not count bases of a read that overlap its mate (the read seen first keeps them).
     #[arg(short = 's')]
     remove_overlaps: bool,
 
+    /// Count deletions.
     #[arg(short = 'J')]
     include_deletions: bool,
 

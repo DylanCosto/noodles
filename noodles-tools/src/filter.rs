@@ -10,6 +10,7 @@ use noodles_sam::{
         Flags,
         data::field::{Tag, Value},
     },
+    header::record::value::map::read_group::tag::LIBRARY,
 };
 
 use crate::{
@@ -27,6 +28,8 @@ pub struct Filter {
     pub exclude: Flags,
     pub exclude_all: Option<Flags>,
     pub min_mapping_quality: u8,
+    /// Keep only records whose `RG` is one of these read groups (`-l`).
+    pub read_groups: Option<HashSet<BString>>,
     pub subsample: Option<Subsample>,
     pub names: Option<HashSet<BString>>,
     pub tag: Option<TagFilter>,
@@ -65,6 +68,17 @@ impl Filter {
             }
         }
 
+        if let Some(read_groups) = &self.read_groups {
+            let read_group = match record.data().get(&Tag::READ_GROUP).transpose()? {
+                Some(Value::String(id)) => id,
+                _ => return Ok(false),
+            };
+
+            if !read_groups.contains::<[u8]>(read_group.as_ref()) {
+                return Ok(false);
+            }
+        }
+
         if let Some(tag) = &self.tag
             && !tag.matches(record)?
         {
@@ -87,6 +101,21 @@ impl Filter {
 
         Ok(true)
     }
+}
+
+/// The IDs of the read groups in `library` (their `LB`), for `samtools view -l`.
+pub fn library_read_groups(header: &sam::Header, library: &str) -> HashSet<BString> {
+    header
+        .read_groups()
+        .iter()
+        .filter(|(_, read_group)| {
+            read_group
+                .other_fields()
+                .get(&LIBRARY)
+                .is_some_and(|lb| lb == library.as_bytes())
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// Reads one read name per line (the first whitespace-delimited word), as `samtools view -N`.

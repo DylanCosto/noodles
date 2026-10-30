@@ -133,6 +133,17 @@ done
 
 check "view -d NH:2" "$st view --no-PG -d NH:2 $tagged" "$nt view --no-PG -d NH:2 $tagged"
 check "view -x" "$st view --no-PG -x NM -x MD,AS $short" "$nt view --no-PG -x NM -x MD,AS $short"
+
+# Read groups a and c are in library x; d has no library; one read has an integer RG.
+printf '@HD\tVN:1.6\n@SQ\tSN:c\tLN:100\n@RG\tID:a\tLB:x\n@RG\tID:b\tLB:y\n@RG\tID:c\tLB:x\n@RG\tID:d\n' > lib.sam
+for rg in RG:Z:a RG:Z:b RG:Z:c RG:Z:d RG:Z:zz RG:i:5 XX:i:0; do
+    printf 'r%s\t0\tc\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\t%s\n' "${rg//:/}" "$rg" >> lib.sam
+done
+for opts in "-l x" "-l y" "-l q" "-c -l x"; do
+    check "view $opts" "$st view --no-PG $opts lib.sam" "$nt view --no-PG $opts lib.sam"
+done
+check "view -l -U" "$st view --no-PG -l x -U /dev/stdout -o /dev/null lib.sam" "$nt view --no-PG -l x -U /dev/stdout -o /dev/null lib.sam"
+check "view --output-fmt-option level=1" "$st view --no-PG -b --output-fmt-option level=1 $short | $st view --no-PG -" "$nt view --no-PG -b --output-fmt-option level=1 $short | $st view --no-PG -"
 check "view BAM->BAM" "$st view --no-PG -h $short" "$nt view --no-PG -b -@ 4 $short | $st view --no-PG -h -"
 
 # statistics
