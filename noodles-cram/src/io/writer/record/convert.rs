@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, sync::Arc};
 
 use noodles_core::Position;
 use noodles_fasta as fasta;
@@ -10,18 +10,24 @@ use noodles_sam::{
     },
 };
 
-use super::{Feature, Record};
+use super::{Feature, Record, ReferenceBases};
 use crate::{
     container::compression_header::preservation_map::substitution_matrix::Base,
     record::{Flags, MateFlags},
 };
 
 impl Record {
-    pub fn try_from_alignment_record(
-        reference_sequence_repository: &fasta::Repository,
+    /// Converts an alignment record, comparing its bases with the sequence that
+    /// `get_reference_sequence` returns for its reference sequence name. When that is `None`, the
+    /// bases are stored verbatim.
+    pub fn try_from_alignment_record<F>(
         header: &sam::Header,
         record: &dyn sam::alignment::Record,
-    ) -> io::Result<Self> {
+        get_reference_sequence: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(&[u8]) -> io::Result<Option<Arc<fasta::record::Sequence>>>,
+    {
         let bam_flags = record.flags()?;
         let mut cram_flags = Flags::QUALITY_SCORES_ARE_STORED_AS_ARRAY;
 
@@ -51,29 +57,34 @@ impl Record {
             record.quality_scores().iter().collect::<io::Result<_>>()?
         };
 
-        let features = if let (Some(id), Some(start)) = (reference_sequence_id, alignment_start) {
-            let (reference_sequence_name, _) = header
-                .reference_sequences()
-                .get_index(id)
-                .expect("missing reference sequence ID");
+        let (features, reference_bases) =
+            if let (Some(id), Some(start)) = (reference_sequence_id, alignment_start) {
+                let (reference_sequence_name, _) = header
+                    .reference_sequences()
+                    .get_index(id)
+                    .expect("missing reference sequence ID");
 
-            let reference_sequence = reference_sequence_repository
-                .get(reference_sequence_name)
-                .transpose()?
-                .expect("missing reference sequence");
+                let reference_sequence = get_reference_sequence(reference_sequence_name)?;
 
-            cigar_to_features(
-                record.cigar().as_ref(),
-                reference_sequence.as_ref(),
-                cram_flags,
-                start,
-                &sequence,
-                &quality_scores,
-            )
-            .map(Some)?
-        } else {
-            None
-        };
+                let reference_bases = if reference_sequence.is_some() {
+                    ReferenceBases::External
+                } else {
+                    ReferenceBases::Verbatim
+                };
+
+                let features = cigar_to_features(
+                    record.cigar().as_ref(),
+                    reference_sequence.as_deref(),
+                    cram_flags,
+                    start,
+                    &sequence,
+                    &quality_scores,
+                )?;
+
+                (features, reference_bases)
+            } else {
+                (Vec::new(), ReferenceBases::Unused)
+            };
 
         let data = record.data();
         let (data_buf, read_group_id) = get_filtered_data(header, data.as_ref())?;
@@ -92,7 +103,8 @@ impl Record {
             template_length: record.template_length()?,
             mate_distance: None,
             data: data_buf,
-            features: features.unwrap_or_default(),
+            features,
+            reference_bases,
             mapping_quality: record.mapping_quality().transpose()?,
             sequence: sequence.into(),
             quality_scores: quality_scores.into(),
@@ -100,9 +112,11 @@ impl Record {
     }
 }
 
+/// Builds the features of a record's CIGAR. Without a reference sequence, aligned bases are stored
+/// verbatim, as stretches of bases.
 fn cigar_to_features(
     cigar: &dyn sam::alignment::record::Cigar,
-    reference_sequence: &fasta::record::Sequence,
+    reference_sequence: Option<&fasta::record::Sequence>,
     flags: Flags,
     alignment_start: Position,
     sequence: &Sequence,
@@ -110,7 +124,7 @@ fn cigar_to_features(
 ) -> io::Result<Vec<Feature>> {
     use noodles_sam::alignment::record::cigar::op::Kind;
 
-    let reference_bases: &[u8] = reference_sequence.as_ref();
+    let reference_bases: Option<&[u8]> = reference_sequence.map(|sequence| sequence.as_ref());
     let bases: &[u8] = sequence.as_ref();
     let scores: &[u8] = quality_scores.as_ref();
     let stores_scores = !flags.quality_scores_are_stored_as_array();
@@ -148,14 +162,21 @@ fn cigar_to_features(
                         push_scores(&mut features, position, scores, read_offset..read_end);
                     }
 
-                    push_mismatches(
-                        &mut features,
-                        reference_bases,
-                        reference_offset,
-                        &bases[read_offset..read_end],
-                        scores,
-                        read_offset,
-                    )?;
+                    if let Some(reference_bases) = reference_bases {
+                        push_mismatches(
+                            &mut features,
+                            reference_bases,
+                            reference_offset,
+                            &bases[read_offset..read_end],
+                            scores,
+                            read_offset,
+                        )?;
+                    } else if len > 0 {
+                        features.push(Feature::Bases {
+                            position,
+                            bases: bases[read_offset..read_end].to_vec(),
+                        });
+                    }
                 }
             }
             Kind::Insertion => {
@@ -402,7 +423,7 @@ mod tests {
             fasta::record::Sequence::from(b"ACGT".to_vec()),
         )]);
 
-        Record::try_from_alignment_record(&repository, &header, record)
+        Record::try_from_alignment_record(&header, record, |name| repository.get(name).transpose())
     }
 
     #[test]
@@ -485,8 +506,7 @@ mod tests {
             .map(|(tag, s)| (tag, ValueBuf::from(s)))
             .collect();
         let record = sam::alignment::RecordBuf::builder().set_data(data).build();
-        let actual =
-            Record::try_from_alignment_record(&fasta::Repository::default(), &header, &record)?;
+        let actual = Record::try_from_alignment_record(&header, &record, |_| Ok(None))?;
         assert_eq!(actual.read_group_id, Some(0));
         assert_eq!(actual.data, [(Tag::COMMENT, ValueBuf::from("note"))]);
         Ok(())
@@ -505,8 +525,7 @@ mod tests {
         let record = sam::alignment::RecordBuf::builder()
             .set_data(data.clone())
             .build();
-        let actual =
-            Record::try_from_alignment_record(&fasta::Repository::default(), &header, &record)?;
+        let actual = Record::try_from_alignment_record(&header, &record, |_| Ok(None))?;
         assert_eq!(actual.read_group_id, None);
         assert_eq!(
             actual.data,
@@ -529,7 +548,7 @@ mod tests {
         let quality_scores = [45].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -546,7 +565,7 @@ mod tests {
         let quality_scores = [45].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -570,7 +589,7 @@ mod tests {
         let quality_scores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -587,7 +606,7 @@ mod tests {
         let quality_scores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -613,7 +632,7 @@ mod tests {
         let quality_scores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -647,7 +666,7 @@ mod tests {
         let quality_scores = [45, 35, 43].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -681,7 +700,7 @@ mod tests {
         let quality_scores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -716,7 +735,7 @@ mod tests {
         let quality_scores = [45].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -746,7 +765,7 @@ mod tests {
         let quality_scores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -780,7 +799,7 @@ mod tests {
         let quality_scores = [45, 35, 43].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -814,7 +833,7 @@ mod tests {
         let quality_scores = [45].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -839,7 +858,7 @@ mod tests {
         let quality_scores = [45].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -873,7 +892,7 @@ mod tests {
         let quality_scores = [45].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -887,7 +906,7 @@ mod tests {
         let quality_scores = [45].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -905,7 +924,7 @@ mod tests {
         let quality_scores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -919,7 +938,7 @@ mod tests {
         let quality_scores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -939,7 +958,7 @@ mod tests {
         let quality_scores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -965,7 +984,7 @@ mod tests {
         let quality_scores = [45, 35, 43].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -991,7 +1010,7 @@ mod tests {
         let quality_scores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -1022,7 +1041,7 @@ mod tests {
         let quality_scores = [45].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -1048,7 +1067,7 @@ mod tests {
         let quality_scores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -1074,7 +1093,7 @@ mod tests {
         let quality_scores = [45, 35, 43].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -1100,7 +1119,7 @@ mod tests {
         let quality_scores = [45].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,
@@ -1119,7 +1138,7 @@ mod tests {
         let quality_scores = [45].into_iter().collect();
         let actual = cigar_to_features(
             &cigar,
-            &reference_sequence,
+            Some(&reference_sequence),
             flags,
             alignment_start,
             &sequence,

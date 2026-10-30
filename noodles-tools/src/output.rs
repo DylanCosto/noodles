@@ -83,23 +83,38 @@ pub struct CramReference {
 impl CramReference {
     /// Returns `header` with HTSlib's `@SQ` fields: `M5`, when missing, from the reference (if
     /// it has the sequence), and `UR`, the reference's absolute path, replacing any.
+    ///
+    /// As HTSlib does, this warns about sequences without `M5` that the reference lacks: the
+    /// writer stores their records' bases verbatim.
     fn annotate(&self, header: &sam::Header) -> io::Result<sam::Header> {
         use sam::header::record::value::map::reference_sequence::tag;
 
         let mut header = header.clone();
+        let mut missing = false;
 
         for (name, reference_sequence) in header.reference_sequences_mut() {
             let fields = reference_sequence.other_fields_mut();
 
-            if !fields.contains_key(&tag::MD5_CHECKSUM)
-                && let Some(Ok(sequence)) = self.repository.get(name)
-            {
-                let checksum = cram::calculate_normalized_sequence_digest(&sequence[..]);
-                let hex: String = checksum.iter().map(|b| format!("{b:02x}")).collect();
-                fields.insert(tag::MD5_CHECKSUM, hex.into());
+            if !fields.contains_key(&tag::MD5_CHECKSUM) {
+                if let Some(sequence) = self.repository.get(name).transpose()? {
+                    let checksum = cram::calculate_normalized_sequence_digest(&sequence[..]);
+                    let hex: String = checksum.iter().map(|b| format!("{b:02x}")).collect();
+                    fields.insert(tag::MD5_CHECKSUM, hex.into());
+                } else {
+                    eprintln!(
+                        "[W::cram_get_ref] Reference file given, but ref '{name}' not present"
+                    );
+                    missing = true;
+                }
             }
 
             fields.insert(tag::URI, self.uri.clone().into());
+        }
+
+        if missing {
+            eprintln!(
+                "[W::cram_write_SAM_hdr] NOTE: the CRAM file will be bigger than using an external reference"
+            );
         }
 
         Ok(header)

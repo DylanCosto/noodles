@@ -18,8 +18,6 @@ where
 {
     const ENCODER: Encoder = Encoder::Gzip(Compression::new(6));
 
-    validate_reference_sequences(header.reference_sequences())?;
-
     let buf = serialize_header(header)?;
     let block = Block::encode(ContentType::FileHeader, 0, Some(&ENCODER), &buf)?;
 
@@ -28,26 +26,6 @@ where
     write_header(writer, &header, len)?;
 
     write_block(writer, &block)?;
-
-    Ok(())
-}
-
-fn validate_reference_sequences(
-    reference_sequences: &sam::header::ReferenceSequences,
-) -> io::Result<()> {
-    use sam::header::record::value::map::reference_sequence::tag;
-
-    for reference_sequence in reference_sequences.values() {
-        if !reference_sequence
-            .other_fields()
-            .contains_key(&tag::MD5_CHECKSUM)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "header reference sequence record is missing MD5 checksum",
-            ));
-        }
-    }
 
     Ok(())
 }
@@ -141,39 +119,6 @@ mod tests {
         expected.extend(expected_block);
 
         assert_eq!(buf, expected);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_validate_reference_sequences() -> Result<(), Box<dyn std::error::Error>> {
-        use std::num::NonZero;
-
-        use sam::header::record::value::{
-            Map,
-            map::{ReferenceSequence, reference_sequence::tag},
-        };
-
-        const SQ0_LN: NonZero<usize> = NonZero::new(8).unwrap();
-
-        let header = sam::Header::builder()
-            .add_reference_sequence(
-                "sq0",
-                Map::<ReferenceSequence>::builder()
-                    .set_length(SQ0_LN)
-                    .insert(
-                        tag::MD5_CHECKSUM,
-                        Vec::from("d7eba311421bbc9d3ada44709dd61534"),
-                    )
-                    .build()?,
-            )
-            .build();
-        assert!(validate_reference_sequences(header.reference_sequences()).is_ok());
-
-        let header = sam::Header::builder()
-            .add_reference_sequence("sq0", Map::<ReferenceSequence>::new(SQ0_LN))
-            .build();
-        assert!(validate_reference_sequences(header.reference_sequences()).is_err());
 
         Ok(())
     }

@@ -10,7 +10,7 @@ use self::{
 use crate::{
     container::compression_header::PreservationMap,
     io::writer::{
-        Context, Record,
+        Context, Record, ReferenceBases,
         collections::write_array,
         num::{write_itf8, write_u8},
     },
@@ -91,7 +91,9 @@ pub(super) fn build_preservation_map(ctx: &Context, records: &[Record]) -> Prese
     PreservationMap {
         records_have_names: ctx.preserve_read_names,
         alignment_starts_are_deltas: ctx.encode_alignment_start_positions_as_deltas,
-        external_reference_sequence_is_required: true,
+        external_reference_sequence_is_required: records
+            .iter()
+            .all(|record| record.reference_bases != ReferenceBases::Verbatim),
         substitution_matrix: build_substitution_matrix(records),
         tag_sets: build_tag_sets(records),
     }

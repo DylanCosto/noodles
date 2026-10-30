@@ -54,11 +54,20 @@ pub(super) fn build_slice(
     let mut block_content_ids = vec![core_data_block.content_id];
     block_content_ids.extend(external_data_blocks.iter().map(|block| block.content_id));
 
-    let (reference_sequence_context, reference_md5) = calculate_reference_sequence_md5(
-        &ctx.reference_sequence_repository,
-        header,
-        reference_sequence_context,
-    )?;
+    // Without a reference (records whose sequence the reference lacks), there is nothing to
+    // checksum.
+    let (reference_sequence_context, reference_md5) = if compression_header
+        .preservation_map()
+        .external_reference_sequence_is_required()
+    {
+        calculate_reference_sequence_md5(
+            &ctx.reference_sequence_repository,
+            header,
+            reference_sequence_context,
+        )?
+    } else {
+        (reference_sequence_context, None)
+    };
 
     let header = Header {
         reference_sequence_context,

@@ -151,6 +151,7 @@ impl Builder {
             context: self.context,
             records: Vec::with_capacity(records_per_container),
             record_counter: 0,
+            missing_reference_sequence_names: Vec::new(),
         }
     }
 }

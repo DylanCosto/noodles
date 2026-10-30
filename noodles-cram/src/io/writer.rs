@@ -8,8 +8,12 @@ pub(crate) mod header;
 pub(crate) mod num;
 pub(crate) mod record;
 
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    sync::Arc,
+};
 
+use noodles_fasta as fasta;
 use noodles_sam::{self as sam, alignment::io::Write as _};
 
 pub use self::builder::Builder;
@@ -17,10 +21,36 @@ use self::{
     container::write_container,
     header::{write_file_definition, write_file_header, write_header},
 };
-pub(crate) use self::{context::Context, record::Record};
+pub(crate) use self::{
+    context::Context,
+    record::{Record, ReferenceBases},
+};
 use crate::FileDefinition;
 
 pub(crate) const DEFAULT_SLICES_PER_CONTAINER: usize = 1;
+
+/// Returns the reference sequence named `name`, or `None` if the repository lacks it. Missing names
+/// are remembered, since the repository only caches sequences it has. There are few, if any.
+pub(crate) fn get_reference_sequence(
+    repository: &fasta::Repository,
+    missing_names: &mut Vec<Vec<u8>>,
+    name: &[u8],
+) -> io::Result<Option<Arc<fasta::record::Sequence>>> {
+    if missing_names
+        .iter()
+        .any(|missing_name| missing_name == name)
+    {
+        return Ok(None);
+    }
+
+    let sequence = repository.get(name).transpose()?;
+
+    if sequence.is_none() {
+        missing_names.push(name.to_vec());
+    }
+
+    Ok(sequence)
+}
 
 /// A CRAM writer.
 ///
@@ -50,6 +80,8 @@ pub struct Writer<W> {
     context: Context,
     records: Vec<Record>,
     record_counter: u64,
+    /// Reference sequences the repository lacks.
+    missing_reference_sequence_names: Vec<Vec<u8>>,
 }
 
 impl<W> Writer<W> {
@@ -283,11 +315,13 @@ where
         header: &sam::Header,
         record: &dyn sam::alignment::Record,
     ) -> io::Result<()> {
-        let record = Record::try_from_alignment_record(
-            &self.context.reference_sequence_repository,
-            header,
-            record,
-        )?;
+        let record = Record::try_from_alignment_record(header, record, |name| {
+            get_reference_sequence(
+                &self.context.reference_sequence_repository,
+                &mut self.missing_reference_sequence_names,
+                name,
+            )
+        })?;
 
         self.add_record(header, record)
     }
@@ -306,6 +340,7 @@ mod tests {
     use noodles_sam::alignment::record::{
         Flags,
         cigar::{Op, op::Kind},
+        data::field::Tag,
     };
 
     use super::*;
@@ -390,6 +425,101 @@ mod tests {
             .map(|r| r.name().unwrap().to_string())
             .collect();
         assert_eq!(names, ["r0", "r1", "r2", "r3"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_records_on_a_reference_sequence_missing_from_the_repository() -> io::Result<()> {
+        use noodles_sam::alignment::RecordBuf;
+
+        // The repository has sq0 but not sq1.
+        let repository = fasta::Repository::new(vec![fasta::Record::new(
+            fasta::record::Definition::new("sq0", None),
+            fasta::record::Sequence::from(b"ACGTACGTAC".to_vec()),
+        )]);
+        let header: sam::Header = "@SQ\tSN:sq0\tLN:10\n@SQ\tSN:sq1\tLN:10\n".parse().unwrap();
+
+        let record =
+            |name: &str, id: Option<usize>, start: usize, cigar: &[(Kind, usize)], seq: &[u8]| {
+                let mut builder = RecordBuf::builder()
+                    .set_name(name)
+                    .set_flags(if id.is_some() {
+                        Flags::empty()
+                    } else {
+                        Flags::UNMAPPED
+                    })
+                    .set_sequence(seq.to_vec().into())
+                    .set_quality_scores(vec![30; seq.len()].into());
+
+                if let Some(id) = id {
+                    builder = builder
+                        .set_reference_sequence_id(id)
+                        .set_alignment_start(Position::new(start).unwrap())
+                        .set_cigar(
+                            cigar
+                                .iter()
+                                .map(|&(kind, len)| Op::new(kind, len))
+                                .collect(),
+                        );
+                }
+
+                builder.build()
+            };
+
+        let records = [
+            // A mismatch against sq0, which is stored verbatim with the sq1 records.
+            record("r0", Some(0), 1, &[(Kind::Match, 4)], b"ACGA"),
+            record(
+                "r1",
+                Some(1),
+                2,
+                &[
+                    (Kind::HardClip, 2),
+                    (Kind::SoftClip, 1),
+                    (Kind::Match, 2),
+                    (Kind::Insertion, 1),
+                    (Kind::Deletion, 1),
+                    (Kind::Match, 2),
+                    (Kind::SoftClip, 1),
+                ],
+                b"TTGCAAG",
+            ),
+            record("r2", Some(1), 5, &[(Kind::Match, 5)], b""),
+            record("r3", None, 0, &[], b"AC"),
+        ];
+
+        let mut writer = Builder::default()
+            .set_reference_sequence_repository(repository.clone())
+            .build_from_writer(Vec::new());
+        writer.write_header(&header)?;
+
+        for record in &records {
+            writer.write_alignment_record(&header, record)?;
+        }
+
+        writer.try_finish(&header)?;
+
+        // The reader needs no sq1 (or sq0): the bases are stored verbatim.
+        let mut reader = crate::io::Reader::new(Cursor::new(writer.into_inner()));
+        let actual_header = reader.read_header()?;
+        let actual = reader
+            .records(&actual_header)
+            .collect::<io::Result<Vec<_>>>()?;
+
+        assert_eq!(actual.len(), records.len());
+
+        for (actual, expected) in actual.iter().zip(&records) {
+            assert_eq!(actual.name(), expected.name());
+            assert_eq!(
+                actual.reference_sequence_id(),
+                expected.reference_sequence_id()
+            );
+            assert_eq!(actual.alignment_start(), expected.alignment_start());
+            assert_eq!(actual.cigar(), expected.cigar());
+            assert_eq!(actual.sequence(), expected.sequence());
+            assert!(actual.data().get(&Tag::MISMATCHED_POSITIONS).is_none());
+        }
+
         Ok(())
     }
 

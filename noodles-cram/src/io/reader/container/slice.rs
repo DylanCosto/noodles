@@ -191,7 +191,13 @@ impl<'c> Slice<'c> {
             }
         }
 
-        if reference_sequence_context.is_many() {
+        // Without a required external reference, records read their bases from features (and the
+        // embedded reference, if any).
+        if reference_sequence_context.is_many()
+            && compression_header
+                .preservation_map()
+                .external_reference_sequence_is_required()
+        {
             set_record_reference_sequences(&reference_sequence_repository, header, &mut records)?;
         }
 
@@ -987,14 +993,11 @@ mod tests {
             &external_data_srcs,
         )?;
 
-        // Records still get their reference sequences when the external reference sequences
-        // are not required.
+        // As in slices with one reference sequence (and HTSlib), records get no external
+        // reference sequence when it is not required: their bases are stored verbatim.
         assert_eq!(records.len(), 2);
         for record in records {
-            assert!(matches!(
-                record.reference_sequence,
-                Some(ReferenceSequence::External { .. })
-            ));
+            assert!(record.reference_sequence.is_none());
         }
 
         Ok(())

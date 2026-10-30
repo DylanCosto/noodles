@@ -278,7 +278,9 @@ mod tests {
         }
 
         assert!(ranges.is_empty(), "ranges are not cached");
-        assert!(ranges.get_range(b"sqx", (..).into()).unwrap().is_err());
+        // A missing sequence is `None` for both adapters.
+        assert!(ranges.get(b"sqx").is_none());
+        assert!(ranges.get_range(b"sqx", (..).into()).is_none());
         assert!(whole.get_range(b"sqx", (..).into()).is_none());
 
         Ok(())

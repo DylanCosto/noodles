@@ -18,7 +18,7 @@ use self::{
     compression_header::{build_compression_header, write_compression_header},
     slice::{Slice, build_slice},
 };
-use super::{Context, Record};
+use super::{Context, Record, ReferenceBases};
 use crate::container::{Header, ReferenceSequenceContext, block::ContentType};
 
 pub fn write_container<W>(
@@ -54,6 +54,18 @@ fn build_container(
 ) -> io::Result<(Header, usize, Vec<Block>)> {
     let mut slices = Vec::new();
     let mut slice_record_counter = record_counter;
+
+    // A container either requires the external reference or not. With records on sequences the
+    // reference lacks, every record stores its aligned bases verbatim, as in HTSlib's
+    // non-reference mode.
+    if records
+        .iter()
+        .any(|record| record.reference_bases == ReferenceBases::Verbatim)
+    {
+        for record in records.iter_mut() {
+            record.store_bases_verbatim();
+        }
+    }
 
     let compression_header = build_compression_header(ctx, records);
 

@@ -139,6 +139,13 @@ Intentional differences:
 - Reading CRAM records that overhang the end of the reference, ntools fills the bases past the
   end with `N`, as HTSlib does when it can decode them; HTSlib fails on such slices when it
   must regenerate `MD`.
+- CRAM output with a reference that lacks some `@SQ` sequences warns as HTSlib does. Containers
+  holding records on those sequences store all their aligned bases verbatim (not "reference
+  required"), so they read back without the missing sequence. HTSlib instead embeds a consensus
+  reference built from the reads in sorted input (smaller files: 0.6 MB against 1.0 MB for 200,000
+  short reads, half of them on a missing sequence) and switches the whole file to no reference
+  for unsorted input (52 MB against 1.0 MB). Such records decode without regenerated `MD`/`NM`,
+  as in HTSlib.
 - `reheader` and `cat` recompress the block holding the end of the header with noodles' encoder,
   so files can differ in size by a few bytes; records are identical.
 - `cat` on CRAM re-encodes the containers it filters to a region (`-r` without `-f`) and those
@@ -305,6 +312,11 @@ ntools relies on these changes to the noodles crates, which downstream tools get
 - CRAM: decoding regenerates `MD`/`NM` tags that HTSlib's writer drops (as HTSlib's reader
   does, unless turned off with `io::reader::MdNm::AsStored`, HTSlib's `decode_md=0`), and fills
   bases past the end of the reference with `N` instead of panicking.
+- CRAM: the writer stores records on sequences missing from the reference verbatim (their
+  containers are not "reference required") instead of failing, and `@SQ` lines may lack `M5`.
+  Records in multi-reference slices that do not require the reference no longer get one, like
+  single-reference slices. FASTA: the indexed reader adapter returns `None` for a name missing
+  from the index, like the other adapters.
 - CRAM: a missing reference sequence is an error rather than a panic, and
   `Reader::set_reference_sequence_repository` lets a reference be chosen after reading the
   header.

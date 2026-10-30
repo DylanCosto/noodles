@@ -4,7 +4,6 @@ use crate::container::compression_header::preservation_map::substitution_matrix:
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Feature {
-    #[allow(dead_code)]
     Bases {
         position: Position,
         bases: Vec<u8>,

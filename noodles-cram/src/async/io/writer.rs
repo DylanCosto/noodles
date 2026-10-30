@@ -14,7 +14,7 @@ use self::{
 };
 use crate::{
     FileDefinition,
-    io::writer::{Context, Record},
+    io::writer::{Context, Record, get_reference_sequence},
 };
 
 /// An async CRAM writer.
@@ -25,6 +25,8 @@ pub struct Writer<W> {
     context: Context,
     records: Vec<Record>,
     record_counter: u64,
+    /// Reference sequences the repository lacks.
+    missing_reference_sequence_names: Vec<Vec<u8>>,
 }
 
 impl<W> Writer<W> {
@@ -271,11 +273,13 @@ where
         header: &sam::Header,
         record: &dyn sam::alignment::Record,
     ) -> io::Result<()> {
-        let record = Record::try_from_alignment_record(
-            &self.context.reference_sequence_repository,
-            header,
-            record,
-        )?;
+        let record = Record::try_from_alignment_record(header, record, |name| {
+            get_reference_sequence(
+                &self.context.reference_sequence_repository,
+                &mut self.missing_reference_sequence_names,
+                name,
+            )
+        })?;
 
         self.add_record(header, record).await
     }

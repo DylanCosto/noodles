@@ -29,24 +29,35 @@ where
     }
 }
 
-impl<R> Adapter for IndexedReader<R>
+impl<R> IndexedReader<R>
 where
-    R: BufRead + Seek + Send + Sync,
+    R: BufRead,
 {
-    fn get(&mut self, name: &[u8]) -> Option<io::Result<Record>> {
-        let region = Region::new(name, ..);
-        Some(self.reader.query(&region))
-    }
-
-    fn get_range(&mut self, name: &[u8], interval: Interval) -> Option<io::Result<Sequence>> {
-        let Some(length) = self
-            .reader
+    fn index_record(&self, name: &[u8]) -> Option<&crate::fai::Record> {
+        self.reader
             .index()
             .as_ref()
             .iter()
             .find(|record| record.name() == name)
-            .and_then(|record| usize::try_from(record.length()).ok())
-        else {
+    }
+}
+
+impl<R> Adapter for IndexedReader<R>
+where
+    R: BufRead + Seek + Send + Sync,
+{
+    /// Returns `None` when the index has no sequence named `name`.
+    fn get(&mut self, name: &[u8]) -> Option<io::Result<Record>> {
+        self.index_record(name)?;
+        let region = Region::new(name, ..);
+        Some(self.reader.query(&region))
+    }
+
+    /// Returns `None` when the index has no sequence named `name`.
+    fn get_range(&mut self, name: &[u8], interval: Interval) -> Option<io::Result<Sequence>> {
+        let length = self.index_record(name)?.length();
+
+        let Ok(length) = usize::try_from(length) else {
             let region = Region::new(name, interval);
             return Some(self.reader.query(&region).map(Record::into_sequence));
         };

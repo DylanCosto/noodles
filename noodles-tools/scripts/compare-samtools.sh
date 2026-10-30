@@ -43,8 +43,10 @@ timings=$work/timings.tsv
 
 # Prints the cache key of a samtools command: the command and the sizes of the work files it
 # names. Files named st.* or *.st.* are samtools outputs, absent when a cached result is used.
+# Files are keyed by size, and small ones (the generated test inputs, which can change without
+# changing size) by content as well.
 cache_key() {
-    local - word
+    local - word size
     set -f
     {
         echo "$cache_id"
@@ -52,7 +54,15 @@ cache_key() {
         for word in $1; do
             case $word in
                 st.* | *.st.*) ;;
-                *) [ -f "$word" ] && printf '%s %s\n' "$word" "$(stat -c %s "$word")" ;;
+                *)
+                    [ -f "$word" ] || continue
+                    size=$(stat -c %s "$word")
+                    if [ "$size" -le 1048576 ]; then
+                        printf '%s %s %s\n' "$word" "$size" "$(sha256sum <"$word" | cut -c1-64)"
+                    else
+                        printf '%s %s\n' "$word" "$size"
+                    fi
+                    ;;
             esac
         done
     } | sha256sum | cut -c1-64
@@ -628,6 +638,25 @@ check "index in.bam out.index" "$st index index.a.bam st.index.legacy && $st idx
 "$nt" view --no-PG -C -T "$ref" -o index.nt.cram p1.bam
 check "index CRAM written by ntools" "$st index -o st.index.crai index.nt.cram && $st idxstats -X index.nt.cram st.index.crai && $st view --no-PG -T $ref -X index.nt.cram st.index.crai $regions | md5sum && $st view -c -T $ref -X index.nt.cram st.index.crai '*'" "$nt index -o nt.index.crai index.nt.cram && $st idxstats -X index.nt.cram nt.index.crai && $st view --no-PG -T $ref -X index.nt.cram nt.index.crai $regions | md5sum && $st view -c -T $ref -X index.nt.cram nt.index.crai '*'"
 check "view --write-index CRAM" "$nt view --no-PG -C -T $ref -o nt.view.wi.ref.cram p1.bam && $st index nt.view.wi.ref.cram && $st idxstats nt.view.wi.ref.cram && $st view -T $ref nt.view.wi.ref.cram $regions | md5sum && $st view -c -T $ref nt.view.wi.ref.cram '*'" "$nt view --no-PG -C -T $ref --write-index -o nt.view.wi.cram p1.bam && $st idxstats nt.view.wi.cram && $st view -T $ref nt.view.wi.cram $regions | md5sum && $st view -c -T $ref nt.view.wi.cram '*'"
+
+# CRAM output with a reference that lacks some @SQ sequences. ntools stores the bases of the
+# containers with such records verbatim; samtools embeds a consensus reference (or, for unsorted
+# input, switches to no reference). Both read back as the input; MD/NM come back in a different
+# order, so tags are sorted.
+sorted_tags() { perl -F'\t' -lane 'print join("\t", @F[0..10], sort @F[11..$#F])'; }
+printf '>dummy\nACGT\n' >noref.fa && "$st" faidx noref.fa
+{
+    "$st" view -H --no-PG p1.bam | awk '{print} /^@SQ/ {print "@SQ\tSN:chrX\tLN:8000000"}'
+    "$st" view --no-PG p1.bam | head -50000 | awk -F'\t' 'BEGIN{OFS="\t"} $3 == "chrS" && substr($1, length($1)) % 2 == 1 {$3 = "chrX"} {print}'
+} >noref.mix.sam
+"$st" sort --no-PG -o noref.sorted.sam noref.mix.sam
+for input in noref.mix.sam noref.sorted.sam; do
+    check "view -C, reference lacking chrX ($input)" "$st view -C -T $ref -o st.$input.cram $input && $st view --no-PG -T $ref st.$input.cram | sorted_tags" "$nt view -C -T $ref -o nt.$input.cram $input && $st view --no-PG -T $ref nt.$input.cram | sorted_tags"
+    check "view -C, reference lacking chrX ($input), read by ntools" "$st view --no-PG -T $ref nt.$input.cram" "$nt view --no-PG -T $ref nt.$input.cram"
+done
+check "view -C, reference lacking every sequence" "$st view -C -T noref.fa -o st.noref.cram p1.bam && $st view --no-PG st.noref.cram | sorted_tags" "$nt view -C -T noref.fa -o nt.noref.cram p1.bam && $st view --no-PG nt.noref.cram | sorted_tags"
+"$st" view -b -o noref.sorted.bam noref.sorted.sam && "$st" index noref.sorted.bam
+check "index CRAM with records stored without reference" "$st view -c noref.sorted.bam chrX:100000-200000 chrS:100000-200000 '*'" "$nt index -o noref.sorted.crai nt.noref.sorted.sam.cram && $st view -c -T $ref -X nt.noref.sorted.sam.cram noref.sorted.crai chrX:100000-200000 chrS:100000-200000 '*'"
 
 # split
 mkdir -p split-s split-n

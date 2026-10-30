@@ -68,10 +68,10 @@ pub(crate) fn add_missing_reference_sequence_checksums(
             .other_fields_mut()
             .entry(tag::MD5_CHECKSUM)
         {
-            let sequence = reference_sequence_repository
-                .get(name)
-                .transpose()?
-                .expect("missing reference sequence");
+            // As in HTSlib, a sequence missing from the reference gets no checksum.
+            let Some(sequence) = reference_sequence_repository.get(name).transpose()? else {
+                continue;
+            };
 
             let checksum = calculate_normalized_sequence_digest(&sequence[..]);
 
