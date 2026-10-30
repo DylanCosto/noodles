@@ -311,6 +311,7 @@ fn probaln_glocal(
 
 /// Why BAQ was not computed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum BaqSkipped {
     /// Unmapped, empty, or with no matches or with reference skips (htslib returns -1).
     NotApplicable,
@@ -320,8 +321,6 @@ pub enum BaqSkipped {
     Invalid,
 }
 
-/// `sam_prob_realn(b, ref, ref_len, BAQ_APPLY | BAQ_EXTEND [| BAQ_REDO])`: caps base qualities
-/// by their extended BAQ and records the adjustment in a ZQ tag.
 impl std::error::Error for BaqSkipped {}
 
 impl std::fmt::Display for BaqSkipped {
@@ -349,6 +348,12 @@ pub struct BaqMode {
 /// `sam_prob_realn`: computes the BAQ of a read's bases against `reference`, recording it in a
 /// BQ tag, or with [`BaqMode::apply`] capping the qualities by it and recording the change in a
 /// ZQ tag.
+///
+/// # Errors
+///
+/// Returns why the read was left unchanged: it is not aligned or has no bases or matches
+/// ([`BaqSkipped::NotApplicable`]), it already carries the requested tag
+/// ([`BaqSkipped::Tagged`]), or its ZQ tag is malformed ([`BaqSkipped::Invalid`]).
 pub fn prob_realn(read: &mut Read, reference: &[u8], mode: BaqMode) -> Result<(), BaqSkipped> {
     let BaqMode {
         apply,
@@ -693,6 +698,7 @@ fn extended_baq(cigar: &[u32], pos: i64, xb: i64, state: &[i32], q: &[u8], bq: &
 }
 
 /// `sam_cap_mapq`: the capped mapping quality, or `None` to skip the read.
+#[must_use]
 pub fn cap_mapq(read: &Read, reference: &[u8], thres: i32) -> Option<i32> {
     let thres = if thres < 0 { 40 } else { thres };
     let ref_len = reference.len() as i64;

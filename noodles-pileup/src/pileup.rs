@@ -36,6 +36,7 @@ fn is_match(op: u32) -> bool {
 
 /// An error from the pileup.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum Error {
     /// A record's reference sequence comes before the last one's.
     UnsortedReferenceSequences,
@@ -102,6 +103,7 @@ struct CigarState {
 const NO_OP: u32 = u32::MAX;
 
 /// `lbnode_t`: a buffered read. What the per-position scan needs is kept apart, in [`Hot`].
+#[derive(Debug)]
 struct Node {
     read: Read,
     mods: Option<Box<BaseMods>>,
@@ -117,30 +119,31 @@ struct Hot {
     s: CigarState,
 }
 
-/// `bam_pileup1_t`: one read at the current position. `qpos` is the query position (for a
-/// deletion, that of the next base); `indel` is the length of an insertion (positive) or
-/// deletion (negative) that follows; `cigar_ind` is the CIGAR operation the position is in.
+/// `bam_pileup1_t`: one read at the current position.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Entry {
     node: usize,
-    #[allow(missing_docs)]
+    /// The 0-based query position of the base; for a deletion, that of the next base.
     pub qpos: i64,
-    #[allow(missing_docs)]
+    /// The length of an insertion (positive) or deletion (negative) that follows the position.
     pub indel: i32,
-    #[allow(missing_docs)]
+    /// Whether the position is in a deletion or reference skip.
     pub is_del: bool,
-    #[allow(missing_docs)]
+    /// Whether the position is the read's first aligned base.
     pub is_head: bool,
-    #[allow(missing_docs)]
+    /// Whether the position is the read's last aligned base.
     pub is_tail: bool,
-    #[allow(missing_docs)]
+    /// Whether the position is in a reference skip.
     pub is_refskip: bool,
-    #[allow(missing_docs)]
+    /// The index of the CIGAR operation the position is in.
     pub cigar_ind: i32,
 }
 
-/// `bam_plp_t`: a pileup over one coordinate-sorted input. Buffered reads live in `slots`, and `order` lists the occupied slots in input
-/// order (htslib's linked list), so that dropping a read moves only slot indices.
+/// `bam_plp_t`: a pileup over one coordinate-sorted input.
+//
+// Buffered reads live in `slots`, and `order` lists the occupied slots in input order (htslib's
+// linked list), so that dropping a read moves only slot indices.
+#[derive(Debug)]
 pub struct Pileup {
     slots: Vec<Option<Node>>,
     /// The scan state of each slot's read.
@@ -215,6 +218,10 @@ impl Pileup {
     }
 
     /// The read of an entry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `entry` is not one of [`Self::entries`].
     #[inline]
     pub fn read(&self, entry: &Entry) -> &Read {
         &self.node(entry.node as u32).read
@@ -222,6 +229,10 @@ impl Pileup {
 
     /// The read of an entry and, if [`Self::enable_base_modifications`] was called, its base
     /// modification state. Ask the state for query positions in increasing order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `entry` is not one of [`Self::entries`].
     #[inline]
     pub fn read_and_base_mods(&mut self, entry: &Entry) -> (&Read, Option<&mut BaseMods>) {
         let node = self.slots[entry.node]
@@ -243,6 +254,10 @@ impl Pileup {
     ///
     /// Returns an error if the input is not sorted by coordinate, or if overlapping mates have
     /// an invalid CIGAR.
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than `u32::MAX` reads are buffered at once.
     pub fn push(&mut self, read: Option<Read>) -> Result<(), Error> {
         let Some(read) = read else {
             self.is_eof = true;
@@ -345,9 +360,8 @@ impl Pileup {
                 let hot = &mut self.hot[slot as usize];
 
                 if hot.tid < tid || (hot.tid == tid && hot.end <= pos) {
-                    let node = self.slots[slot as usize].take().expect("occupied");
-
-                    if let Some(overlaps) = &mut self.overlaps
+                    if let Some(node) = self.slots[slot as usize].take()
+                        && let Some(overlaps) = &mut self.overlaps
                         && node.read.flag & FLAG_UNMAPPED == 0
                         && node.read.flag & FLAG_PROPER_PAIR != 0
                     {

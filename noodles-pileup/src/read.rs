@@ -42,8 +42,14 @@ impl Read {
             return Err(truncated());
         }
 
-        let u32_at =
-            |offset: usize| u32::from_le_bytes(raw[offset..offset + 4].try_into().unwrap());
+        let u32_at = |offset: usize| {
+            u32::from_le_bytes([
+                raw[offset],
+                raw[offset + 1],
+                raw[offset + 2],
+                raw[offset + 3],
+            ])
+        };
         let i32_at = |offset: usize| u32_at(offset).cast_signed();
 
         let name_len = usize::from(raw[NAME_LENGTH]);
