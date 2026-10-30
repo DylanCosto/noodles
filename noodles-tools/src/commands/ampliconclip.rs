@@ -650,9 +650,10 @@ impl<'a> Parts<'a> {
         let qual_start = seq_start + l_seq.div_ceil(2);
         let aux_start = qual_start + l_seq;
 
-        let long_cigar = bam_raw::Record::new(raw)
-            .and_then(|record| record.long_cigar_field())
-            .ok()
+        // Only a two-operation CIGAR can be a long CIGAR's placeholder.
+        let long_cigar = (n_cigar == 2)
+            .then(|| bam_raw::Record::new(raw).and_then(|record| record.long_cigar_field()))
+            .and_then(Result::ok)
             .flatten();
 
         let (cigar_src, aux) = match long_cigar {
