@@ -192,10 +192,16 @@ impl Programs {
     }
 }
 
+/// Returns whether following the previous program IDs from `parent_id` leads back to `node_id`.
+///
+/// A previous program ID that is not in the graph ends the chain (HTSlib warns about such links
+/// and keeps the line). The walk is bounded by the graph's size, so a cycle that does not pass
+/// through `node_id` also ends it; that cycle is found from one of its own nodes.
 fn has_cycle<'a>(graph: &'a Inner, mut parent_id: &'a BStr, node_id: &'a BStr) -> bool {
-    loop {
-        // SAFETY: `parent_id` is guaranteed to be in the graph.
-        let node = &graph[parent_id];
+    for _ in 0..graph.len() {
+        let Some(node) = graph.get(parent_id) else {
+            return false;
+        };
 
         if let Some(previous_program_id) = node.other_fields().get(&tag::PREVIOUS_PROGRAM_ID) {
             parent_id = previous_program_id.as_ref();
@@ -207,6 +213,8 @@ fn has_cycle<'a>(graph: &'a Inner, mut parent_id: &'a BStr, node_id: &'a BStr) -
             return false;
         }
     }
+
+    false
 }
 
 impl AsRef<Inner> for Programs {
@@ -339,6 +347,51 @@ mod tests {
                 "pg1",
                 Map::builder()
                     .insert(tag::PREVIOUS_PROGRAM_ID, "pg0")
+                    .build()?,
+            )
+            .build();
+
+        assert!(matches!(
+            header.programs().leaves(),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_leaves_with_a_missing_previous_program_or_a_downstream_cycle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let header = Header::builder()
+            .add_program(
+                "pg0",
+                Map::builder()
+                    .insert(tag::PREVIOUS_PROGRAM_ID, "missing")
+                    .build()?,
+            )
+            .build();
+
+        let leaves: Vec<_> = header.programs().leaves()?.map(|(id, _)| id).collect();
+        assert_eq!(leaves, [&b"pg0"[..]]);
+
+        // pg0 -> pg1 <-> pg2: the cycle does not pass through pg0.
+        let header = Header::builder()
+            .add_program(
+                "pg0",
+                Map::builder()
+                    .insert(tag::PREVIOUS_PROGRAM_ID, "pg1")
+                    .build()?,
+            )
+            .add_program(
+                "pg1",
+                Map::builder()
+                    .insert(tag::PREVIOUS_PROGRAM_ID, "pg2")
+                    .build()?,
+            )
+            .add_program(
+                "pg2",
+                Map::builder()
+                    .insert(tag::PREVIOUS_PROGRAM_ID, "pg1")
                     .build()?,
             )
             .build();

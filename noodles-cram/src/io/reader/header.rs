@@ -128,8 +128,27 @@ pub(super) fn read_header<R>(reader: &mut R) -> io::Result<sam::Header>
 where
     R: Read,
 {
-    read_file_definition(reader)?;
+    let file_definition = read_file_definition(reader)?;
+    validate_version(file_definition.version())?;
     read_file_header(reader)
+}
+
+/// Only CRAM 3 can be read: CRAM 2 containers and blocks have no CRC32 checksums, and their
+/// record counters have another encoding, so reading them as CRAM 3 fails with misleading
+/// checksum errors.
+fn validate_version(version: Version) -> io::Result<()> {
+    if version.major() >= 3 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported CRAM version {}.{}: only CRAM 3.0 and 3.1 can be read",
+                version.major(),
+                version.minor()
+            ),
+        ))
+    }
 }
 
 pub(super) fn read_file_definition<R>(reader: &mut R) -> io::Result<FileDefinition>
@@ -246,5 +265,15 @@ mod tests {
         assert_eq!(actual, expected);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_validate_version() {
+        assert!(validate_version(Version::new(3, 0)).is_ok());
+        assert!(validate_version(Version::new(3, 1)).is_ok());
+        assert!(matches!(
+            validate_version(Version::new(2, 1)),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData
+        ));
     }
 }

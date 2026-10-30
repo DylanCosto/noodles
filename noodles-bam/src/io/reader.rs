@@ -390,7 +390,8 @@ where
         ))
     }
 
-    /// Returns an iterator of unmapped records after querying for the unmapped region.
+    /// Returns an iterator of unplaced unmapped records (`*`) after querying for the unmapped
+    /// region.
     ///
     /// # Examples
     ///
@@ -423,9 +424,11 @@ where
             self.seek_to_first_record()?;
         }
 
+        // The records before the unplaced ones are those of the last reference sequence, which
+        // can include placed unmapped records; like HTSlib, only unplaced records are returned.
         Ok(self.records().filter_map(|result| match result {
             Ok(record) => {
-                if record.flags().is_unmapped() {
+                if record.reference_sequence_id().is_none() {
                     Some(Ok(record))
                 } else {
                     None

@@ -163,11 +163,6 @@ where
 
     let buf = split_off_first_chunk(src).ok_or_else(unexpected_eof)?;
     let n = f32::from_le_bytes(*buf);
-
-    if !n.is_finite() {
-        return Err(io::Error::from(io::ErrorKind::InvalidInput));
-    }
-
     num::write_f32(writer, n)?;
 
     Ok(())
@@ -408,11 +403,6 @@ where
         writer.write_all(&[ARRAY_ITEM_SEPARATOR])?;
 
         let n = f32::from_le_bytes(*chunk);
-
-        if !n.is_finite() {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput));
-        }
-
         num::write_f32(writer, n)?;
     }
 
@@ -591,12 +581,16 @@ mod tests {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
         ));
 
+        // HTSlib writes non-finite values.
         buf.clear();
         let src = f32::NAN.to_le_bytes();
-        assert!(matches!(
-            write_f32_field(&mut buf, &mut &src[..], tag),
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput
-        ));
+        write_f32_field(&mut buf, &mut &src[..], tag)?;
+        assert_eq!(buf, b"\tZZ:f:nan");
+
+        buf.clear();
+        let src = 1e30f32.to_le_bytes();
+        write_f32_field(&mut buf, &mut &src[..], tag)?;
+        assert_eq!(buf, b"\tZZ:f:1e+30");
 
         Ok(())
     }
@@ -720,11 +714,9 @@ mod tests {
         ));
 
         buf.clear();
-        let src = f32::NAN.to_le_bytes();
-        assert!(matches!(
-            write_f32_array_field(&mut buf, &mut &src[..], tag, 1),
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput
-        ));
+        let src = f32::NEG_INFINITY.to_le_bytes();
+        write_f32_array_field(&mut buf, &mut &src[..], tag, 1)?;
+        assert_eq!(buf, b"\tZZ:B:f,-inf");
 
         Ok(())
     }

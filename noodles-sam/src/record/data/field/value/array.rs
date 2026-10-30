@@ -26,13 +26,16 @@ pub(super) fn parse_array<'a>(src: &mut &'a [u8]) -> io::Result<Array<'a>> {
     }
 }
 
+/// Consumes the delimiter after the subtype. An empty array (`B:c`) has none: the field ends
+/// there, at a tab or the end of the record.
 fn maybe_consume_delimiter(src: &mut &[u8]) -> io::Result<()> {
     const DELIMITER: u8 = b',';
+    const FIELD_TERMINATOR: u8 = b'\t';
 
     if let Some((b, rest)) = src.split_first() {
         if *b == DELIMITER {
             *src = rest;
-        } else {
+        } else if *b != FIELD_TERMINATOR {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid delimiter",
@@ -69,6 +72,24 @@ mod tests {
 
         let src = b"f,0.0";
         assert!(matches!(parse_array(&mut &src[..])?, Array::Float(_)));
+
+        // Empty arrays, at the end of the record or followed by another field.
+        let src = b"c";
+        assert!(
+            matches!(parse_array(&mut &src[..])?, Array::Int8(values) if values.iter().next().is_none())
+        );
+
+        let mut src = &b"f\tZZ:Z:a"[..];
+        assert!(
+            matches!(parse_array(&mut src)?, Array::Float(values) if values.iter().next().is_none())
+        );
+        assert_eq!(src, b"\tZZ:Z:a");
+
+        let src = b"c;0";
+        assert!(matches!(
+            parse_array(&mut &src[..]),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData
+        ));
 
         Ok(())
     }

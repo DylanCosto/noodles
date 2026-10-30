@@ -56,6 +56,14 @@ fn band_index(bw: i32, i: i32, k: i32) -> usize {
 
 /// `probaln_glocal`, with the backward pass and MAP: fills `state` and `q` (each `query.len()`
 /// long). Returns `false` on invalid input.
+/// Allocates `len` zeros, or returns `None` if the allocation fails.
+fn zeroed(len: usize) -> Option<Vec<f64>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).ok()?;
+    v.resize(len, 0.0);
+    Some(v)
+}
+
 fn probaln_glocal(
     reference: &[u8],
     query: &[u8],
@@ -92,9 +100,15 @@ fn probaln_glocal(
         l_ref as usize * 3 + 6
     };
 
+    // htslib gives up (and leaves the read unchanged) when it cannot allocate the matrices,
+    // which a long read with a wide band can make very large.
     let rows = l_query as usize + 1;
-    let mut f = vec![0f64; rows * i_dim];
-    let mut b = vec![0f64; rows * i_dim];
+    let Some(len) = rows.checked_mul(i_dim) else {
+        return false;
+    };
+    let (Some(mut f), Some(mut b)) = (zeroed(len), zeroed(len)) else {
+        return false;
+    };
     let mut s = vec![0f64; l_query as usize + 2];
 
     let table = &*QUAL_TO_PROB;
@@ -250,7 +264,12 @@ fn probaln_glocal(
         let mut xi = band_index(bw, i, end) as isize;
         let mut yi = band_index(bw, i + 1, end) as isize;
 
-        let mut xi_5 = bi[(xi + 5) as usize];
+        // HTSlib reads `xi[5]` through a pointer into the whole matrix: when the band reaches
+        // the end of a short reference, that is past this row, in the next one.
+        let mut xi_5 = match bi.get((xi + 5) as usize) {
+            Some(&v) => v,
+            None => bi1[(xi + 5) as usize - i_dim],
+        };
         let e1 = EI * m[1];
         let e4 = EI * m[4];
         let n = 1.0 / s[i as usize];
@@ -798,5 +817,37 @@ fn c_int(value: f64) -> i32 {
         #[expect(clippy::cast_possible_truncation, reason = "the value is in range")]
         let n = value as i32;
         n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_probaln_glocal_with_a_reference_shorter_than_the_band() {
+        // With the band covering the whole reference, htslib reads one value past the end of a
+        // backward matrix row (into the next row), which must not go out of bounds here.
+        let reference = [0, 1, 2, 3];
+        let query = [0, 1, 2, 3, 0, 1];
+        let qual = [30; 6];
+        let params = Params {
+            d: 0.001,
+            e: 0.1,
+            bw: 10,
+        };
+        let mut state = [0; 6];
+        let mut q = [0; 6];
+
+        assert!(probaln_glocal(
+            &reference, &query, &qual, &params, &mut state, &mut q
+        ));
+        assert_eq!(state[0] >> 2, 0);
+    }
+
+    #[test]
+    fn test_zeroed() {
+        assert_eq!(zeroed(3), Some(vec![0.0; 3]));
+        assert_eq!(zeroed(usize::MAX / 4), None);
     }
 }

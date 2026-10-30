@@ -155,12 +155,11 @@ pub(super) mod tests {
             b"f,8,13",
         )?;
 
-        buf.clear();
-        let array = Array::Float(Box::new(T::new(&[f32::NAN])));
-        assert!(matches!(
-            write_array(&mut buf, &array),
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput
-        ));
+        t(
+            &mut buf,
+            &Array::Float(Box::new(T::new(&[f32::NAN, 1e10]))),
+            b"f,nan,1e+10",
+        )?;
 
         Ok(())
     }

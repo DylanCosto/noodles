@@ -359,7 +359,8 @@ where
         ))
     }
 
-    /// Returns an iterator of unmapped records after querying for the unmapped region.
+    /// Returns an iterator of unplaced unmapped records (`*`) after querying for the unmapped
+    /// region.
     ///
     /// # Examples
     ///
@@ -388,21 +389,33 @@ where
         let offset = index
             .iter()
             .find(|record| record.reference_sequence_id().is_none())
-            .map(|record| SeekFrom::Start(record.offset()))
-            .unwrap_or(SeekFrom::End(0));
+            .map(|record| record.offset());
 
-        self.get_mut().seek(offset)?;
-
-        Ok(self.records(header).filter_map(|result| match result {
-            Ok(record) => {
-                if record.flags().is_unmapped() {
-                    Some(Ok(record))
-                } else {
-                    None
-                }
+        // Without unplaced records, there is nothing to read: the end of the stream has no
+        // container (not even the EOF container) to read.
+        let limit = match offset {
+            Some(offset) => {
+                self.get_mut().seek(SeekFrom::Start(offset))?;
+                usize::MAX
             }
-            Err(e) => Some(Err(e)),
-        }))
+            None => 0,
+        };
+
+        // A slice with many reference sequences can also hold placed records; like HTSlib, only
+        // unplaced records are returned.
+        Ok(self
+            .records(header)
+            .take(limit)
+            .filter_map(|result| match result {
+                Ok(record) => {
+                    if record.reference_sequence_id().is_none() {
+                        Some(Ok(record))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => Some(Err(e)),
+            }))
     }
 }
 

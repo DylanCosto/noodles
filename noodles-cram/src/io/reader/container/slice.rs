@@ -194,6 +194,13 @@ fn resolve_mates(records: &mut [Record]) -> io::Result<()> {
         .map(|(i, record)| record.mate_distance.map(|len| i + len + 1))
         .collect();
 
+    if mate_indices.iter().flatten().any(|&j| j >= records.len()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "mate record is outside the slice",
+        ));
+    }
+
     for i in 0..records.len() {
         let record = &mut records[i];
 
@@ -228,20 +235,7 @@ fn resolve_mates(records: &mut [Record]) -> io::Result<()> {
         let mate = &mut left[i];
         set_mate(record, mate);
 
-        // "The TLEN field is positive for the leftmost segment of the template, negative for the
-        // rightmost, and the sign for any middle segment is undefined. If segments cover the same
-        // coordinates then the choice of which is leftmost and rightmost is arbitrary..."
-        let template_length = calculate_template_length(record, mate);
-        records[i].template_length = template_length;
-
-        let mut j = i;
-
-        while let Some(mate_index) = mate_indices[j] {
-            let record = &mut records[mate_index];
-            record.template_length = -template_length;
-            mate_indices[j] = None;
-            j = mate_index;
-        }
+        set_template_lengths(records, &mut mate_indices, i);
     }
 
     Ok(())
@@ -256,17 +250,6 @@ fn set_mate(record: &mut Record, mate: &mut Record) {
         mate.reference_sequence_id,
         mate.alignment_start,
     );
-}
-
-fn calculate_template_length(record: &Record, mate: &Record) -> i32 {
-    calculate_template_length_chunk(
-        record.alignment_start,
-        record.read_length,
-        &record.features,
-        mate.alignment_start,
-        mate.read_length,
-        &mate.features,
-    )
 }
 
 fn set_mate_chunk(
@@ -289,54 +272,97 @@ fn set_mate_chunk(
     *record_mate_alignment_start = mate_alignment_start;
 }
 
-// _Sequence Alignment/Map Format Specification_ (2021-06-03) § 1.4.9 "TLEN"
-fn calculate_template_length_chunk(
-    record_alignment_start: Option<Position>,
-    record_read_length: usize,
-    record_features: &[Feature],
-    mate_alignment_start: Option<Position>,
-    mate_read_length: usize,
-    mate_features: &[Feature],
-) -> i32 {
+/// Returns the alignment start and end of a record, as HTSlib uses them for template lengths:
+/// 0 for an unplaced record, and the start for an unmapped one or one that covers no reference
+/// bases.
+fn template_extent(record: &Record) -> (usize, usize) {
     use crate::record::calculate_alignment_span;
 
-    fn alignment_end(
-        alignment_start: Option<Position>,
-        read_length: usize,
-        features: &[Feature],
-    ) -> Option<Position> {
-        alignment_start.and_then(|start| {
-            let span = calculate_alignment_span(read_length, features);
-            let end = usize::from(start) + span - 1;
-            Position::new(end)
-        })
+    let start = record.alignment_start.map(usize::from).unwrap_or_default();
+
+    if record.bam_flags.is_unmapped() {
+        return (start, start);
     }
 
-    let Some(start) = record_alignment_start
-        .min(mate_alignment_start)
-        .map(usize::from)
-    else {
-        return 0;
-    };
+    let span = calculate_alignment_span(record.read_length, &record.features);
+    let end = (start + span).saturating_sub(1).max(start);
 
-    let record_alignment_end =
-        alignment_end(record_alignment_start, record_read_length, record_features);
-    let mate_alignment_end = alignment_end(mate_alignment_start, mate_read_length, mate_features);
+    (start, end)
+}
 
-    let end = record_alignment_end
-        .max(mate_alignment_end)
-        .map(usize::from)
-        .expect("invalid end position");
+/// Sets the template lengths of the attached template that starts at record `i`, as HTSlib does
+/// (`cram_decode_slice_xref`), and detaches its records in `mate_indices`.
+///
+/// The length spans all segments when they are on the same reference sequence, and is 0
+/// otherwise. The first record's length is positive when it is leftmost (and not also rightmost
+/// with another segment), with ties of identical extents broken by the first-segment flag, and the
+/// other records get the opposite sign. Unmapped records and records with unmapped mates get 0.
+fn set_template_lengths(records: &mut [Record], mate_indices: &mut [Option<usize>], i: usize) {
+    let (first_start, first_end) = template_extent(&records[i]);
+    let reference_sequence_id = records[i].reference_sequence_id;
 
-    // "...the absolute value of TLEN equals the distance between the mapped end of the template
-    // and the mapped start of the template, inclusively..."
-    let len = if start > end {
-        start - end + 1
+    let (mut left, mut right) = (first_start, first_end);
+    let (mut left_count, mut right_count) = (0, 0);
+    let mut same_reference_sequence = reference_sequence_id.is_some();
+
+    let mut j = Some(i);
+
+    while let Some(k) = j {
+        let (start, end) = template_extent(&records[k]);
+
+        if start < left {
+            (left, left_count) = (start, 1);
+        } else if start == left {
+            left_count += 1;
+        }
+
+        if end > right {
+            (right, right_count) = (end, 1);
+        } else if end == right {
+            right_count += 1;
+        }
+
+        same_reference_sequence &= records[k].reference_sequence_id == reference_sequence_id;
+
+        j = mate_indices[k];
+    }
+
+    let len = if same_reference_sequence {
+        i32::try_from(right - left + 1).unwrap_or_default()
     } else {
-        end - start + 1
+        0
     };
 
-    i32::try_from(len).expect("invalid template length")
+    let first_is_leftmost = first_start == left && (first_end < right || left_count <= 1);
+    let first_is_tied =
+        first_start == left && first_end == right && left_count > 1 && right_count > 1;
+
+    let first_len =
+        if first_is_leftmost || (first_is_tied && records[i].bam_flags.is_first_segment()) {
+            len
+        } else {
+            -len
+        };
+
+    let mut prev = i;
+    let mut j = mate_indices[i].take();
+    records[i].template_length = first_len;
+
+    while let Some(k) = j {
+        records[k].template_length = -first_len;
+        clear_unmapped_template_length(records, prev, k);
+        prev = k;
+        j = mate_indices[k].take();
+    }
+
+    clear_unmapped_template_length(records, prev, i);
+}
+
+/// Sets the template length of record `i` to 0 when it or its mate, record `mate`, is unmapped.
+fn clear_unmapped_template_length(records: &mut [Record], i: usize, mate: usize) {
+    if records[i].bam_flags.is_unmapped() || records[mate].bam_flags.is_unmapped() {
+        records[i].template_length = 0;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -688,6 +714,7 @@ mod tests {
             Record {
                 id: 1,
                 cram_flags: Flags::MATE_IS_DOWNSTREAM,
+                bam_flags: sam::alignment::record::Flags::empty(),
                 reference_sequence_id: Some(2),
                 read_length: 4,
                 alignment_start: Position::new(5),
@@ -697,6 +724,7 @@ mod tests {
             Record {
                 id: 2,
                 cram_flags: Flags::MATE_IS_DOWNSTREAM,
+                bam_flags: sam::alignment::record::Flags::empty(),
                 reference_sequence_id: Some(2),
                 read_length: 4,
                 alignment_start: Position::new(8),
@@ -709,6 +737,7 @@ mod tests {
             },
             Record {
                 id: 4,
+                bam_flags: sam::alignment::record::Flags::empty(),
                 reference_sequence_id: Some(2),
                 read_length: 4,
                 alignment_start: Position::new(13),
@@ -750,83 +779,84 @@ mod tests {
         Ok(())
     }
 
+    fn attached_pair<'c>(first: Record<'c>, second: Record<'c>) -> io::Result<[Record<'c>; 2]> {
+        let mut records = [
+            Record {
+                id: 1,
+                name: Some(Cow::from(b"r".to_vec())),
+                cram_flags: Flags::MATE_IS_DOWNSTREAM,
+                mate_distance: Some(0),
+                ..first
+            },
+            Record { id: 2, ..second },
+        ];
+
+        resolve_mates(&mut records)?;
+
+        Ok(records)
+    }
+
     #[test]
-    fn test_calculate_template_length() {
-        use sam::alignment::record::Flags;
+    fn test_resolve_mates_template_lengths() -> io::Result<()> {
+        use sam::alignment::record::Flags as BamFlags;
 
-        // --> -->
-        let record = Record {
-            alignment_start: Position::new(100),
-            read_length: 50,
+        let mapped = |flags: BamFlags, start: usize, read_length: usize| Record {
+            bam_flags: flags,
+            reference_sequence_id: Some(0),
+            alignment_start: Position::new(start),
+            read_length,
             ..Default::default()
         };
 
-        let mate = Record {
-            alignment_start: Position::new(200),
-            read_length: 50,
-            ..Default::default()
+        // The leftmost segment gets the positive length.
+        let [a, b] = attached_pair(
+            mapped(BamFlags::LAST_SEGMENT, 100, 50),
+            mapped(BamFlags::FIRST_SEGMENT, 200, 50),
+        )?;
+        assert_eq!((a.template_length, b.template_length), (150, -150));
+
+        // Identical extents: the first segment gets the positive length, whatever the order.
+        let [a, b] = attached_pair(
+            mapped(BamFlags::LAST_SEGMENT, 100, 50),
+            mapped(BamFlags::FIRST_SEGMENT, 100, 50),
+        )?;
+        assert_eq!((a.template_length, b.template_length), (-50, 50));
+
+        // Same start, the first record is shorter: it is leftmost and not rightmost.
+        let [a, b] = attached_pair(
+            mapped(BamFlags::LAST_SEGMENT, 100, 10),
+            mapped(BamFlags::FIRST_SEGMENT, 100, 50),
+        )?;
+        assert_eq!((a.template_length, b.template_length), (50, -50));
+
+        // An unmapped segment gives both records 0.
+        let unmapped = Record {
+            bam_flags: BamFlags::UNMAPPED,
+            ..mapped(BamFlags::LAST_SEGMENT, 100, 50)
         };
+        let [a, b] = attached_pair(mapped(BamFlags::FIRST_SEGMENT, 100, 50), unmapped)?;
+        assert_eq!((a.template_length, b.template_length), (0, 0));
+        assert!(a.bam_flags.is_mate_unmapped());
 
-        assert_eq!(calculate_template_length(&record, &mate), 150);
-        assert_eq!(calculate_template_length(&mate, &record), 150);
-
-        // --> <--
-        // This is the example given in _Sequence Alignment/Map Format Specification_ (2021-06-03)
-        // § 1.4.9 "TLEN" (footnote 14).
-        let record = Record {
-            alignment_start: Position::new(100),
-            read_length: 50,
-            ..Default::default()
+        // Segments on different reference sequences give 0.
+        let other = Record {
+            reference_sequence_id: Some(1),
+            ..mapped(BamFlags::LAST_SEGMENT, 300, 50)
         };
+        let [a, b] = attached_pair(mapped(BamFlags::FIRST_SEGMENT, 100, 50), other)?;
+        assert_eq!((a.template_length, b.template_length), (0, 0));
 
-        let mate = Record {
-            bam_flags: Flags::REVERSE_COMPLEMENTED,
-            alignment_start: Position::new(200),
-            read_length: 50,
+        // A mate past the end of the slice is an error.
+        let mut records = [Record {
+            mate_distance: Some(3),
             ..Default::default()
-        };
+        }];
+        assert!(matches!(
+            resolve_mates(&mut records),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData
+        ));
 
-        assert_eq!(calculate_template_length(&record, &mate), 150);
-        assert_eq!(calculate_template_length(&mate, &record), 150);
-
-        // <-- -->
-        let record = Record {
-            bam_flags: Flags::REVERSE_COMPLEMENTED,
-            alignment_start: Position::new(100),
-            read_length: 50,
-            ..Default::default()
-        };
-
-        let mate = Record {
-            alignment_start: Position::new(200),
-            read_length: 50,
-            ..Default::default()
-        };
-
-        assert_eq!(calculate_template_length(&record, &mate), 150);
-        assert_eq!(calculate_template_length(&mate, &record), 150);
-
-        // <-- <--
-        let record = Record {
-            bam_flags: Flags::REVERSE_COMPLEMENTED,
-            alignment_start: Position::new(100),
-            read_length: 50,
-            ..Default::default()
-        };
-
-        let mate = Record {
-            bam_flags: Flags::REVERSE_COMPLEMENTED,
-            alignment_start: Position::new(200),
-            read_length: 50,
-            ..Default::default()
-        };
-
-        assert_eq!(calculate_template_length(&record, &mate), 150);
-        assert_eq!(calculate_template_length(&mate, &record), 150);
-
-        // No alignment start position.
-        let record = Record::default();
-        assert_eq!(calculate_template_length(&record, &record), 0);
+        Ok(())
     }
 
     #[test]

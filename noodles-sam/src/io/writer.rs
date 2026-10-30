@@ -7,9 +7,9 @@ pub mod record;
 
 use std::io::{self, Write};
 
-pub use self::builder::Builder;
 use self::header::write_header;
 pub(crate) use self::record::write_record;
+pub use self::{builder::Builder, num::write_f32};
 use crate::{Header, Record};
 
 /// A SAM writer.
