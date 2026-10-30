@@ -366,7 +366,7 @@ fn files(args: &Args) -> anyhow::Result<(PathBuf, Vec<InputFile>)> {
 /// Reads a list of file names, one per line, skipping empty lines (`hts_readlines`). A gzipped
 /// list is decompressed; a name that is not a file but starts with `:` is a comma-separated
 /// list.
-fn read_file_list(src: &Path) -> anyhow::Result<Vec<PathBuf>> {
+pub fn read_file_list(src: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let file = match File::open(src) {
         Ok(file) => file,
         Err(e) => {

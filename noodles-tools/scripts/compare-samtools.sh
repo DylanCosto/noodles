@@ -284,6 +284,33 @@ done
 "$st" view -C -T "$ref" -O cram,version=2.1 -o reheader.21.cram p1.bam
 check "reheader -i CRAM 2.1" "cp reheader.21.cram st.reheader.21.cram && $st reheader -P -i reheader.sam st.reheader.21.cram && $st view --no-PG -h -T $ref st.reheader.21.cram" "cp reheader.21.cram nt.reheader.21.cram && $nt reheader -P -i reheader.sam nt.reheader.21.cram && $st view --no-PG -h -T $ref nt.reheader.21.cram"
 
+# cat: @RG lines of later inputs are added (HTSlib appends them after @PG lines, so headers are
+# compared sorted), -b lists, and CRAM: concatenation, read group renumbering, and the -q, -r,
+# -p, and -f container selections
+"$st" addreplacerg -r 'ID:other\tSM:x' -o cat.rg.bam p2.bam
+"$st" view -C -T "$ref" -o cat.p1.cram p1.bam
+"$st" view -C -T "$ref" -o cat.rg.cram cat.rg.bam
+printf 'p1.bam\ncat.rg.bam\n' > cat.list
+check "cat (@RG merge)" "$st cat --no-PG p1.bam cat.rg.bam | $st view --no-PG -h - | sort" "$nt cat --no-PG p1.bam cat.rg.bam | $st view --no-PG -h - | sort"
+check "cat -b -h" "$st cat --no-PG -b cat.list -h cat.rg.bam p1.bam | $st view --no-PG -h - | sort" "$nt cat --no-PG -b cat.list -h cat.rg.bam p1.bam | $st view --no-PG -h - | sort"
+check "cat CRAM (@RG renumbered)" "$st cat --no-PG cat.p1.cram cat.rg.cram | $st view --no-PG -h -T $ref - | sort" "$nt cat --no-PG cat.p1.cram cat.rg.cram | $st view --no-PG -h -T $ref - | sort"
+for v in 3.0 3.1; do
+    cram=$corpus/short/input.$v.cram
+    check "cat CRAM $v" "$st cat --no-PG $cram $cram | $st view --no-PG -h -T $ref -" "$nt cat --no-PG $cram $cram | $st view --no-PG -h -T $ref -"
+    check "cat -q CRAM $v" "$st cat -q $cram" "$nt cat -q $cram"
+    for r in chrS:1-100000 chrS:500000-600000 '*'; do
+        check "cat -q -r $r CRAM $v" "$st cat -q -r '$r' $cram" "$nt cat -q -r '$r' $cram"
+        check "cat -r $r CRAM $v" "$st cat --no-PG -r '$r' $cram | $st view --no-PG -h -T $ref -" "$nt cat --no-PG -r '$r' $cram | $st view --no-PG -h -T $ref -"
+        check "cat -f -r $r CRAM $v" "$st cat --no-PG -f -r '$r' $cram | $st view --no-PG -h -T $ref -" "$nt cat --no-PG -f -r '$r' $cram | $st view --no-PG -h -T $ref -"
+        check "cat -r $r -p 2/3 CRAM $v" "$st cat --no-PG -r '$r' -p 2/3 $cram | $st view --no-PG -h -T $ref -" "$nt cat --no-PG -r '$r' -p 2/3 $cram | $st view --no-PG -h -T $ref -"
+    done
+    check "cat -r #:3-5 CRAM $v" "$st cat --no-PG -r '#:3-5' $cram | $st view --no-PG -h -T $ref -" "$nt cat --no-PG -r '#:3-5' $cram | $st view --no-PG -h -T $ref -"
+done
+long_cram=$corpus/long/input.3.0.cram
+for r in $(sed -n '1p;2p' "$corpus/long/queries.100.regions"); do
+    check "cat -r $r CRAM long" "$st cat --no-PG -r $r $long_cram | $st view --no-PG -h -T $long_ref -" "$nt cat --no-PG -r $r --reference $long_ref $long_cram | $st view --no-PG -h -T $long_ref -"
+done
+
 # reads
 check "fastq" "$st fastq short.name.bam" "$nt fastq short.name.bam"
 check "fastq -n -t" "$st fastq -n -t $tagged" "$nt fastq -n -t $tagged"

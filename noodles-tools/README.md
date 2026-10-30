@@ -29,7 +29,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `fastq`, `fasta` | `fastq`, `fasta` | `-0/-1/-2/-s/-o`, `-n/-N`, `-t/-T`, `-F/-f/-G`, `.gz` output |
 | `quickcheck` | `quickcheck` | `-v`, `-q`, `-u` |
 | `reheader` | `reheader` | BAM and CRAM; `-P`, `-c CMD`, `-i` (CRAM in place); copies compressed blocks and containers |
-| `cat` | `cat` | BAM; copies compressed blocks |
+| `cat` | `cat` | BAM and CRAM; `-b`, `-h`, `-o`, later inputs' `@RG` lines added; CRAM `-r` (region, `*`, or `#:start-end` containers), `-p N/M`, `-f`, `-q`; copies compressed blocks and containers, re-encoding only CRAM containers that must be filtered or get new read group numbers |
 | `split` | `split` | by read group or `-d` tag; `-f`, `-p`, `-u`, `-M` |
 | `collate` | `collate` | groups templates by name; `-f`, `-O/-o`, `-u`, `-l`, `-m`, `-T`; `-n` and `-r` are accepted and ignored (they size samtools' temporary files) |
 | `fixmate` | `fixmate` | `-m`, `-c`, `-r`, `-p`, `-z`; parallel with `-@` |
@@ -93,6 +93,14 @@ Intentional differences:
   must regenerate `MD`.
 - `reheader` and `cat` recompress the block holding the end of the header with noodles' encoder,
   so files can differ in size by a few bytes; records are identical.
+- `cat` on CRAM re-encodes the containers it filters to a region (`-r` without `-f`) and those
+  whose single read group gets a new number with noodles' encoder (which needs the reference,
+  from `--reference` or the `@SQ` `UR` fields, and does not write CRAM 2.1); HTSlib edits the
+  compression header for the latter. Decoded records are the same, and `MD`/`NM` tags are dropped
+  where HTSlib would regenerate them. `cat -p N/M` without `-r` divides all of a file's
+  containers; samtools 1.24 divides a single container, so part 1 copies the whole file and the
+  others nothing. Containers are numbered (`-q`, `-p`, `#:`) by the index's entries for each
+  reference in turn, then unplaced ones, which is HTSlib's order unless slices nest.
 - `collate` groups each template's records together, in input order, as samtools does, but
   templates come out in a different (hash) order.
 - Header lines are written grouped by type (`@HD`, `@SQ`, `@RG`, `@PG`, `@CO`). HTSlib keeps
