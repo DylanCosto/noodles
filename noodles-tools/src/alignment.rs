@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, bail};
 use noodles_bam as bam;
 use noodles_core::{Position, Region};
-use noodles_cram as cram;
+use noodles_cram::{self as cram, io::reader::MdNm};
 use noodles_fasta as fasta;
 use noodles_sam::{
     self as sam,
@@ -204,6 +204,14 @@ impl AlignmentReader {
         })
     }
 
+    /// Stops CRAM decoding from adding the MD and NM tags the file left out, as samtools
+    /// commands that set `CRAM_OPT_DECODE_MD` to 0 do. Other formats are unaffected.
+    pub fn keep_stored_md_nm(&mut self) {
+        if let Self::Cram(reader, _, _) = self {
+            reader.set_md_nm(MdNm::AsStored);
+        }
+    }
+
     pub fn format(&self) -> Format {
         match self {
             Self::Sam(_) => Format::Sam,
@@ -273,12 +281,13 @@ impl AlignmentReader {
                         let slice = result?;
                         let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
 
-                        let records = slice.records(
+                        let records = slice.records_with_md_nm(
                             repository.clone(),
                             header,
                             &compression_header,
                             &core_data_src,
                             &external_data_srcs,
+                            reader.md_nm(),
                         )?;
 
                         for record in &records {

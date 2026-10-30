@@ -130,6 +130,7 @@ where
         }
 
         let reference_sequence_repository = self.get_ref().reference_sequence_repository().clone();
+        let md_nm = self.get_ref().md_nm();
         let compression_header = self.container.compression_header()?;
 
         let mut records = Vec::with_capacity(self.container.header().record_count());
@@ -140,12 +141,13 @@ where
             let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
 
             let record_bufs = slice
-                .records(
+                .records_with_md_nm(
                     reference_sequence_repository.clone(),
                     header,
                     &compression_header,
                     &core_data_src,
                     &external_data_srcs,
+                    md_nm,
                 )?
                 .into_iter()
                 .map(|record| {

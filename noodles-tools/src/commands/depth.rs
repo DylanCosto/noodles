@@ -129,6 +129,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     for (i, src) in sources.iter().enumerate() {
         let (mut reader, path) = AlignmentReader::open(src, &options)?;
+        // As in samtools (CRAM_OPT_DECODE_MD set to 0); depth never reads MD or NM.
+        reader.keep_stored_md_nm();
         let header = reader.read_header()?;
         let index = indexes.as_ref().map(|indexes| PathBuf::from(&indexes[i]));
         inputs.push((reader, path, header, index));

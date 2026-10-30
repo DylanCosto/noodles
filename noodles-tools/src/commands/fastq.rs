@@ -233,6 +233,8 @@ pub fn run(args: Args, format: ReadFormat) -> anyhow::Result<()> {
     };
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &options)?;
+    // samtools fastq sets CRAM_OPT_DECODE_MD to 0, so -T copies stored MD and NM tags only.
+    reader.keep_stored_md_nm();
     let header = reader.read_header()?;
 
     if is_coordinate_sorted(&header) {

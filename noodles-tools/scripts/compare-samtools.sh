@@ -599,6 +599,17 @@ check "view CRAM without MD/NM" "$st view -T $ref mp.short.nomd.cram" "$nt view 
 check "view long CRAM with dropped MD/NM" "$st view -T $long_ref mp.long.cram" "$nt view -T $long_ref mp.long.cram"
 check "consensus CRAM with dropped MD/NM" "$st consensus mp.short.cram" "$nt consensus mp.short.cram"
 
+# Regenerated MD and NM go after the stored tags, MD first; a stored NM (here a wrong one, so
+# kept) stays before a regenerated MD, and a stored wrong MD before a regenerated NM.
+"$st" view -h mp.short.bam | awk 'BEGIN { OFS = "\t" } /^@/ { print; next } { n++; for (i = 12; i <= NF; i++) { if (n % 3 == 1 && $i ~ /^MD:Z:/) $i = "MD:Z:0A0" substr($i, 6); if (n % 3 == 2 && $i ~ /^NM:i:/) $i = "NM:i:99" } print }' > mp.mixmd.sam
+"$st" view -C -T "$ref" -o mp.mixmd.cram mp.mixmd.sam && "$st" index mp.mixmd.cram
+check "view CRAM with stored and regenerated MD/NM" "$st view -T $ref mp.mixmd.cram" "$nt view -T $ref mp.mixmd.cram"
+check "view CRAM with stored and regenerated MD/NM -@4 -b" "$st view -b -T $ref mp.mixmd.cram | $st view" "$nt view -@ 4 -b -T $ref mp.mixmd.cram | $st view"
+check "view CRAM region with regenerated MD/NM" "$st view -T $ref mp.mixmd.cram chrS:50000-150000" "$nt view -T $ref mp.mixmd.cram chrS:50000-150000"
+# samtools fastq and mpileup turn regeneration off (CRAM_OPT_DECODE_MD=0): only stored tags show
+check "fastq -T MD,NM CRAM (no regeneration)" "$st fastq -T MD,NM --reference $ref mp.mixmd.cram" "$nt fastq -T MD,NM --reference $ref mp.mixmd.cram"
+check "mpileup --output-extra MD,NM CRAM (no regeneration)" "$st mpileup -f $ref --output-extra NM,MD mp.mixmd.cram 2>/dev/null" "$nt mpileup -f $ref --output-extra NM,MD mp.mixmd.cram 2>/dev/null"
+
 # import: FASTQ written by samtools fastq (with MM/ML tags, paired files, interleaved names)
 "$st" fastq -T MM,ML mp.long.bam > imp.long.fq 2>/dev/null
 "$st" collate -u -O mp.short.bam 2>/dev/null | "$st" fastq -1 imp.R1.fq -2 imp.R2.fq -s imp.S.fq -0 /dev/null - 2>/dev/null
