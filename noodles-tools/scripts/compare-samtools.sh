@@ -301,6 +301,7 @@ done
 sort_region=$(head -1 "$corpus/short/queries.100.regions")
 check "sort --write-index (##idx## BAI)" "$st sort --write-index --no-PG -o 'st.sort.wi.bam##idx##st.sort.wi.bai' short.name.bam && head -c 4 st.sort.wi.bai | od -c && $st view -X st.sort.wi.bam st.sort.wi.bai $sort_region | md5sum" "$nt sort --write-index --no-PG -o 'nt.sort.wi.bam##idx##nt.sort.wi.bai' short.name.bam && head -c 4 nt.sort.wi.bai | od -c && $st view -X nt.sort.wi.bam nt.sort.wi.bai $sort_region | md5sum"
 check "sort --write-index (CSI)" "$st sort --write-index --no-PG -o st.sort.wi2.bam short.name.bam && head -c 4 st.sort.wi2.bam.csi | od -c && $st idxstats st.sort.wi2.bam && $st view st.sort.wi2.bam $sort_region | md5sum" "$nt sort --write-index --no-PG -o nt.sort.wi2.bam short.name.bam && head -c 4 nt.sort.wi2.bam.csi | od -c && $st idxstats nt.sort.wi2.bam && $st view nt.sort.wi2.bam $sort_region | md5sum"
+check "sort --write-index (CRAM)" "$nt sort --reference $ref --no-PG -o nt.sort.wi4.ref.cram short.name.bam && $st index nt.sort.wi4.ref.cram && $st idxstats nt.sort.wi4.ref.cram && $st view -T $ref nt.sort.wi4.ref.cram $sort_region | md5sum && $st view -c -T $ref nt.sort.wi4.ref.cram '*'" "$nt sort --write-index --reference $ref --no-PG -o nt.sort.wi4.cram short.name.bam && $st idxstats nt.sort.wi4.cram && $st view -T $ref nt.sort.wi4.cram $sort_region | md5sum && $st view -c -T $ref nt.sort.wi4.cram '*'"
 check "sort --template-coordinate --write-index (ignored)" "$st sort --template-coordinate --write-index --no-PG -o st.sort.wi3.bam sort.tc.sam; ls st.sort.wi3.bam*" "$nt sort --template-coordinate --write-index --no-PG -o nt.sort.wi3.bam sort.tc.sam 2>/dev/null; ls nt.sort.wi3.bam* | sed s/^nt/st/"
 
 "$st" view --no-PG -b -f 64 -o p1.bam "$short"
@@ -385,6 +386,7 @@ for idx in '' merge.wi1.bai merge.wi2.csi merge.wi3.idx; do
     check "merge --write-index (${idx:-CSI})" "$st merge --write-index -c -p --no-PG -o '$st_out' p1.bam p2.bam && head -c 4 $st_idx | od -c && $st view -X ${st_out%%#*} $st_idx $merge_region | md5sum" "$nt merge --write-index -c -p --no-PG -o '$nt_out' p1.bam p2.bam && head -c 4 $nt_idx | od -c && $st view -X ${nt_out%%#*} $nt_idx $merge_region | md5sum"
 done
 check "merge --write-index (positional output)" "$st merge --write-index -c -p --no-PG 'st.merge.wi4.bam##idx##st.merge.wi4.bai' p1.bam p2.bam && $st idxstats st.merge.wi4.bam && $st view -X st.merge.wi4.bam st.merge.wi4.bai $merge_region | md5sum" "$nt merge --write-index -c -p --no-PG 'nt.merge.wi4.bam##idx##nt.merge.wi4.bai' p1.bam p2.bam && $st idxstats nt.merge.wi4.bam && $st view -X nt.merge.wi4.bam nt.merge.wi4.bai $merge_region | md5sum"
+check "merge --write-index (CRAM)" "$nt merge -c -p --reference $ref --no-PG -o nt.merge.wi7.ref.cram p1.bam p2.bam && $st index nt.merge.wi7.ref.cram && $st idxstats nt.merge.wi7.ref.cram && $st view -T $ref nt.merge.wi7.ref.cram $merge_region | md5sum && $st view -c -T $ref nt.merge.wi7.ref.cram '*'" "$nt merge --write-index -c -p --reference $ref --no-PG -o nt.merge.wi7.cram p1.bam p2.bam && $st idxstats nt.merge.wi7.cram && $st view -T $ref nt.merge.wi7.cram $merge_region | md5sum && $st view -c -T $ref nt.merge.wi7.cram '*'"
 check "merge --write-index SAM (exit status)" "$st merge --write-index --no-PG -o st.merge.wi5.sam p1.bam p2.bam; echo \$?" "$nt merge --write-index --no-PG -o nt.merge.wi5.sam p1.bam p2.bam 2>/dev/null; echo \$?"
 check "merge --write-index stdout (exit status)" "$st merge --write-index --no-PG -o - p1.bam p2.bam > /dev/null; echo \$?" "$nt merge --write-index --no-PG -o - p1.bam p2.bam 2>/dev/null > /dev/null; echo \$?"
 check "merge -n --write-index (exit status)" "$st merge -n --write-index --no-PG -o st.merge.wi6.bam merge.n1.bam merge.n2.bam; echo \$?" "$nt merge -n --write-index --no-PG -o nt.merge.wi6.bam merge.n1.bam merge.n2.bam 2>/dev/null; echo \$?"
@@ -597,6 +599,15 @@ cp "$short" nt.index.a.bam && cp "$tagged" nt.index.b.bam
 check "index -M" "$st index -M -m 13 st.index.a.bam st.index.b.bam && $st idxstats -X st.index.b.bam st.index.b.bam.csi && $st view --no-PG -X st.index.a.bam st.index.a.bam.csi $regions" "$nt index -M -m 13 nt.index.a.bam nt.index.b.bam && $st idxstats -X nt.index.b.bam nt.index.b.bam.csi && $st view --no-PG -X nt.index.a.bam nt.index.a.bam.csi $regions"
 check "index without -M" "$st index index.a.bam index.b.bam; echo \$?" "$nt index index.a.bam index.b.bam 2>/dev/null; echo \$?"
 check "index in.bam out.index" "$st index index.a.bam st.index.legacy && $st idxstats -X index.a.bam st.index.legacy" "$nt index index.a.bam nt.index.legacy && $st idxstats -X index.a.bam nt.index.legacy"
+
+# index on CRAM written by ntools, whose last slice holds both placed and unplaced records (a
+# multi-reference slice, which samtools does not write); view --write-index with CRAM output.
+# CRAM indexes are compared through queries with samtools' index of the same ntools-written
+# file (samtools' own CRAM has a different layout, and HTSlib misses the first slice of unplaced
+# records when an index entry spans 0 bases, so its '*' queries differ by file).
+"$nt" view --no-PG -C -T "$ref" -o index.nt.cram p1.bam
+check "index CRAM written by ntools" "$st index -o st.index.crai index.nt.cram && $st idxstats -X index.nt.cram st.index.crai && $st view --no-PG -T $ref -X index.nt.cram st.index.crai $regions | md5sum && $st view -c -T $ref -X index.nt.cram st.index.crai '*'" "$nt index -o nt.index.crai index.nt.cram && $st idxstats -X index.nt.cram nt.index.crai && $st view --no-PG -T $ref -X index.nt.cram nt.index.crai $regions | md5sum && $st view -c -T $ref -X index.nt.cram nt.index.crai '*'"
+check "view --write-index CRAM" "$nt view --no-PG -C -T $ref -o nt.view.wi.ref.cram p1.bam && $st index nt.view.wi.ref.cram && $st idxstats nt.view.wi.ref.cram && $st view -T $ref nt.view.wi.ref.cram $regions | md5sum && $st view -c -T $ref nt.view.wi.ref.cram '*'" "$nt view --no-PG -C -T $ref --write-index -o nt.view.wi.cram p1.bam && $st idxstats nt.view.wi.cram && $st view -T $ref nt.view.wi.cram $regions | md5sum && $st view -c -T $ref nt.view.wi.cram '*'"
 
 # split
 mkdir -p split-s split-n

@@ -1,8 +1,12 @@
-use std::{cmp, collections::HashMap, fs::File, io, path::Path};
+use std::{
+    cmp,
+    collections::HashMap,
+    fs::File,
+    io::{self, Read, Seek},
+    path::Path,
+};
 
 use noodles_core::Position;
-use noodles_fasta as fasta;
-use noodles_sam as sam;
 
 use crate::{
     container::{CompressionHeader, slice},
@@ -27,7 +31,14 @@ where
     P: AsRef<Path>,
 {
     let mut reader = File::open(src).map(Reader::new)?;
-    let header = reader.read_header()?;
+    index_reader(&mut reader)
+}
+
+fn index_reader<R>(reader: &mut Reader<R>) -> io::Result<crai::Index>
+where
+    R: Read + Seek,
+{
+    reader.read_header()?;
 
     let mut index = Vec::new();
 
@@ -57,7 +68,6 @@ where
 
             push_index_records(
                 &mut index,
-                &header,
                 &compression_header,
                 &slice,
                 container_position,
@@ -74,7 +84,6 @@ where
 
 fn push_index_records(
     index: &mut crai::Index,
-    header: &sam::Header,
     compression_header: &CompressionHeader,
     slice: &Slice,
     container_position: u64,
@@ -84,7 +93,6 @@ fn push_index_records(
     if slice.header().reference_sequence_context().is_many() {
         push_index_records_for_multi_reference_slice(
             index,
-            header,
             compression_header,
             slice,
             container_position,
@@ -119,7 +127,6 @@ impl Default for SliceReferenceSequenceAlignmentRangeInclusive {
 
 fn push_index_records_for_multi_reference_slice(
     index: &mut crai::Index,
-    header: &sam::Header,
     compression_header: &CompressionHeader,
     slice: &Slice,
     container_position: u64,
@@ -133,9 +140,8 @@ fn push_index_records_for_multi_reference_slice(
 
     let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
 
-    for record in slice.records(
-        fasta::Repository::default(), // TODO
-        header,
+    // Alignment spans need positions and features, not reference sequences.
+    for record in slice.records_without_reference_sequences(
         compression_header,
         &core_data_src,
         &external_data_srcs,
@@ -152,7 +158,8 @@ fn push_index_records_for_multi_reference_slice(
 
     let mut sorted_reference_sequence_ids: Vec<_> =
         reference_sequence_ids.keys().copied().collect();
-    sorted_reference_sequence_ids.sort_unstable();
+    // Unplaced records come last, as in a coordinate-sorted slice.
+    sorted_reference_sequence_ids.sort_unstable_by_key(|id| (id.is_none(), *id));
 
     for reference_sequence_id in sorted_reference_sequence_ids {
         let (alignment_start, alignment_span) = if reference_sequence_id.is_some() {
@@ -162,10 +169,16 @@ fn push_index_records_for_multi_reference_slice(
                 let span = usize::from(end) - usize::from(start) + 1;
                 (Some(start), span)
             } else {
-                todo!("unhandled interval: {:?}", range);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid alignment range in slice: {range:?}"),
+                ));
             }
         } else {
-            (None, 0)
+            // As in HTSlib (`cram_index_build_multiref`), which spans unplaced records from
+            // position 0 to 0, inclusive. HTSlib does not find unplaced records through entries
+            // with a span of 0 in multi-reference slices.
+            (None, 1)
         };
 
         let record = crai::Record::new(
@@ -216,4 +229,95 @@ fn push_index_record_for_single_reference_slice(
     index.push(record);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use noodles_fasta as fasta;
+    use noodles_sam::{
+        self as sam,
+        alignment::{
+            RecordBuf,
+            io::Write as _,
+            record::{
+                Flags,
+                cigar::{Op, op::Kind},
+            },
+        },
+    };
+
+    use super::*;
+
+    #[test]
+    fn test_index_reader_with_multi_reference_slice() -> Result<(), Box<dyn std::error::Error>> {
+        let header: sam::Header = "@SQ\tSN:sq0\tLN:8\n@SQ\tSN:sq1\tLN:8\n".parse()?;
+        let repository = fasta::Repository::new(
+            [b"sq0", b"sq1"]
+                .map(|name| {
+                    let definition = fasta::record::Definition::new(name, None);
+                    fasta::Record::new(definition, b"ACGTACGT".to_vec().into())
+                })
+                .to_vec(),
+        );
+
+        // One slice with records on two reference sequences and an unplaced record.
+        let mut writer = crate::io::writer::Builder::default()
+            .set_reference_sequence_repository(repository)
+            .build_from_writer(Vec::new());
+        writer.write_header(&header)?;
+
+        for (reference_sequence_id, start, len) in [(0, 2, 4), (0, 3, 5), (1, 1, 3)] {
+            let record = RecordBuf::builder()
+                .set_flags(Flags::empty())
+                .set_reference_sequence_id(reference_sequence_id)
+                .set_alignment_start(Position::try_from(start)?)
+                .set_cigar([Op::new(Kind::Match, len)].into_iter().collect())
+                .set_sequence(b"ACGTACGT"[..len].to_vec().into())
+                .set_quality_scores(vec![30; len].into())
+                .build();
+            writer.write_alignment_record(&header, &record)?;
+        }
+
+        let unplaced = RecordBuf::builder()
+            .set_flags(Flags::UNMAPPED)
+            .set_sequence(b"ACGT".to_vec().into())
+            .set_quality_scores(vec![30; 4].into())
+            .build();
+        writer.write_alignment_record(&header, &unplaced)?;
+
+        writer.try_finish(&header)?;
+        let src = writer.into_inner();
+
+        // Indexing needs no reference sequences.
+        let mut reader = Reader::new(Cursor::new(src));
+        let index = index_reader(&mut reader)?;
+
+        let actual: Vec<_> = index
+            .iter()
+            .map(|record| {
+                (
+                    record.reference_sequence_id(),
+                    record.alignment_start(),
+                    record.alignment_span(),
+                )
+            })
+            .collect();
+
+        let expected = [
+            (Some(0), Position::new(2), 6),
+            (Some(1), Position::new(1), 3),
+            (None, None, 1),
+        ];
+
+        assert_eq!(actual, expected);
+
+        // All entries are for the same slice.
+        assert!(index.iter().all(|record| {
+            record.offset() == index[0].offset() && record.landmark() == index[0].landmark()
+        }));
+
+        Ok(())
+    }
 }

@@ -182,6 +182,43 @@ impl<'c> Slice<'c> {
     }
 }
 
+impl<'c> Slice<'c> {
+    /// Decodes the records without reference sequences, mates, or `MD`/`NM` tags.
+    ///
+    /// Their positions, read lengths, and features are set, which is enough to compute
+    /// alignment spans (e.g., for indexing) without a reference sequence repository.
+    pub(crate) fn records_without_reference_sequences<'ch: 'c>(
+        &self,
+        compression_header: &'ch CompressionHeader,
+        core_data_src: &'c [u8],
+        external_data_srcs: &'c [(block::ContentId, Cow<'c, [u8]>)],
+    ) -> io::Result<Vec<Record<'c>>> {
+        let core_data_reader = BitReader::new(core_data_src);
+
+        let mut external_data_readers = ExternalDataReaders::new();
+
+        for (block_content_id, src) in external_data_srcs {
+            external_data_readers.insert(*block_content_id, src);
+        }
+
+        let mut reader = Records::new(
+            compression_header,
+            core_data_reader,
+            external_data_readers,
+            self.header.reference_sequence_context(),
+            self.header.record_counter(),
+        )?;
+
+        let mut records: Vec<Record<'c>> = vec![Record::default(); self.header.record_count()];
+
+        for record in &mut records {
+            reader.read_record(record)?;
+        }
+
+        Ok(records)
+    }
+}
+
 pub fn read_slice<'c>(src: &mut &'c [u8]) -> io::Result<Slice<'c>> {
     let header = read_header(src)?;
     Ok(Slice { header, src })
@@ -650,12 +687,22 @@ fn get_record_reference_sequence<'c>(
         .reference_sequence(header)
         .transpose()?
         .map(|(name, _)| name)
-        .expect("invalid reference sequence ID");
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid record reference sequence ID",
+            )
+        })?;
 
     let sequence = reference_sequence_repository
         .get(reference_sequence_name)
         .transpose()?
-        .expect("invalid reference sequence name");
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing reference sequence: {reference_sequence_name}"),
+            )
+        })?;
 
     Ok(Some(ReferenceSequence::External { sequence }))
 }

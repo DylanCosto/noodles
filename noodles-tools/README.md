@@ -108,8 +108,9 @@ Intentional differences:
   samtools checks for a file with the whole name, so it overwrites.
 - `merge --write-index` indexes the output after writing it, and checks while writing that it is
   sorted by coordinate (samtools fails the same way, from its on-the-fly indexer).
-  `--write-index` for CRAM output (here and in `sort`) cannot index CRAM written by ntools yet:
-  noodles' CRAM indexer fails on it.
+- CRAM written by ntools can end a run of placed records and start the unplaced ones in the same
+  slice (a multi-reference slice, valid CRAM); HTSlib starts a new container instead. Both tools
+  read and index either layout.
 - `sort --template-coordinate` and `merge --template-coordinate` compare reference sequence IDs
   directly; samtools subtracts them, which overflows for a record flagged as mapped without a
   reference sequence. With `-N --template-coordinate -n`, ntools sorts by name naturally;
