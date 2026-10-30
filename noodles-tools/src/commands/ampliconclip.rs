@@ -12,7 +12,7 @@
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, bail};
@@ -171,22 +171,6 @@ struct Counts {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let clipping = if args.hard_clip {
-        Clipping::Hard
-    } else {
-        Clipping::Soft
-    };
-
-    let tolerance = if args.tolerance < 0 {
-        eprintln!(
-            "[ampliconclip] warning: invalid tolerance of {}, resetting tolerance to default of 5.",
-            args.tolerance
-        );
-        5
-    } else {
-        args.tolerance
-    };
-
     let strand_column = if args.strand {
         StrandColumn::Required
     } else {
@@ -237,19 +221,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         rejects.write_header(&header)?;
     }
 
-    let names_by_id: Vec<String> = header
-        .reference_sequences()
-        .keys()
-        .map(|name| name.to_string())
-        .collect();
-
-    let options = ClipOptions {
-        clipping,
-        tolerance,
-        original: args.original,
-        delete_tags: !args.keep_tag,
-        reference_names: names_by_id,
-    };
+    let options = ClipOptions::from_args(&args, &header);
 
     let mut counts = Counts::default();
     let mut encoder = RawEncoder::new();
@@ -278,38 +250,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
         match sites {
             Some(i) if flags & (FLAG_UNMAPPED | FLAG_QC_FAIL) == 0 => {
-                let regions = &mut beds[i];
-                let clipped = if args.both_ends {
-                    clip_both_ends(&mut raw, regions, &options, &mut counts)?
-                } else {
-                    clip_five_prime(&mut raw, regions, &options, &mut counts)?
-                };
-
-                if !clipped && args.fail {
-                    add_flags(&mut raw, FLAG_QC_FAIL);
-                }
-
-                let length = active_query_len(&raw);
-
-                if args.fail_len >= 0 && length <= args.fail_len {
-                    add_flags(&mut raw, FLAG_QC_FAIL);
-                }
-
-                if args.filter_len >= 0 && length <= args.filter_len {
-                    filter = true;
-                }
-
-                if args.unmap_len >= 0 && length <= args.unmap_len {
-                    raw = unmap(&raw);
-                }
-
-                if le_u16(&raw[14..16]) & FLAG_QC_FAIL != 0 {
-                    counts.failed += 1;
-                }
-
-                if args.clipped && !clipped {
-                    filter = true;
-                }
+                filter = clip_record(&mut raw, &mut beds[i], &options, &args, &mut counts)?;
             }
             _ => {
                 counts.excluded += 1;
@@ -340,6 +281,96 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         rejects.finish(&header)?;
     }
 
+    write_stats(&args, &counts)?;
+
+    if let Some(path) = &args.primer_counts {
+        write_primer_counts(path, &names, &beds)?;
+    }
+
+    Ok(())
+}
+
+impl ClipOptions {
+    fn from_args(args: &Args, header: &sam::Header) -> Self {
+        let clipping = if args.hard_clip {
+            Clipping::Hard
+        } else {
+            Clipping::Soft
+        };
+
+        let tolerance = if args.tolerance < 0 {
+            eprintln!(
+                "[ampliconclip] warning: invalid tolerance of {}, resetting tolerance to default of 5.",
+                args.tolerance
+            );
+            5
+        } else {
+            args.tolerance
+        };
+
+        let names_by_id: Vec<String> = header
+            .reference_sequences()
+            .keys()
+            .map(|name| name.to_string())
+            .collect();
+
+        Self {
+            clipping,
+            tolerance,
+            original: args.original,
+            delete_tags: !args.keep_tag,
+            reference_names: names_by_id,
+        }
+    }
+}
+
+/// Clips a mapped read at its matching primer site and applies the length and `--fail`
+/// options; returns whether to filter it out.
+fn clip_record(
+    raw: &mut Vec<u8>,
+    regions: &mut Regions,
+    options: &ClipOptions,
+    args: &Args,
+    counts: &mut Counts,
+) -> anyhow::Result<bool> {
+    let mut filter = false;
+    let clipped = if args.both_ends {
+        clip_both_ends(raw, regions, options, counts)?
+    } else {
+        clip_five_prime(raw, regions, options, counts)?
+    };
+
+    if !clipped && args.fail {
+        add_flags(raw, FLAG_QC_FAIL);
+    }
+
+    let length = active_query_len(raw);
+
+    if args.fail_len >= 0 && length <= args.fail_len {
+        add_flags(raw, FLAG_QC_FAIL);
+    }
+
+    if args.filter_len >= 0 && length <= args.filter_len {
+        filter = true;
+    }
+
+    if args.unmap_len >= 0 && length <= args.unmap_len {
+        *raw = unmap(raw);
+    }
+
+    if le_u16(&raw[14..16]) & FLAG_QC_FAIL != 0 {
+        counts.failed += 1;
+    }
+
+    if args.clipped && !clipped {
+        filter = true;
+    }
+
+    Ok(filter)
+}
+
+/// Writes the clipping statistics to `--stats`, or stderr.
+fn write_stats(args: &Args, counts: &Counts) -> io::Result<()> {
     let command_line = std::env::args().collect::<Vec<_>>().join(" ");
     let stats = format!(
         "COMMAND: {command_line}\nTOTAL READS: {}\nTOTAL CLIPPED: {}\nFORWARD CLIPPED: {}\n\
@@ -371,38 +402,41 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         None => io::stderr().write_all(stats.as_bytes())?,
     }
 
-    if let Some(path) = &args.primer_counts {
-        let mut text = String::from("#CHR\tLEFT\tRIGHT\tNAME\tSCORE\tSTRAND\tNUM_CLIPPED\n");
+    Ok(())
+}
 
-        for (name, regions) in names.iter().zip(&beds) {
-            for region in &regions.regions {
-                let strand = match region.strand {
-                    None => ".",
-                    Some(Strand::Reverse) => "-",
-                    Some(Strand::Forward) => "+",
-                };
+/// Writes how many reads each primer clipped (`--primer-counts`).
+fn write_primer_counts(path: &Path, names: &[String], beds: &[Regions]) -> io::Result<()> {
+    let mut text = String::from("#CHR\tLEFT\tRIGHT\tNAME\tSCORE\tSTRAND\tNUM_CLIPPED\n");
 
-                // glibc prints NULL strings as "(null)".
-                text.push_str(&format!(
-                    "{name}\t{}\t{}\t{}\t{}\t{strand}\t{}\n",
-                    region.left,
-                    region.right,
-                    region.name.as_deref().unwrap_or("(null)"),
-                    region.score.as_deref().unwrap_or("(null)"),
-                    region.reads
-                ));
-            }
+    for (name, regions) in names.iter().zip(beds) {
+        for region in &regions.regions {
+            let strand = match region.strand {
+                None => ".",
+                Some(Strand::Reverse) => "-",
+                Some(Strand::Forward) => "+",
+            };
+
+            // glibc prints NULL strings as "(null)".
+            text.push_str(&format!(
+                "{name}\t{}\t{}\t{}\t{}\t{strand}\t{}\n",
+                region.left,
+                region.right,
+                region.name.as_deref().unwrap_or("(null)"),
+                region.score.as_deref().unwrap_or("(null)"),
+                region.reads
+            ));
         }
+    }
 
-        match File::create(path) {
-            Ok(mut file) => file.write_all(text.as_bytes())?,
-            Err(_) => {
-                eprintln!(
-                    "[ampliconclip] warning: cannot write count summary to {}.",
-                    path.display()
-                );
-                io::stderr().write_all(text.as_bytes())?;
-            }
+    match File::create(path) {
+        Ok(mut file) => file.write_all(text.as_bytes())?,
+        Err(_) => {
+            eprintln!(
+                "[ampliconclip] warning: cannot write count summary to {}.",
+                path.display()
+            );
+            io::stderr().write_all(text.as_bytes())?;
         }
     }
 

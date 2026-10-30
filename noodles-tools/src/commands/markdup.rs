@@ -367,49 +367,7 @@ struct Options {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let barcode_name = args.barcode_name || args.barcode_rgx.is_some();
-
-    if args.barcode_tag.is_some() && barcode_name {
-        bail!(
-            "[markdup] error, cannot specify --barcode-tag and --barcode-name (or --barcode-rgx) at same time."
-        );
-    }
-
-    if args.move_umi_to_tag && !barcode_name {
-        bail!("[markdup] error, --move-umi-to-tag requires --barcode-name or --barcode-rgx.");
-    }
-
-    let coordinates = match &args.read_coords {
-        Some(pattern) => coordinate_regex(pattern, &args.coords_order)?,
-        None => CoordinateParser::Colons,
-    };
-
-    let barcodes = if let Some(tag) = &args.barcode_tag {
-        let tag = tag.as_bytes();
-        Barcodes::Tag([
-            tag.first().copied().unwrap_or(0),
-            tag.get(1).copied().unwrap_or(0),
-        ])
-    } else if barcode_name {
-        // From Illumina's UMI documentation: "The UMI sequence is located in the eighth
-        // colon-delimited field of the read name (QNAME)".
-        const ILLUMINA_UMI: &str = "[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:([!-?A-~]+)";
-        let pattern = args.barcode_rgx.as_deref().unwrap_or(ILLUMINA_UMI);
-        Barcodes::Name(
-            compile_regex(pattern)
-                .with_context(|| "[markdup] error, barcode regex fail".to_string())?,
-        )
-    } else {
-        Barcodes::None
-    };
-
-    let umi = match &barcodes {
-        Barcodes::Name(regex) if args.move_umi_to_tag => Some(UmiMover {
-            regex: regex.clone(),
-            separator: args.umi_separator.bytes().next().unwrap_or(0),
-        }),
-        _ => None,
-    };
+    let names = ReadNameOptions::from_args(&args)?;
 
     let read_options = ReadOptions {
         threads: args.threads,
@@ -428,13 +386,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         bail!("[markdup] error, queryname sorted, must be sorted by coordinate.");
     }
 
-    let read_groups: HashMap<Vec<u8>, usize> = if args.use_read_groups {
-        header
-            .read_groups()
-            .keys()
-            .enumerate()
-            .map(|(i, id)| (id.to_vec(), i + 1))
-            .collect()
+    let read_groups = if args.use_read_groups {
+        read_group_indices(&header)
     } else {
         HashMap::new()
     };
@@ -445,59 +398,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         program::add(&mut header)?;
     }
 
-    let format = args
-        .output_format
-        .or_else(|| OutputFormat::from_path(&args.output))
-        .unwrap_or(OutputFormat::Bam);
+    let header = header;
+    let mut out = open_output(&args, &header)?;
 
-    let write_options = WriteOptions {
-        format,
-        level: output::parse_level(if args.uncompressed { 0 } else { 6 })?,
-        threads: args.threads,
-        reference: args.reference.clone(),
-    };
-
-    let mut writer = AlignmentWriter::create(Some(&args.output), &write_options, &header)?;
-    writer.write_header(&header)?;
-
-    let optical_distance = args.optical_distance.max(0);
-
-    let mut out = if args.supplementary {
-        let dir = temp_dir(args.temp_prefix.as_deref(), &args.output);
-        let file = tempfile::tempfile_in(dir)
-            .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
-
-        Output::Temp {
-            writer,
-            temp: BgzfWriter::new(file, output::parse_level(1)?, args.threads),
-        }
-    } else {
-        Output::Writer(writer)
-    };
-
-    let mut state = Markdup {
-        options: Options {
-            remove: args.remove,
-            max_length: args.max_length,
-            mode: args.mode,
-            duplicate_count: args.duplicate_count,
-            tag: args.tag,
-            optical_distance,
-            supplementary: args.supplementary,
-            check_chain: !args.no_multi_dup && (args.tag || optical_distance > 0),
-        },
-        reads: VecDeque::new(),
-        front_id: 0,
-        pair_hash: HashMap::new(),
-        single_hash: HashMap::new(),
-        duplicates: HashMap::new(),
-        stats: vec![Stats::default(); group_count + 1],
-        warnings: 0,
-        coordinates,
-        barcodes,
-        barcode_warnings: 0,
-        umi,
-    };
+    let mut state = Markdup::new(&args, group_count, names);
 
     let exclude = if args.include_fails {
         Flags::SECONDARY | Flags::SUPPLEMENTARY | Flags::UNMAPPED
@@ -509,8 +413,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut prev_coord: i64 = 0;
     let mut encoder = RawEncoder::new();
     let mut cleared = Vec::new();
-
-    let header = header;
 
     reader.for_each(&header, |rec| {
         let mut raw: Vec<u8> = rec.encode_raw(&header, &mut encoder)?.to_vec();
@@ -542,31 +444,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             0
         };
 
-        state.stats[read_group].reading += 1;
-
-        let id = state.front_id + state.reads.len() as u64;
-        state.reads.push_back(Read {
-            record,
-            pos,
-            tid,
-            pair_key: None,
-            single_key: None,
-            duplicate_count: 1,
-            read_group,
-            duplicate: None,
-            original: None,
-            dup_checked: false,
-        });
-
-        let flags = flags_of(state.get(id).record.as_ref());
-
-        if flags.intersects(exclude) {
-            state.stats[read_group].excluded += 1;
-        } else {
-            state.stats[read_group].examined += 1;
-            state.examine(id, read_group)?;
-        }
-
+        state.add_read(record, tid, pos, read_group, exclude)?;
         state.flush(prev_tid, prev_coord, &header, &mut out)?;
 
         Ok(())
@@ -585,55 +463,244 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     writer.finish(&header)?;
 
-    if state.warnings > 0 {
-        eprintln!(
-            "[markdup] warning, number of failed attempts to get coordinates from read names = {}",
-            state.warnings
-        );
-    }
-
-    if state.barcode_warnings > 0 {
-        eprintln!(
-            "[markdup] warning, number of failed attempts to get barcodes = {}",
-            state.barcode_warnings
-        );
-    }
+    state.report_warnings();
 
     if args.stats || args.stats_file.is_some() || args.json {
-        let mut out: Box<dyn Write> = match &args.stats_file {
-            Some(path) => Box::new(
-                File::create(path).with_context(|| format!("creating {}", path.display()))?,
-            ),
-            None => Box::new(io::stderr()),
+        write_report(&args, &header, &state)?;
+    }
+
+    Ok(())
+}
+
+/// How read names are parsed: tile coordinates for optical duplicates, barcodes, and UMIs to
+/// move to a tag.
+struct ReadNameOptions {
+    coordinates: CoordinateParser,
+    barcodes: Barcodes,
+    umi: Option<UmiMover>,
+}
+
+impl ReadNameOptions {
+    fn from_args(args: &Args) -> anyhow::Result<Self> {
+        let barcode_name = args.barcode_name || args.barcode_rgx.is_some();
+
+        if args.barcode_tag.is_some() && barcode_name {
+            bail!(
+                "[markdup] error, cannot specify --barcode-tag and --barcode-name (or --barcode-rgx) at same time."
+            );
+        }
+
+        if args.move_umi_to_tag && !barcode_name {
+            bail!("[markdup] error, --move-umi-to-tag requires --barcode-name or --barcode-rgx.");
+        }
+
+        let coordinates = match &args.read_coords {
+            Some(pattern) => coordinate_regex(pattern, &args.coords_order)?,
+            None => CoordinateParser::Colons,
         };
 
-        let command_line = std::env::args().collect::<Vec<_>>().join(" ");
-        let total = state.stats.iter().fold(Stats::default(), Stats::add);
-        let group_names: Vec<String> = header
-            .read_groups()
-            .keys()
-            .map(|id| id.to_string())
-            .collect();
-
-        if args.json {
-            let read_groups = args
-                .use_read_groups
-                .then_some((&state.stats[..], &group_names[..]));
-            write_json_report(&mut out, &command_line, &total, read_groups)?;
+        let barcodes = if let Some(tag) = &args.barcode_tag {
+            let tag = tag.as_bytes();
+            Barcodes::Tag([
+                tag.first().copied().unwrap_or(0),
+                tag.get(1).copied().unwrap_or(0),
+            ])
+        } else if barcode_name {
+            // From Illumina's UMI documentation: "The UMI sequence is located in the eighth
+            // colon-delimited field of the read name (QNAME)".
+            const ILLUMINA_UMI: &str = "[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:([!-?A-~]+)";
+            let pattern = args.barcode_rgx.as_deref().unwrap_or(ILLUMINA_UMI);
+            Barcodes::Name(
+                compile_regex(pattern)
+                    .with_context(|| "[markdup] error, barcode regex fail".to_string())?,
+            )
         } else {
-            write_stats(&mut out, "COMMAND: ", &command_line, &total)?;
-            writeln!(out)?;
+            Barcodes::None
+        };
 
-            if args.use_read_groups {
-                if state.stats[0].reading > 0 {
-                    write_stats(&mut out, "READ GROUP: ", "ungrouped", &state.stats[0])?;
-                    writeln!(out)?;
-                }
+        let umi = match &barcodes {
+            Barcodes::Name(regex) if args.move_umi_to_tag => Some(UmiMover {
+                regex: regex.clone(),
+                separator: args.umi_separator.bytes().next().unwrap_or(0),
+            }),
+            _ => None,
+        };
 
-                for (id, stats) in group_names.iter().zip(&state.stats[1..]) {
-                    write_stats(&mut out, "READ GROUP: ", id, stats)?;
-                    writeln!(out)?;
-                }
+        Ok(Self {
+            coordinates,
+            barcodes,
+            umi,
+        })
+    }
+}
+
+/// Read group indices by ID, from 1 (0 is for reads without a read group).
+fn read_group_indices(header: &sam::Header) -> HashMap<Vec<u8>, usize> {
+    header
+        .read_groups()
+        .keys()
+        .enumerate()
+        .map(|(i, id)| (id.to_vec(), i + 1))
+        .collect()
+}
+
+/// Opens the output, with a temporary file for records held back for `-S`.
+fn open_output(args: &Args, header: &sam::Header) -> anyhow::Result<Output> {
+    let format = args
+        .output_format
+        .or_else(|| OutputFormat::from_path(&args.output))
+        .unwrap_or(OutputFormat::Bam);
+
+    let write_options = WriteOptions {
+        format,
+        level: output::parse_level(if args.uncompressed { 0 } else { 6 })?,
+        threads: args.threads,
+        reference: args.reference.clone(),
+    };
+
+    let mut writer = AlignmentWriter::create(Some(&args.output), &write_options, header)?;
+    writer.write_header(header)?;
+
+    let out = if args.supplementary {
+        let dir = temp_dir(args.temp_prefix.as_deref(), &args.output);
+        let file = tempfile::tempfile_in(dir)
+            .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
+
+        Output::Temp {
+            writer,
+            temp: BgzfWriter::new(file, output::parse_level(1)?, args.threads),
+        }
+    } else {
+        Output::Writer(writer)
+    };
+
+    Ok(out)
+}
+
+impl Markdup {
+    fn new(args: &Args, group_count: usize, names: ReadNameOptions) -> Self {
+        let optical_distance = args.optical_distance.max(0);
+        let ReadNameOptions {
+            coordinates,
+            barcodes,
+            umi,
+        } = names;
+
+        Self {
+            options: Options {
+                remove: args.remove,
+                max_length: args.max_length,
+                mode: args.mode,
+                duplicate_count: args.duplicate_count,
+                tag: args.tag,
+                optical_distance,
+                supplementary: args.supplementary,
+                check_chain: !args.no_multi_dup && (args.tag || optical_distance > 0),
+            },
+            reads: VecDeque::new(),
+            front_id: 0,
+            pair_hash: HashMap::new(),
+            single_hash: HashMap::new(),
+            duplicates: HashMap::new(),
+            stats: vec![Stats::default(); group_count + 1],
+            warnings: 0,
+            coordinates,
+            barcodes,
+            barcode_warnings: 0,
+            umi,
+        }
+    }
+
+    /// Queues a read and, unless its flags exclude it, looks for its duplicates.
+    fn add_read(
+        &mut self,
+        record: bam::Record,
+        tid: i32,
+        pos: i64,
+        read_group: usize,
+        exclude: Flags,
+    ) -> anyhow::Result<()> {
+        self.stats[read_group].reading += 1;
+
+        let id = self.front_id + self.reads.len() as u64;
+        self.reads.push_back(Read {
+            record,
+            pos,
+            tid,
+            pair_key: None,
+            single_key: None,
+            duplicate_count: 1,
+            read_group,
+            duplicate: None,
+            original: None,
+            dup_checked: false,
+        });
+
+        let flags = flags_of(self.get(id).record.as_ref());
+
+        if flags.intersects(exclude) {
+            self.stats[read_group].excluded += 1;
+        } else {
+            self.stats[read_group].examined += 1;
+            self.examine(id, read_group)?;
+        }
+
+        Ok(())
+    }
+
+    /// Reports read names whose coordinates or barcodes could not be parsed.
+    fn report_warnings(&self) {
+        if self.warnings > 0 {
+            eprintln!(
+                "[markdup] warning, number of failed attempts to get coordinates from read names = {}",
+                self.warnings
+            );
+        }
+
+        if self.barcode_warnings > 0 {
+            eprintln!(
+                "[markdup] warning, number of failed attempts to get barcodes = {}",
+                self.barcode_warnings
+            );
+        }
+    }
+}
+
+/// Writes the statistics report (`-s`, `-f`, `--json`).
+fn write_report(args: &Args, header: &sam::Header, state: &Markdup) -> anyhow::Result<()> {
+    let mut out: Box<dyn Write> = match &args.stats_file {
+        Some(path) => {
+            Box::new(File::create(path).with_context(|| format!("creating {}", path.display()))?)
+        }
+        None => Box::new(io::stderr()),
+    };
+
+    let command_line = std::env::args().collect::<Vec<_>>().join(" ");
+    let total = state.stats.iter().fold(Stats::default(), Stats::add);
+    let group_names: Vec<String> = header
+        .read_groups()
+        .keys()
+        .map(|id| id.to_string())
+        .collect();
+
+    if args.json {
+        let read_groups = args
+            .use_read_groups
+            .then_some((&state.stats[..], &group_names[..]));
+        write_json_report(&mut out, &command_line, &total, read_groups)?;
+    } else {
+        write_stats(&mut out, "COMMAND: ", &command_line, &total)?;
+        writeln!(out)?;
+
+        if args.use_read_groups {
+            if state.stats[0].reading > 0 {
+                write_stats(&mut out, "READ GROUP: ", "ungrouped", &state.stats[0])?;
+                writeln!(out)?;
+            }
+
+            for (id, stats) in group_names.iter().zip(&state.stats[1..]) {
+                write_stats(&mut out, "READ GROUP: ", id, stats)?;
+                writeln!(out)?;
             }
         }
     }
@@ -716,165 +783,193 @@ impl Markdup {
 
     /// Keys the read and resolves duplicates against earlier reads with the same key.
     fn examine(&mut self, id: u64, read_group: usize) -> anyhow::Result<()> {
+        if has_mate(&self.get(id).record) {
+            self.examine_pair(id, read_group)
+        } else {
+            self.examine_single(id, read_group)
+        }
+    }
+
+    /// Looks for a duplicate of one read of a pair, by its single key and its pair key.
+    fn examine_pair(&mut self, id: u64, read_group: usize) -> anyhow::Result<()> {
         let read_group_key = i32::try_from(read_group).unwrap_or(i32::MAX);
         let chain = self.options.check_chain;
 
-        if has_mate(&self.get(id).record) {
-            // samtools reads the barcode for each key, warning twice.
-            let pair_barcode = self.barcode(id);
-            let single_barcode = self.barcode(id);
-            let record = &self.get(id).record;
-            let pair_key = make_pair_key(record, self.options.mode, read_group_key, pair_barcode)?;
-            let single_key = make_single_key(record, read_group_key, single_barcode);
+        // samtools reads the barcode for each key, warning twice.
+        let pair_barcode = self.barcode(id);
+        let single_barcode = self.barcode(id);
+        let record = &self.get(id).record;
+        let pair_key = make_pair_key(record, self.options.mode, read_group_key, pair_barcode)?;
+        let single_key = make_single_key(record, read_group_key, single_barcode);
 
-            self.stats[read_group].pair += 1;
-            self.get_mut(id).pos = single_key.this_coord;
+        self.stats[read_group].pair += 1;
+        self.get_mut(id).pos = single_key.this_coord;
 
-            // A single read at a paired read's position is a duplicate, whatever its score.
-            match self.existing(&self.single_hash, &single_key) {
-                None => {
-                    self.single_hash.insert(single_key, id);
-                    self.get_mut(id).single_key = Some(single_key);
+        // A single read at a paired read's position is a duplicate, whatever its score.
+        match self.existing(&self.single_hash, &single_key) {
+            None => {
+                self.single_hash.insert(single_key, id);
+                self.get_mut(id).single_key = Some(single_key);
+            }
+            Some(other) if !has_mate(&self.get(other).record) => {
+                if chain {
+                    self.get_mut(id).duplicate = Some(other);
+                    self.get_mut(other).original = Some(id);
                 }
-                Some(other) if !has_mate(&self.get(other).record) => {
+
+                self.single_hash.insert(single_key, id);
+                self.get_mut(id).duplicate_count += 1;
+                self.mark_duplicate(id, other, read_group, DuplicateKind::Single)?;
+                self.stats[read_group].single_duplicate += 1;
+            }
+            Some(_) => {}
+        }
+
+        match self.existing(&self.pair_hash, &pair_key) {
+            None => {
+                self.pair_hash.insert(pair_key, id);
+                self.get_mut(id).pair_key = Some(pair_key);
+            }
+            Some(other) => self.resolve_pair(id, other, pair_key, read_group)?,
+        }
+
+        Ok(())
+    }
+
+    /// Resolves a pair whose key matches the buffered pair `other`: the pair with the higher
+    /// score (base qualities, mate included) is kept.
+    fn resolve_pair(
+        &mut self,
+        id: u64,
+        other: u64,
+        pair_key: Key,
+        read_group: usize,
+    ) -> anyhow::Result<()> {
+        let chain = self.options.check_chain;
+
+        let old = &self.get(other).record;
+        let new = &self.get(id).record;
+
+        let (old_score, new_score) =
+            if flags_of(old.as_ref()).is_qc_fail() != flags_of(new.as_ref()).is_qc_fail() {
+                if flags_of(old.as_ref()).is_qc_fail() {
+                    (0, 1)
+                } else {
+                    (1, 0)
+                }
+            } else {
+                (
+                    read_score(old.as_ref()) + mate_score(old)?,
+                    read_score(new.as_ref()) + mate_score(new)?,
+                )
+            };
+
+        let tie_add = if new_score == old_score {
+            if name(new.as_ref()) < name(old.as_ref()) {
+                1
+            } else {
+                -1
+            }
+        } else {
+            0
+        };
+
+        let (original, duplicate) = if new_score + tie_add > old_score {
+            let other_count = self.get(other).duplicate_count;
+            self.get_mut(id).duplicate_count += other_count;
+
+            if chain {
+                match self.get(id).duplicate {
+                    Some(first) => {
+                        let last = self.chain_end(first);
+                        self.get_mut(last).duplicate = Some(other);
+                    }
+                    None => self.get_mut(id).duplicate = Some(other),
+                }
+
+                self.get_mut(other).original = Some(id);
+            }
+
+            self.pair_hash.insert(pair_key, id);
+            (id, other)
+        } else {
+            if chain {
+                // The new read goes first in the kept read's chain, followed by the
+                // kept read's duplicates and then the new read's own.
+                if let Some(other_first) = self.get(other).duplicate {
+                    if let Some(own_first) = self.get(id).duplicate {
+                        let last = self.chain_end(other_first);
+                        self.get_mut(last).duplicate = Some(own_first);
+                    }
+
+                    self.get_mut(id).duplicate = Some(other_first);
+                }
+
+                self.get_mut(other).duplicate = Some(id);
+                self.get_mut(id).original = Some(other);
+            }
+
+            self.get_mut(other).duplicate_count += 1;
+            (other, id)
+        };
+
+        self.mark_duplicate(original, duplicate, read_group, DuplicateKind::Pair)?;
+        self.stats[read_group].duplicate += 1;
+
+        Ok(())
+    }
+
+    /// Looks for a duplicate of an unpaired read by its single key.
+    fn examine_single(&mut self, id: u64, read_group: usize) -> anyhow::Result<()> {
+        let read_group_key = i32::try_from(read_group).unwrap_or(i32::MAX);
+        let chain = self.options.check_chain;
+
+        let barcode = self.barcode(id);
+        let single_key = make_single_key(&self.get(id).record, read_group_key, barcode);
+
+        self.stats[read_group].single += 1;
+        self.get_mut(id).pos = single_key.this_coord;
+
+        match self.existing(&self.single_hash, &single_key) {
+            None => {
+                self.single_hash.insert(single_key, id);
+                self.get_mut(id).single_key = Some(single_key);
+            }
+            Some(other) => {
+                let other_is_paired = has_mate(&self.get(other).record);
+
+                let new_wins = !other_is_paired
+                    && read_score(self.get(id).record.as_ref())
+                        > read_score(self.get(other).record.as_ref());
+
+                let (original, duplicate) = if new_wins {
+                    let other_count = self.get(other).duplicate_count;
+                    self.get_mut(id).duplicate_count += other_count;
+
                     if chain {
                         self.get_mut(id).duplicate = Some(other);
                         self.get_mut(other).original = Some(id);
                     }
 
                     self.single_hash.insert(single_key, id);
-                    self.get_mut(id).duplicate_count += 1;
-                    self.mark_duplicate(id, other, read_group, DuplicateKind::Single)?;
-                    self.stats[read_group].single_duplicate += 1;
-                }
-                Some(_) => {}
-            }
-
-            match self.existing(&self.pair_hash, &pair_key) {
-                None => {
-                    self.pair_hash.insert(pair_key, id);
-                    self.get_mut(id).pair_key = Some(pair_key);
-                }
-                Some(other) => {
-                    let old = &self.get(other).record;
-                    let new = &self.get(id).record;
-
-                    let (old_score, new_score) = if flags_of(old.as_ref()).is_qc_fail()
-                        != flags_of(new.as_ref()).is_qc_fail()
-                    {
-                        if flags_of(old.as_ref()).is_qc_fail() {
-                            (0, 1)
-                        } else {
-                            (1, 0)
-                        }
-                    } else {
-                        (
-                            read_score(old.as_ref()) + mate_score(old)?,
-                            read_score(new.as_ref()) + mate_score(new)?,
-                        )
-                    };
-
-                    let tie_add = if new_score == old_score {
-                        if name(new.as_ref()) < name(old.as_ref()) {
-                            1
-                        } else {
-                            -1
-                        }
-                    } else {
-                        0
-                    };
-
-                    let (original, duplicate) = if new_score + tie_add > old_score {
-                        let other_count = self.get(other).duplicate_count;
-                        self.get_mut(id).duplicate_count += other_count;
-
-                        if chain {
-                            match self.get(id).duplicate {
-                                Some(first) => {
-                                    let last = self.chain_end(first);
-                                    self.get_mut(last).duplicate = Some(other);
-                                }
-                                None => self.get_mut(id).duplicate = Some(other),
-                            }
-
-                            self.get_mut(other).original = Some(id);
+                    (id, other)
+                } else {
+                    // Against one of a pair, a single read is always the duplicate.
+                    if chain {
+                        if let Some(other_first) = self.get(other).duplicate {
+                            self.get_mut(id).duplicate = Some(other_first);
                         }
 
-                        self.pair_hash.insert(pair_key, id);
-                        (id, other)
-                    } else {
-                        if chain {
-                            // The new read goes first in the kept read's chain, followed by the
-                            // kept read's duplicates and then the new read's own.
-                            if let Some(other_first) = self.get(other).duplicate {
-                                if let Some(own_first) = self.get(id).duplicate {
-                                    let last = self.chain_end(other_first);
-                                    self.get_mut(last).duplicate = Some(own_first);
-                                }
+                        self.get_mut(other).duplicate = Some(id);
+                        self.get_mut(id).original = Some(other);
+                    }
 
-                                self.get_mut(id).duplicate = Some(other_first);
-                            }
+                    self.get_mut(other).duplicate_count += 1;
+                    (other, id)
+                };
 
-                            self.get_mut(other).duplicate = Some(id);
-                            self.get_mut(id).original = Some(other);
-                        }
-
-                        self.get_mut(other).duplicate_count += 1;
-                        (other, id)
-                    };
-
-                    self.mark_duplicate(original, duplicate, read_group, DuplicateKind::Pair)?;
-                    self.stats[read_group].duplicate += 1;
-                }
-            }
-        } else {
-            let barcode = self.barcode(id);
-            let single_key = make_single_key(&self.get(id).record, read_group_key, barcode);
-
-            self.stats[read_group].single += 1;
-            self.get_mut(id).pos = single_key.this_coord;
-
-            match self.existing(&self.single_hash, &single_key) {
-                None => {
-                    self.single_hash.insert(single_key, id);
-                    self.get_mut(id).single_key = Some(single_key);
-                }
-                Some(other) => {
-                    let other_is_paired = has_mate(&self.get(other).record);
-
-                    let new_wins = !other_is_paired
-                        && read_score(self.get(id).record.as_ref())
-                            > read_score(self.get(other).record.as_ref());
-
-                    let (original, duplicate) = if new_wins {
-                        let other_count = self.get(other).duplicate_count;
-                        self.get_mut(id).duplicate_count += other_count;
-
-                        if chain {
-                            self.get_mut(id).duplicate = Some(other);
-                            self.get_mut(other).original = Some(id);
-                        }
-
-                        self.single_hash.insert(single_key, id);
-                        (id, other)
-                    } else {
-                        // Against one of a pair, a single read is always the duplicate.
-                        if chain {
-                            if let Some(other_first) = self.get(other).duplicate {
-                                self.get_mut(id).duplicate = Some(other_first);
-                            }
-
-                            self.get_mut(other).duplicate = Some(id);
-                            self.get_mut(id).original = Some(other);
-                        }
-
-                        self.get_mut(other).duplicate_count += 1;
-                        (other, id)
-                    };
-
-                    self.mark_duplicate(original, duplicate, read_group, DuplicateKind::Single)?;
-                    self.stats[read_group].single_duplicate += 1;
-                }
+                self.mark_duplicate(original, duplicate, read_group, DuplicateKind::Single)?;
+                self.stats[read_group].single_duplicate += 1;
             }
         }
 

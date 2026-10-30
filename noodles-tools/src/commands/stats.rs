@@ -491,65 +491,7 @@ pub fn run(mut args: Args) -> anyhow::Result<()> {
     let (mut reader, path) = AlignmentReader::open(&args.input, &read_options)?;
     let header = reader.read_header()?;
 
-    let (cov_min, cov_max, cov_step) = parse_coverage(&args.coverage)?;
-
-    if args.coverage_threshold < 0 || args.coverage_threshold == i32::MAX {
-        bail!(
-            "Unsupported value for coverage threshold {}",
-            args.coverage_threshold
-        );
-    }
-
-    let flag_filter = args
-        .filtering_flags
-        .iter()
-        .fold(0, |f, flags| f | flags.bits())
-        | if args.remove_dups {
-            Flags::DUPLICATE.bits()
-        } else {
-            0
-        };
-
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "samtools stores atof(--GC-depth) in an int"
-    )]
-    let gcd_bin_size = args.gc_depth_bin_size as i32;
-
-    let reference = args.reference.as_deref().map(Reference::open).transpose()?;
-
-    let mut info = Info {
-        flag_require: args.required_flags.map_or(0, |f| f.bits()),
-        flag_filter,
-        gcd_bin_size,
-        nisize: args.insert_size,
-        trim_qual: args.trim_quality,
-        isize_main_bulk: args.most_inserts,
-        cov_min,
-        cov_max,
-        cov_step,
-        filter_readlen: args.read_length,
-        remove_overlaps: args.remove_overlaps,
-        cov_threshold: args.coverage_threshold,
-        ref_chunk_size: args.ref_stats_chunk.max(1) * 1024 * 1024,
-        reference,
-        reference_names: header
-            .reference_sequences()
-            .keys()
-            .map(|name| name.to_vec())
-            .collect(),
-        reference_lengths: header
-            .reference_sequences()
-            .values()
-            .map(|rs| rs.length().get() as u64)
-            .collect(),
-        workers: args.threads,
-        insert_size_rows: if args.sparse {
-            InsertSizeRows::WithPairs
-        } else {
-            InsertSizeRows::All
-        },
-    };
+    let mut info = Info::from_args(&args, &header)?;
 
     let mut all = Stats::new(
         &mut info,
@@ -557,20 +499,8 @@ pub fn run(mut args: Args) -> anyhow::Result<()> {
         args.group_id.as_deref(),
         args.targets.as_deref(),
     )?;
-    let mut splits: Vec<(Vec<u8>, Stats)> = Vec::new();
-    let mut split_index: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut pairs: HashMap<Vec<u8>, Pair> = HashMap::new();
-
-    let split_tag = args
-        .split_tag
-        .as_deref()
-        .map(|tag| -> anyhow::Result<[u8; 2]> {
-            tag.as_bytes()
-                .try_into()
-                .with_context(|| format!("invalid tag: {tag}"))
-        })
-        .transpose()?;
-
+    let mut splits = Splits::new(args.split_tag.as_deref())?;
     let mut encoder = RawEncoder::new();
 
     let mut process = |rec: Rec<'_>,
@@ -579,36 +509,8 @@ pub fn run(mut args: Args) -> anyhow::Result<()> {
                        pairs: &mut HashMap<Vec<u8>, Pair>|
      -> anyhow::Result<()> {
         let raw: &[u8] = rec.encode_raw(&header, &mut encoder)?;
-
         let bam = Bam::parse(raw)?;
-
-        if let Some(tag) = split_tag {
-            let Some(value) = (match bam_raw::find_field(raw, tag)? {
-                Some(range) if raw[range.start + 2] == b'Z' => {
-                    Some(raw[range.start + 3..range.end - 1].to_vec())
-                }
-                _ => None,
-            }) else {
-                bail!(
-                    "Tag '{}' not found in bam_line.",
-                    String::from_utf8_lossy(&tag)
-                );
-            };
-
-            let i = match split_index.get(&value) {
-                Some(&i) => i,
-                None => {
-                    let mut stats = Stats::new_with_info(info, args.targets.as_deref())?;
-                    stats.split_name = Some(value.clone());
-                    splits.push((value.clone(), stats));
-                    split_index.insert(value, splits.len() - 1);
-                    splits.len() - 1
-                }
-            };
-
-            splits[i].1.collect(&bam, info, pairs)?;
-        }
-
+        splits.collect(&bam, info, pairs, args.targets.as_deref())?;
         all.collect(&bam, info, pairs)
     };
 
@@ -650,7 +552,143 @@ pub fn run(mut args: Args) -> anyhow::Result<()> {
         all.collect_reference_stats(&info)?;
     }
 
-    all.round_buffer_flush(-1, &info)?;
+    write_reports(&args, &info, all, splits)?;
+
+    Ok(())
+}
+
+impl Info {
+    fn from_args(args: &Args, header: &sam::Header) -> anyhow::Result<Self> {
+        let (cov_min, cov_max, cov_step) = parse_coverage(&args.coverage)?;
+
+        if args.coverage_threshold < 0 || args.coverage_threshold == i32::MAX {
+            bail!(
+                "Unsupported value for coverage threshold {}",
+                args.coverage_threshold
+            );
+        }
+
+        let flag_filter = args
+            .filtering_flags
+            .iter()
+            .fold(0, |f, flags| f | flags.bits())
+            | if args.remove_dups {
+                Flags::DUPLICATE.bits()
+            } else {
+                0
+            };
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "samtools stores atof(--GC-depth) in an int"
+        )]
+        let gcd_bin_size = args.gc_depth_bin_size as i32;
+
+        let reference = args.reference.as_deref().map(Reference::open).transpose()?;
+
+        Ok(Info {
+            flag_require: args.required_flags.map_or(0, |f| f.bits()),
+            flag_filter,
+            gcd_bin_size,
+            nisize: args.insert_size,
+            trim_qual: args.trim_quality,
+            isize_main_bulk: args.most_inserts,
+            cov_min,
+            cov_max,
+            cov_step,
+            filter_readlen: args.read_length,
+            remove_overlaps: args.remove_overlaps,
+            cov_threshold: args.coverage_threshold,
+            ref_chunk_size: args.ref_stats_chunk.max(1) * 1024 * 1024,
+            reference,
+            reference_names: header
+                .reference_sequences()
+                .keys()
+                .map(|name| name.to_vec())
+                .collect(),
+            reference_lengths: header
+                .reference_sequences()
+                .values()
+                .map(|rs| rs.length().get() as u64)
+                .collect(),
+            workers: args.threads,
+            insert_size_rows: if args.sparse {
+                InsertSizeRows::WithPairs
+            } else {
+                InsertSizeRows::All
+            },
+        })
+    }
+}
+
+/// Statistics by the value of a tag (`-S`), each written to its own file.
+struct Splits {
+    tag: Option<[u8; 2]>,
+    stats: Vec<(Vec<u8>, Stats)>,
+    index: HashMap<Vec<u8>, usize>,
+}
+
+impl Splits {
+    fn new(tag: Option<&str>) -> anyhow::Result<Self> {
+        let tag = tag
+            .map(|tag| -> anyhow::Result<[u8; 2]> {
+                tag.as_bytes()
+                    .try_into()
+                    .with_context(|| format!("invalid tag: {tag}"))
+            })
+            .transpose()?;
+
+        Ok(Self {
+            tag,
+            stats: Vec::new(),
+            index: HashMap::new(),
+        })
+    }
+
+    /// Collects a record into the statistics of its tag value, if splitting.
+    fn collect(
+        &mut self,
+        bam: &Bam<'_>,
+        info: &Info,
+        pairs: &mut HashMap<Vec<u8>, Pair>,
+        targets: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        let Some(tag) = self.tag else {
+            return Ok(());
+        };
+
+        let raw = bam.raw;
+
+        let Some(value) = (match bam_raw::find_field(raw, tag)? {
+            Some(range) if raw[range.start + 2] == b'Z' => {
+                Some(raw[range.start + 3..range.end - 1].to_vec())
+            }
+            _ => None,
+        }) else {
+            bail!(
+                "Tag '{}' not found in bam_line.",
+                String::from_utf8_lossy(&tag)
+            );
+        };
+
+        let i = match self.index.get(&value) {
+            Some(&i) => i,
+            None => {
+                let mut stats = Stats::new_with_info(info, targets)?;
+                stats.split_name = Some(value.clone());
+                self.stats.push((value.clone(), stats));
+                self.index.insert(value, self.stats.len() - 1);
+                self.stats.len() - 1
+            }
+        };
+
+        self.stats[i].1.collect(bam, info, pairs)
+    }
+}
+
+/// Writes the report for all reads to stdout, and one per split to `PREFIX_VALUE.bamstat`.
+fn write_reports(args: &Args, info: &Info, mut all: Stats, splits: Splits) -> anyhow::Result<()> {
+    all.round_buffer_flush(-1, info)?;
 
     let command_line = std::iter::once("stats".to_owned())
         .chain(std::env::args().skip(2))
@@ -658,18 +696,18 @@ pub fn run(mut args: Args) -> anyhow::Result<()> {
         .join(" ");
 
     let mut out = BufWriter::new(output::raw_stdout()?);
-    all.output(&mut out, &info, &command_line, None)?;
+    all.output(&mut out, info, &command_line, None)?;
     out.flush()?;
 
-    for (name, mut stats) in splits {
-        stats.round_buffer_flush(-1, &info)?;
+    for (name, mut stats) in splits.stats {
+        stats.round_buffer_flush(-1, info)?;
 
         let prefix = args.split_prefix.as_deref().unwrap_or(&args.input);
         let path = format!("{prefix}_{}.bamstat", String::from_utf8_lossy(&name));
         let file =
             File::create(&path).with_context(|| format!("Could not open '{path}' for writing."))?;
         let mut out = BufWriter::new(file);
-        stats.output(&mut out, &info, &command_line, args.split_tag.as_deref())?;
+        stats.output(&mut out, info, &command_line, args.split_tag.as_deref())?;
         out.flush()?;
     }
 

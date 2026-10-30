@@ -11,7 +11,7 @@ use std::{
     collections::HashSet,
     fs::{self, File},
     io::{BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
 };
@@ -253,53 +253,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         bail!("[mpileup] no input file/data given");
     }
 
-    let mut print_flags = 0;
-
-    if args.output_mq {
-        print_flags |= PRINT_MAPQ_CHAR;
-    }
-
-    if args.output_bp {
-        print_flags |= PRINT_QPOS;
-    }
-
-    if args.output_bp5 {
-        print_flags |= PRINT_QPOS5;
-    }
-
-    if args.output_qname {
-        print_flags |= PRINT_QNAME;
-    }
-
-    let mut aux_tags: Vec<[u8; 2]> = Vec::new();
-
-    if let Some(extra) = &args.output_extra {
-        for name in extra.split(',').filter(|s| !s.is_empty()) {
-            let flag = match name {
-                "QNAME" => Some(PRINT_QNAME),
-                "FLAG" => Some(PRINT_FLAG),
-                "RNAME" => Some(PRINT_RNAME),
-                "POS" => Some(PRINT_POS),
-                "MAPQ" => Some(PRINT_MAPQ),
-                "RNEXT" => Some(PRINT_RNEXT),
-                "PNEXT" => Some(PRINT_PNEXT),
-                "RLEN" => Some(PRINT_RLEN),
-                _ => None,
-            };
-
-            match flag {
-                Some(flag) => print_flags |= flag,
-                None if name.len() == 2 => {
-                    let b = name.as_bytes();
-                    aux_tags.push([b[0], b[1]]);
-                }
-                None => eprintln!(
-                    "[build_auxlist] tag '{name}' has more than two characters or not supported"
-                ),
-            }
-        }
-    }
-
     let bed = args
         .positions
         .as_deref()
@@ -307,24 +260,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         .transpose()?
         .map(Arc::new);
 
-    let exclude_rg = match &args.exclude_rg {
-        Some(path) => match fs::read(path) {
-            Ok(text) => Some(
-                text.split(|b| b.is_ascii_whitespace())
-                    .filter(|s| !s.is_empty())
-                    .map(<[u8]>::to_vec)
-                    .collect(),
-            ),
-            Err(_) => {
-                eprintln!(
-                    "[bam_mpileup] Fail to open file {}. Continue anyway.",
-                    path.display()
-                );
-                Some(HashSet::new())
-            }
-        },
-        None => None,
-    };
+    let exclude_rg = args.exclude_rg.as_deref().map(read_excluded_read_groups);
 
     let fasta = args
         .fasta_ref
@@ -338,16 +274,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         reference: cram_reference,
     };
 
-    let max_depth = if args.max_depth <= 0 {
-        eprintln!("[mpileup] Max depth set to maximum value ({})", i32::MAX);
-        i32::MAX as usize
-    } else {
-        if args.max_depth * inputs.len() as i64 > 1 << 20 {
-            eprintln!("[mpileup] Combined max depth is above 1M. Potential memory hog!");
-        }
-
-        args.max_depth as usize
-    };
+    let max_depth = max_depth(&args, inputs.len());
 
     let conf = Conf {
         min_mq: args.min_mq,
@@ -378,27 +305,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     };
     let mut out = BufWriter::with_capacity(1 << 20, sink);
 
-    let options = OutputOptions {
-        min_bq: args.min_bq,
-        rev_del: args.reverse_del,
-        no_ins: args.no_output_ins,
-        mods: if args.output_mods {
-            if args.no_output_ins_mods || args.no_output_ins > 0 {
-                Mods::Bases
-            } else {
-                Mods::BasesAndInsertions
-            }
-        } else {
-            Mods::None
-        },
-        no_del: args.no_output_del,
-        no_ends: args.no_output_ends,
-        flags: print_flags,
-        aux_tags,
-        sep: args.output_sep.bytes().next().unwrap_or(b','),
-        empty: args.output_empty.bytes().next().unwrap_or(b'*'),
-        all: args.all,
-    };
+    let options = OutputOptions::from_args(&args);
 
     let context = PileupContext {
         inputs: &inputs,
@@ -434,6 +341,112 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     out.flush()?;
 
     Ok(())
+}
+
+impl OutputOptions {
+    fn from_args(args: &Args) -> Self {
+        let mut print_flags = 0;
+
+        if args.output_mq {
+            print_flags |= PRINT_MAPQ_CHAR;
+        }
+
+        if args.output_bp {
+            print_flags |= PRINT_QPOS;
+        }
+
+        if args.output_bp5 {
+            print_flags |= PRINT_QPOS5;
+        }
+
+        if args.output_qname {
+            print_flags |= PRINT_QNAME;
+        }
+
+        let mut aux_tags: Vec<[u8; 2]> = Vec::new();
+
+        if let Some(extra) = &args.output_extra {
+            for name in extra.split(',').filter(|s| !s.is_empty()) {
+                let flag = match name {
+                    "QNAME" => Some(PRINT_QNAME),
+                    "FLAG" => Some(PRINT_FLAG),
+                    "RNAME" => Some(PRINT_RNAME),
+                    "POS" => Some(PRINT_POS),
+                    "MAPQ" => Some(PRINT_MAPQ),
+                    "RNEXT" => Some(PRINT_RNEXT),
+                    "PNEXT" => Some(PRINT_PNEXT),
+                    "RLEN" => Some(PRINT_RLEN),
+                    _ => None,
+                };
+
+                match flag {
+                    Some(flag) => print_flags |= flag,
+                    None if name.len() == 2 => {
+                        let b = name.as_bytes();
+                        aux_tags.push([b[0], b[1]]);
+                    }
+                    None => eprintln!(
+                        "[build_auxlist] tag '{name}' has more than two characters or not supported"
+                    ),
+                }
+            }
+        }
+
+        Self {
+            min_bq: args.min_bq,
+            rev_del: args.reverse_del,
+            no_ins: args.no_output_ins,
+            mods: if args.output_mods {
+                if args.no_output_ins_mods || args.no_output_ins > 0 {
+                    Mods::Bases
+                } else {
+                    Mods::BasesAndInsertions
+                }
+            } else {
+                Mods::None
+            },
+            no_del: args.no_output_del,
+            no_ends: args.no_output_ends,
+            flags: print_flags,
+            aux_tags,
+            sep: args.output_sep.bytes().next().unwrap_or(b','),
+            empty: args.output_empty.bytes().next().unwrap_or(b'*'),
+            all: args.all,
+        }
+    }
+}
+
+/// Read groups to leave out (`-G`), whitespace-separated. An unreadable file excludes none, as
+/// in samtools.
+fn read_excluded_read_groups(path: &Path) -> HashSet<Vec<u8>> {
+    match fs::read(path) {
+        Ok(text) => text
+            .split(|b| b.is_ascii_whitespace())
+            .filter(|s| !s.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect(),
+        Err(_) => {
+            eprintln!(
+                "[bam_mpileup] Fail to open file {}. Continue anyway.",
+                path.display()
+            );
+            HashSet::new()
+        }
+    }
+}
+
+/// The per-position read limit (`-d`), warning as samtools does.
+fn max_depth(args: &Args, input_count: usize) -> usize {
+    if args.max_depth <= 0 {
+        eprintln!("[mpileup] Max depth set to maximum value ({})", i32::MAX);
+        i32::MAX as usize
+    } else {
+        if args.max_depth * input_count as i64 > 1 << 20 {
+            eprintln!("[mpileup] Combined max depth is above 1M. Potential memory hog!");
+        }
+
+        args.max_depth as usize
+    }
 }
 
 /// What the pileup of one region needs.
@@ -628,13 +641,14 @@ fn mpileup<W: Write>(
     let (tid0, beg0, end0) = region.unwrap_or((0, 0, i64::MAX));
     let has_region = region.is_some();
 
-    // `bam_mplp_t` state
-    let mut min_tid: i32 = -1;
-    let mut min_pos: i64 = i64::MAX;
-    let mut tids = vec![-1i32; n];
-    let mut poss = vec![i64::MAX; n];
-    let mut ready = vec![false; n];
-    let mut active = vec![false; n];
+    let mut inputs = MultiPileup::new(n);
+    let mut empty = EmptyLines {
+        options,
+        names,
+        input_count: n,
+        bed,
+        line: Vec::new(),
+    };
 
     let mut last_tid: i32 = -1;
     let mut last_pos: i64 = -1;
@@ -647,59 +661,9 @@ fn mpileup<W: Write>(
     let mut qual = Vec::new();
     let mut ins = Vec::new();
 
-    let ref_at = |reference: &Option<Arc<Vec<u8>>>, pos: i64| -> u8 {
-        match reference {
-            Some(r) if pos < r.len() as i64 => r[pos as usize],
-            _ => b'N',
-        }
-    };
-
     let name_of = |tid: i32| -> &[u8] { &names[tid as usize] };
 
-    loop {
-        // `bam_mplp64_auto`
-        let mut new_min_tid = u32::MAX;
-        let mut new_min_pos = i64::MAX;
-
-        for i in 0..n {
-            if poss[i] == min_pos && tids[i] == min_tid {
-                ready[i] = sources[i].auto()?;
-
-                if ready[i] {
-                    let (tid, pos) = sources[i].pileup.position();
-                    tids[i] = tid;
-                    poss[i] = pos;
-                } else {
-                    tids[i] = 0;
-                    poss[i] = 0;
-                }
-            }
-
-            if ready[i] {
-                let tid = tids[i] as u32;
-
-                if tid < new_min_tid {
-                    new_min_tid = tid;
-                    new_min_pos = poss[i];
-                } else if tid == new_min_tid && poss[i] < new_min_pos {
-                    new_min_pos = poss[i];
-                }
-            }
-        }
-
-        min_pos = new_min_pos;
-        min_tid = new_min_tid as i32;
-
-        if new_min_pos == i64::MAX {
-            break;
-        }
-
-        let (tid, pos) = (min_tid, min_pos);
-
-        for i in 0..n {
-            active[i] = ready[i] && poss[i] == min_pos && tids[i] == min_tid;
-        }
-
+    while let Some((tid, pos)) = inputs.next(sources)? {
         one_seq = true;
 
         if has_region && (pos < beg0 || pos >= end0) {
@@ -710,29 +674,9 @@ fn mpileup<W: Write>(
             // Positions of earlier sequences not yet written
             while tid > last_tid {
                 if last_tid >= 0 && !has_region {
-                    loop {
-                        last_pos += 1;
-
-                        if last_pos >= lengths[last_tid as usize] {
-                            break;
-                        }
-
-                        if let Some(bed) = bed
-                            && !bed.overlaps(name_of(last_tid), last_pos, last_pos + 1)
-                        {
-                            continue;
-                        }
-
-                        write_empty(
-                            out,
-                            &mut line,
-                            options,
-                            name_of(last_tid),
-                            last_pos,
-                            n,
-                            reference.as_deref().map(Vec::as_slice),
-                        )?;
-                    }
+                    let end = lengths[last_tid as usize];
+                    let reference = reference.as_deref().map(Vec::as_slice);
+                    empty.fill(out, last_tid, last_pos + 1..end, i64::MIN, reference)?;
                 }
 
                 last_tid += 1;
@@ -758,34 +702,9 @@ fn mpileup<W: Write>(
 
         if options.all > 0 {
             // Positions of this sequence not yet written
-            loop {
-                last_pos += 1;
-
-                if last_pos >= pos {
-                    break;
-                }
-
-                if has_region && last_pos < beg0 {
-                    continue;
-                }
-
-                if let Some(bed) = bed
-                    && !bed.overlaps(name_of(tid), last_pos, last_pos + 1)
-                {
-                    continue;
-                }
-
-                write_empty(
-                    out,
-                    &mut line,
-                    options,
-                    name_of(tid),
-                    last_pos,
-                    n,
-                    reference.as_deref().map(Vec::as_slice),
-                )?;
-            }
-
+            let skip_before = if has_region { beg0 } else { i64::MIN };
+            let reference = reference.as_deref().map(Vec::as_slice);
+            empty.fill(out, tid, last_pos + 1..pos, skip_before, reference)?;
             last_pos = pos;
         }
 
@@ -801,12 +720,15 @@ fn mpileup<W: Write>(
         line.push(b'\t');
         push_int(&mut line, pos + 1);
         line.push(b'\t');
-        line.push(ref_at(&reference, pos));
+        line.push(match &reference {
+            Some(r) if pos < r.len() as i64 => r[pos as usize],
+            _ => b'N',
+        });
 
-        for (i, source) in sources.iter_mut().enumerate() {
+        for (source, &active) in sources.iter_mut().zip(&inputs.active) {
             write_sample(
                 &mut line,
-                active[i].then_some(&mut source.pileup),
+                active.then_some(&mut source.pileup),
                 options,
                 names,
                 pos,
@@ -833,29 +755,9 @@ fn mpileup<W: Write>(
         while last_tid >= 0 && (last_tid as usize) < names.len() {
             reference = references.get_id(names, last_tid)?;
 
-            loop {
-                last_pos += 1;
-
-                if last_pos >= lengths[last_tid as usize] || last_pos >= end0 {
-                    break;
-                }
-
-                if let Some(bed) = bed
-                    && !bed.overlaps(name_of(last_tid), last_pos, last_pos + 1)
-                {
-                    continue;
-                }
-
-                write_empty(
-                    out,
-                    &mut line,
-                    options,
-                    name_of(last_tid),
-                    last_pos,
-                    n,
-                    reference.as_deref().map(Vec::as_slice),
-                )?;
-            }
+            let end = lengths[last_tid as usize].min(end0);
+            let reference_bases = reference.as_deref().map(Vec::as_slice);
+            empty.fill(out, last_tid, last_pos + 1..end, i64::MIN, reference_bases)?;
 
             last_tid += 1;
             last_pos = -1;
@@ -867,4 +769,123 @@ fn mpileup<W: Write>(
     }
 
     Ok(())
+}
+
+/// `bam_mplp_t`: the inputs' pileups, kept at the same position.
+struct MultiPileup {
+    min_tid: i32,
+    min_pos: i64,
+    tids: Vec<i32>,
+    positions: Vec<i64>,
+    ready: Vec<bool>,
+    /// Whether each input has reads at the current position.
+    active: Vec<bool>,
+}
+
+impl MultiPileup {
+    fn new(input_count: usize) -> Self {
+        Self {
+            min_tid: -1,
+            min_pos: i64::MAX,
+            tids: vec![-1; input_count],
+            positions: vec![i64::MAX; input_count],
+            ready: vec![false; input_count],
+            active: vec![false; input_count],
+        }
+    }
+
+    /// `bam_mplp64_auto`: advances the inputs at the current position and returns the next
+    /// position with reads in any input, or `None` at the end.
+    fn next(&mut self, sources: &mut [Source]) -> anyhow::Result<Option<(i32, i64)>> {
+        let mut new_min_tid = u32::MAX;
+        let mut new_min_pos = i64::MAX;
+
+        for (i, source) in sources.iter_mut().enumerate() {
+            if self.positions[i] == self.min_pos && self.tids[i] == self.min_tid {
+                self.ready[i] = source.auto()?;
+
+                if self.ready[i] {
+                    let (tid, pos) = source.pileup.position();
+                    self.tids[i] = tid;
+                    self.positions[i] = pos;
+                } else {
+                    self.tids[i] = 0;
+                    self.positions[i] = 0;
+                }
+            }
+
+            if self.ready[i] {
+                let tid = self.tids[i] as u32;
+
+                if tid < new_min_tid {
+                    new_min_tid = tid;
+                    new_min_pos = self.positions[i];
+                } else if tid == new_min_tid && self.positions[i] < new_min_pos {
+                    new_min_pos = self.positions[i];
+                }
+            }
+        }
+
+        self.min_pos = new_min_pos;
+        self.min_tid = new_min_tid as i32;
+
+        if new_min_pos == i64::MAX {
+            return Ok(None);
+        }
+
+        for i in 0..self.active.len() {
+            self.active[i] =
+                self.ready[i] && self.positions[i] == self.min_pos && self.tids[i] == self.min_tid;
+        }
+
+        Ok(Some((self.min_tid, self.min_pos)))
+    }
+}
+
+/// Writes `-a` lines for positions without reads.
+struct EmptyLines<'a> {
+    options: &'a OutputOptions,
+    names: &'a [Vec<u8>],
+    input_count: usize,
+    bed: Option<&'a Bed>,
+    line: Vec<u8>,
+}
+
+impl EmptyLines<'_> {
+    /// Writes a line for each position of `tid` in `positions`, except those before
+    /// `skip_before` and those outside the BED file.
+    fn fill<W: Write>(
+        &mut self,
+        out: &mut W,
+        tid: i32,
+        positions: std::ops::Range<i64>,
+        skip_before: i64,
+        reference: Option<&[u8]>,
+    ) -> anyhow::Result<()> {
+        let name = &self.names[tid as usize];
+
+        for pos in positions {
+            if pos < skip_before {
+                continue;
+            }
+
+            if let Some(bed) = self.bed
+                && !bed.overlaps(name, pos, pos + 1)
+            {
+                continue;
+            }
+
+            write_empty(
+                out,
+                &mut self.line,
+                self.options,
+                name,
+                pos,
+                self.input_count,
+                reference,
+            )?;
+        }
+
+        Ok(())
+    }
 }

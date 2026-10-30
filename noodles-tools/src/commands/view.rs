@@ -168,17 +168,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut header = reader.read_header()?;
 
     let (traversal, mut filter) = plan(&args, &header, &reader, path.as_deref())?;
-    filter.require = args.require_flags.unwrap_or_else(Flags::empty);
-    filter.exclude = args.exclude_flags.unwrap_or_else(Flags::empty);
-    filter.exclude_all = args.exclude_all_flags;
-    filter.min_mapping_quality = args.min_mapping_quality;
-    filter.subsample = args.subsample;
-    filter.tag = TagFilter::from_args(&args.tags)?;
-    filter.names = args
-        .qname_file
-        .as_deref()
-        .map(filter::read_names)
-        .transpose()?;
+    configure_filter(&mut filter, &args)?;
     let filter = filter;
 
     let remove_tags = parse_tags(&args.remove_tags)?;
@@ -210,20 +200,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         program::add(&mut header)?;
     }
 
-    let level = if args.uncompressed {
-        0
-    } else if args.fast {
-        1
-    } else {
-        args.level
-    };
-
-    let write_options = WriteOptions {
-        format,
-        level: output::parse_level(level)?,
-        threads: args.threads,
-        reference: args.reference.clone(),
-    };
+    let write_options = write_options(&args, format)?;
 
     let mut writer = AlignmentWriter::create(args.output.as_deref(), &write_options, &header)?;
     let mut unselected = args
@@ -300,18 +277,60 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     if args.write_index {
-        let Some(output) = args.output.as_deref().filter(|p| *p != Path::new("-")) else {
-            bail!("--write-index needs an output file (-o)");
-        };
-
-        let kind = match format {
-            OutputFormat::Bam => IndexKind::Csi,
-            OutputFormat::Cram => IndexKind::Default,
-            OutputFormat::Sam => bail!("--write-index needs BAM or CRAM output"),
-        };
-
-        index_file(output, None, kind, args.threads)?;
+        write_output_index(&args, format)?;
     }
+
+    Ok(())
+}
+
+/// Sets the record filter's options (`-f`, `-F`, `-G`, `-q`, `-s`, `-d`/`-D`, `-N`).
+fn configure_filter(filter: &mut Filter, args: &Args) -> anyhow::Result<()> {
+    filter.require = args.require_flags.unwrap_or_else(Flags::empty);
+    filter.exclude = args.exclude_flags.unwrap_or_else(Flags::empty);
+    filter.exclude_all = args.exclude_all_flags;
+    filter.min_mapping_quality = args.min_mapping_quality;
+    filter.subsample = args.subsample;
+    filter.tag = TagFilter::from_args(&args.tags)?;
+    filter.names = args
+        .qname_file
+        .as_deref()
+        .map(filter::read_names)
+        .transpose()?;
+
+    Ok(())
+}
+
+/// The output options, with the compression level from `-u`, `-1`, or `-l`.
+fn write_options(args: &Args, format: OutputFormat) -> anyhow::Result<WriteOptions> {
+    let level = if args.uncompressed {
+        0
+    } else if args.fast {
+        1
+    } else {
+        args.level
+    };
+
+    Ok(WriteOptions {
+        format,
+        level: output::parse_level(level)?,
+        threads: args.threads,
+        reference: args.reference.clone(),
+    })
+}
+
+/// Indexes the output file (`--write-index`).
+fn write_output_index(args: &Args, format: OutputFormat) -> anyhow::Result<()> {
+    let Some(output) = args.output.as_deref().filter(|p| *p != Path::new("-")) else {
+        bail!("--write-index needs an output file (-o)");
+    };
+
+    let kind = match format {
+        OutputFormat::Bam => IndexKind::Csi,
+        OutputFormat::Cram => IndexKind::Default,
+        OutputFormat::Sam => bail!("--write-index needs BAM or CRAM output"),
+    };
+
+    index_file(output, None, kind, args.threads)?;
 
     Ok(())
 }

@@ -157,6 +157,18 @@ pub(super) fn format_e(value: f64) -> String {
     format!("{mantissa}e{sign}{:02}", exponent.abs())
 }
 
+/// Insert size statistics for the summary, from [`Stats::insert_size_summary`].
+#[derive(Clone, Copy, Debug)]
+struct InsertSizeSummary {
+    /// One past the last insert size in the main bulk.
+    ibulk: i32,
+    average: f64,
+    sd: f64,
+    inward: u64,
+    outward: u64,
+    other: u64,
+}
+
 impl Stats {
     /// `output_stats`
     pub(super) fn output<W: Write>(
@@ -168,7 +180,27 @@ impl Stats {
     ) -> io::Result<()> {
         self.flush_cycles();
 
-        // Insert size average and standard deviation, from the main bulk only.
+        let insert_sizes = self.insert_size_summary(info);
+
+        self.write_preamble(out, command_line, split_tag)?;
+        self.write_summary(out, info, &insert_sizes)?;
+        self.round_up_maxima();
+        self.write_quality_tables(out)?;
+        self.write_base_content(out)?;
+        self.write_barcodes(out)?;
+        self.write_distributions(out, info, insert_sizes.ibulk)?;
+
+        if self.is_sorted {
+            self.write_coverage(out, info)?;
+            self.write_gc_depth(out, info, self.average_read_length())?;
+        }
+
+        self.write_reference_stats(out)
+    }
+
+    /// The insert size average and standard deviation, from the main bulk of insert sizes only,
+    /// and the pair counts by orientation.
+    fn insert_size_summary(&mut self, info: &Info) -> InsertSizeSummary {
         self.isize.halve();
 
         let nitems = self.isize.len();
@@ -216,8 +248,34 @@ impl Stats {
             sd_isize += (i + o + x) as f64 * d * d / divisor as f64;
         }
 
-        let sd_isize = sd_isize.sqrt();
+        InsertSizeSummary {
+            ibulk,
+            average: avg_isize,
+            sd: sd_isize.sqrt(),
+            inward: nisize_inward,
+            outward: nisize_outward,
+            other: nisize_other,
+        }
+    }
 
+    /// The average read length.
+    fn average_read_length(&self) -> f32 {
+        let nreads = self.nreads_1st + self.nreads_2nd + self.nreads_other;
+
+        if nreads > 0 {
+            self.total_len as f32 / nreads as f32
+        } else {
+            0.0
+        }
+    }
+
+    /// The file header and the checksums (CHK).
+    fn write_preamble<W: Write>(
+        &self,
+        out: &mut W,
+        command_line: &str,
+        split_tag: Option<&str>,
+    ) -> io::Result<()> {
         writeln!(
             out,
             "# This file was produced by ntools stats ({}) and can be plotted using plot-bamstats",
@@ -247,6 +305,25 @@ impl Stats {
             "CHK\t{:08x}\t{:08x}\t{:08x}",
             self.checksum_names, self.checksum_reads, self.checksum_quals
         )?;
+
+        Ok(())
+    }
+
+    /// The summary numbers (SN).
+    fn write_summary<W: Write>(
+        &self,
+        out: &mut W,
+        info: &Info,
+        insert_sizes: &InsertSizeSummary,
+    ) -> io::Result<()> {
+        let InsertSizeSummary {
+            average: avg_isize,
+            sd: sd_isize,
+            inward: nisize_inward,
+            outward: nisize_outward,
+            other: nisize_other,
+            ..
+        } = *insert_sizes;
 
         let nreads = self.nreads_1st + self.nreads_2nd + self.nreads_other;
 
@@ -360,11 +437,7 @@ impl Stats {
             format_e(error_rate)
         )?;
 
-        let avg_read_length: f32 = if nreads > 0 {
-            self.total_len as f32 / nreads as f32
-        } else {
-            0.0
-        };
+        let avg_read_length = self.average_read_length();
 
         let ratio = |a: u64, b: u64| -> f64 {
             if b > 0 {
@@ -439,6 +512,12 @@ impl Stats {
             )?;
         }
 
+        Ok(())
+    }
+
+    /// Includes the longest read and the highest quality in the per-cycle tables, as samtools
+    /// does after the summary.
+    fn round_up_maxima(&mut self) {
         if self.max_len < self.nbases {
             self.max_len += 1;
         }
@@ -446,7 +525,10 @@ impl Stats {
         if self.max_qual + 1 < QUALITY_BINS && self.max_qual < 255 {
             self.max_qual += 1;
         }
+    }
 
+    /// Base qualities per cycle (FFQ, LFQ) and mismatches per cycle (MPC).
+    fn write_quality_tables<W: Write>(&self, out: &mut W) -> io::Result<()> {
         writeln!(
             out,
             "# First Fragment Qualities. Use `grep ^FFQ | cut -f 2-` to extract this part."
@@ -498,6 +580,11 @@ impl Stats {
             write_quality_rows(out, "MPC", mpc, QUALITY_BINS, self.max_len, self.max_qual)?;
         }
 
+        Ok(())
+    }
+
+    /// GC content (GCF, GCL) and base content per cycle (GCC, GCT, and by fragment).
+    fn write_base_content<W: Write>(&self, out: &mut W) -> io::Result<()> {
         writeln!(
             out,
             "# GC Content of first fragments. Use `grep ^GCF | cut -f 2-` to extract this part."
@@ -599,6 +686,11 @@ impl Stats {
             )?;
         }
 
+        Ok(())
+    }
+
+    /// Barcode base content and qualities per cycle.
+    fn write_barcodes<W: Write>(&self, out: &mut W) -> io::Result<()> {
         for barcode in &self.barcodes {
             if barcode.len == 0 {
                 continue;
@@ -655,6 +747,16 @@ impl Stats {
             }
         }
 
+        Ok(())
+    }
+
+    /// Insert sizes (IS) below `ibulk`, read lengths (RL, FRL, LRL), mapping qualities (MAPQ), and indels (ID, IC).
+    fn write_distributions<W: Write>(
+        &self,
+        out: &mut W,
+        info: &Info,
+        ibulk: i32,
+    ) -> io::Result<()> {
         writeln!(
             out,
             "# Insert sizes. Use `grep ^IS | cut -f 2-` to extract this part. The columns are: insert size, pairs total, inward oriented pairs, outward oriented pairs, other pairs"
@@ -749,11 +851,11 @@ impl Stats {
             }
         }
 
-        if self.is_sorted {
-            self.write_coverage(out, info)?;
-            self.write_gc_depth(out, info, avg_read_length)?;
-        }
+        Ok(())
+    }
 
+    /// Reference statistics (RFS).
+    fn write_reference_stats<W: Write>(&self, out: &mut W) -> io::Result<()> {
         if let Some(rs) = &self.reference_stats {
             writeln!(
                 out,

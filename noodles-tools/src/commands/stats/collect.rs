@@ -246,11 +246,7 @@ impl Stats {
 
     /// `update_checksum`
     pub(super) fn update_checksum(&mut self, bam: &Bam<'_>) {
-        let crc = |bytes: &[u8]| {
-            let mut crc = flate2::Crc::new();
-            crc.update(bytes);
-            crc.sum()
-        };
+        let crc = crc32fast::hash;
 
         self.checksum_names = self.checksum_names.wrapping_add(crc(bam.name));
 
@@ -577,31 +573,7 @@ impl Stats {
         info: &Info,
         pairs: &mut HashMap<Vec<u8>, Pair>,
     ) -> anyhow::Result<()> {
-        if !self.is_in_regions(bam)? {
-            return Ok(());
-        }
-
-        if let Some(read_groups) = &self.read_groups {
-            let Some(rg) = string_value(bam.raw, *b"RG")? else {
-                return Ok(());
-            };
-
-            if !read_groups.iter().any(|id| id == rg) {
-                return Ok(());
-            }
-        }
-
-        if info.flag_require != 0 && bam.flag & info.flag_require != info.flag_require {
-            self.nreads_filtered += 1;
-            return Ok(());
-        }
-
-        if info.flag_filter != 0 && bam.flag & info.flag_filter != 0 {
-            self.nreads_filtered += 1;
-            return Ok(());
-        }
-
-        if info.filter_readlen != -1 && bam.l_seq as i64 != info.filter_readlen {
+        if !self.is_selected(bam, info)? {
             return Ok(());
         }
 
@@ -627,6 +599,89 @@ impl Stats {
             self.nreads_dup += 1;
         }
 
+        let read_len = self.update_read_lengths(bam, info, seq_len);
+        let gc_count = if bam.is_original() {
+            self.count_original_read(bam, info, read_len)
+        } else {
+            0
+        };
+
+        if bam.has(Flags::UNMAPPED) {
+            return Ok(());
+        }
+
+        self.count_indels(bam)?;
+
+        self.count_insert_size(bam, info);
+
+        if let Some(nm) = integer_field(bam.raw, *b"NM")? {
+            self.nmismatches = self.nmismatches.wrapping_add_signed(nm);
+        }
+
+        if bam.cigar.is_empty() {
+            bail!("FIXME: mapped read with no cigar?");
+        }
+
+        let readlen = self.count_mapped_bases(bam, seq_len);
+
+        if self.tid == bam.tid && bam.pos < self.pos {
+            self.is_sorted = false;
+        }
+
+        self.pos = bam.pos;
+
+        if !self.is_sorted {
+            return Ok(());
+        }
+
+        if self.tid == -1 || self.tid != bam.tid {
+            self.round_buffer_flush(-1, info)?;
+        }
+
+        self.cleanup_pairs(bam, pairs);
+
+        self.update_gc_depth(bam, info, read_len, readlen, gc_count, seq_len)?;
+
+        self.update_coverage(bam, info, pairs)?;
+
+        Ok(())
+    }
+
+    /// Whether a record passes the region, read group, flag, and length filters, counting the filtered ones.
+    fn is_selected(&mut self, bam: &Bam<'_>, info: &Info) -> anyhow::Result<bool> {
+        if !self.is_in_regions(bam)? {
+            return Ok(false);
+        }
+
+        if let Some(read_groups) = &self.read_groups {
+            let Some(rg) = string_value(bam.raw, *b"RG")? else {
+                return Ok(false);
+            };
+
+            if !read_groups.iter().any(|id| id == rg) {
+                return Ok(false);
+            }
+        }
+
+        if info.flag_require != 0 && bam.flag & info.flag_require != info.flag_require {
+            self.nreads_filtered += 1;
+            return Ok(false);
+        }
+
+        if info.flag_filter != 0 && bam.flag & info.flag_filter != 0 {
+            self.nreads_filtered += 1;
+            return Ok(false);
+        }
+
+        if info.filter_readlen != -1 && bam.l_seq as i64 != info.filter_readlen {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    /// Counts a read's length and mapping quality, growing the per-cycle buffers for it; returns its length including hard clips.
+    fn update_read_lengths(&mut self, bam: &Bam<'_>, info: &Info, seq_len: usize) -> usize {
         let order = bam.order();
 
         let read_len = seq_len
@@ -662,28 +717,29 @@ impl Stats {
             self.mapping_qualities[usize::from(bam.mapq)] += 1;
         }
 
-        let mut gc_count = 0;
+        read_len
+    }
 
-        if bam.is_original() {
-            self.read_lengths[read_len] += 1;
+    /// Counts an original (non-secondary, non-supplementary) read's length and per-cycle
+    /// statistics; returns its GC count.
+    fn count_original_read(&mut self, bam: &Bam<'_>, info: &Info, read_len: usize) -> usize {
+        let order = bam.order();
 
-            if order == READ_ORDER_FIRST {
-                self.read_lengths_1st[read_len] += 1;
-            }
+        self.read_lengths[read_len] += 1;
 
-            if order == READ_ORDER_LAST {
-                self.read_lengths_2nd[read_len] += 1;
-            }
-
-            gc_count = self.collect_orig_read_stats(bam, info);
+        if order == READ_ORDER_FIRST {
+            self.read_lengths_1st[read_len] += 1;
         }
 
-        if bam.has(Flags::UNMAPPED) {
-            return Ok(());
+        if order == READ_ORDER_LAST {
+            self.read_lengths_2nd[read_len] += 1;
         }
 
-        self.count_indels(bam)?;
+        self.collect_orig_read_stats(bam, info)
+    }
 
+    /// Counts the insert size of a mapped pair's original read by orientation.
+    fn count_insert_size(&mut self, bam: &Bam<'_>, info: &Info) {
         if bam.is_paired_and_mapped() && bam.is_original() {
             let mut isize = bam.isize.wrapping_abs();
 
@@ -719,15 +775,10 @@ impl Stats {
                 self.isize.increment(isize, orientation);
             }
         }
+    }
 
-        if let Some(nm) = integer_field(bam.raw, *b"NM")? {
-            self.nmismatches = self.nmismatches.wrapping_add_signed(nm);
-        }
-
-        if bam.cigar.is_empty() {
-            bail!("FIXME: mapped read with no cigar?");
-        }
-
+    /// Counts mapped bases (within the region, if any); returns the read's length on the reference, including deletions.
+    fn count_mapped_bases(&mut self, bam: &Bam<'_>, seq_len: usize) -> i64 {
         let mut readlen = seq_len as i64;
 
         if self.regions.is_some() {
@@ -784,21 +835,11 @@ impl Stats {
             }
         }
 
-        if self.tid == bam.tid && bam.pos < self.pos {
-            self.is_sorted = false;
-        }
+        readlen
+    }
 
-        self.pos = bam.pos;
-
-        if !self.is_sorted {
-            return Ok(());
-        }
-
-        if self.tid == -1 || self.tid != bam.tid {
-            self.round_buffer_flush(-1, info)?;
-        }
-
-        // Drop pairs that can no longer overlap, to bound memory.
+    /// Drops pairs that can no longer overlap, to bound memory.
+    fn cleanup_pairs(&mut self, bam: &Bam<'_>, pairs: &mut HashMap<Vec<u8>, Pair>) {
         self.last_read_flush += 1;
 
         if self.pair_count > PAIR_MAX && self.last_read_flush > PAIR_MAX {
@@ -813,7 +854,18 @@ impl Stats {
             self.last_pair_tid = bam.tid;
             self.last_read_flush = 0;
         }
+    }
 
+    /// Adds a read to the GC-depth bins, reading the reference as needed, and counts its mismatches per cycle when there is a reference.
+    fn update_gc_depth(
+        &mut self,
+        bam: &Bam<'_>,
+        info: &Info,
+        read_len: usize,
+        readlen: i64,
+        gc_count: usize,
+        seq_len: usize,
+    ) -> anyhow::Result<()> {
         let gcd_bin_size = i64::from(info.gcd_bin_size);
 
         if info.reference.is_some() {
@@ -862,7 +914,16 @@ impl Stats {
             self.gcd[self.igcd].gc += gc_count as f32 / seq_len as f32;
         }
 
-        // Coverage distribution
+        Ok(())
+    }
+
+    /// Adds a read's aligned bases (within the regions, if any) to the coverage distribution.
+    fn update_coverage(
+        &mut self,
+        bam: &Bam<'_>,
+        info: &Info,
+        pairs: &mut HashMap<Vec<u8>, Pair>,
+    ) -> anyhow::Result<()> {
         self.round_buffer_flush(bam.pos, info)?;
 
         if self.regions.is_some() {

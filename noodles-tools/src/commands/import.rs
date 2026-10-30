@@ -157,31 +157,7 @@ struct ParseOptions {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let mut files: Vec<(Slot, String)> = Vec::new();
-    let mut single = args.single.clone();
-    let (mut read1, mut read2) = (args.read1.clone(), args.read2.clone());
-
-    match args.inputs.as_slice() {
-        [] => {}
-        [only] => single = Some(only.clone()),
-        [first, second, ..] => {
-            read1 = Some(first.clone());
-            read2 = Some(second.clone());
-        }
-    }
-
-    for (slot, path) in [
-        (Slot::Index1, &args.index1),
-        (Slot::Index2, &args.index2),
-        (Slot::Unpaired, &args.unpaired),
-        (Slot::Read1, &read1),
-        (Slot::Read2, &read2),
-        (Slot::Single, &single),
-    ] {
-        if let Some(path) = path {
-            files.push((slot, path.clone()));
-        }
-    }
+    let files = input_files(&args);
 
     if files.is_empty() {
         eprintln!("Usage: ntools import [options] [file.fastq ...]");
@@ -222,16 +198,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut writer = AlignmentWriter::create(Some(&args.output), &write_options, &header)?;
     writer.write_header_text(&header, &text)?;
 
-    let order = args.order.as_deref().map(|order| {
-        let width = (order.len() > 3 && order.as_bytes()[2] == b':')
-            .then(|| atoi(&order[3..]))
-            .filter(|&n| n != 0);
-        (tag(order), width)
-    });
+    let order = args.order.as_deref().map(parse_order);
 
     let index_tags = (tag(&args.barcode_tag), tag(&args.quality_tag));
 
     let n = readers.len();
+    let slots: Vec<Slot> = readers.iter().map(|(slot, _)| *slot).collect();
     let mut record = Vec::new();
     let mut index_bases = Vec::new();
     let mut index_qualities = Vec::new();
@@ -245,10 +217,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         index_qualities.clear();
         let mut last = Read::Record;
 
-        for i in 0..n {
-            let slot = readers[i].0;
+        for (i, (slot, reader)) in readers.iter_mut().enumerate() {
+            let slot = *slot;
 
-            last = readers[i].1.read(&options, &mut record)?;
+            last = reader.read(&options, &mut record)?;
 
             match last {
                 Read::Eof => {
@@ -271,47 +243,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 append_string_tag(&mut record, index_tags.1, &index_qualities);
             }
 
-            let mut flags = record_flags(&record);
+            set_pair_flags(&mut record, &slots, i);
 
-            match slot {
-                Slot::Read1 => {
-                    if flags & (FLAG_READ1 | FLAG_READ2) == 0 {
-                        flags |= FLAG_READ1;
-                    }
-
-                    flags |= FLAG_PAIRED;
-
-                    if i + 1 < n && readers[i + 1].0 == Slot::Read2 {
-                        flags |= FLAG_MATE_UNMAPPED;
-                    }
-                }
-                Slot::Read2 => {
-                    flags |= FLAG_PAIRED | FLAG_READ2;
-
-                    if i > 0 && readers[i - 1].0 == Slot::Read1 {
-                        flags |= FLAG_MATE_UNMAPPED;
-                    }
-                }
-                _ => {}
-            }
-
-            record[14..16].copy_from_slice(&flags.to_le_bytes());
-
-            if let Some(rg) = &rg {
-                append_string_tag(&mut record, *b"RG", rg);
-            }
-
-            if let Some((order_tag, width)) = order {
-                match width {
-                    Some(width) => {
-                        let value = format!("{read_number:0width$}");
-                        bam_raw::update_string_field(&mut record, order_tag, value.as_bytes())?;
-                    }
-                    None => update_integer_tag(&mut record, order_tag, read_number)?,
-                }
-
-                read_number += 1;
-            }
+            tag_record(&mut record, rg.as_deref(), order, &mut read_number)?;
 
             writer.write_raw(&header, &record)?;
         }
@@ -330,6 +264,103 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     if eof != n {
         bail!("[import] input files with differing number of records");
+    }
+
+    Ok(())
+}
+
+/// The input files by slot: `-s`, `-1`, `-2`, `-0`, and `--i1`/`--i2`, with positional
+/// arguments as single or paired files.
+fn input_files(args: &Args) -> Vec<(Slot, String)> {
+    let mut files: Vec<(Slot, String)> = Vec::new();
+    let mut single = args.single.clone();
+    let (mut read1, mut read2) = (args.read1.clone(), args.read2.clone());
+
+    match args.inputs.as_slice() {
+        [] => {}
+        [only] => single = Some(only.clone()),
+        [first, second, ..] => {
+            read1 = Some(first.clone());
+            read2 = Some(second.clone());
+        }
+    }
+
+    for (slot, path) in [
+        (Slot::Index1, &args.index1),
+        (Slot::Index2, &args.index2),
+        (Slot::Unpaired, &args.unpaired),
+        (Slot::Read1, &read1),
+        (Slot::Read2, &read2),
+        (Slot::Single, &single),
+    ] {
+        if let Some(path) = path {
+            files.push((slot, path.clone()));
+        }
+    }
+
+    files
+}
+
+/// `--order TAG[:WIDTH]`: the tag to number records in, and the zero-padded width of a string
+/// value (an integer without one).
+fn parse_order(order: &str) -> ([u8; 2], Option<usize>) {
+    let width = (order.len() > 3 && order.as_bytes()[2] == b':')
+        .then(|| atoi(&order[3..]))
+        .filter(|&n| n != 0);
+    (tag(order), width)
+}
+
+/// Sets the paired-end flags of the record read from input `i` (as samtools does, marking the
+/// mate unmapped when the other file of the pair is read too).
+fn set_pair_flags(record: &mut [u8], slots: &[Slot], i: usize) {
+    let mut flags = record_flags(record);
+
+    match slots[i] {
+        Slot::Read1 => {
+            if flags & (FLAG_READ1 | FLAG_READ2) == 0 {
+                flags |= FLAG_READ1;
+            }
+
+            flags |= FLAG_PAIRED;
+
+            if i + 1 < slots.len() && slots[i + 1] == Slot::Read2 {
+                flags |= FLAG_MATE_UNMAPPED;
+            }
+        }
+        Slot::Read2 => {
+            flags |= FLAG_PAIRED | FLAG_READ2;
+
+            if i > 0 && slots[i - 1] == Slot::Read1 {
+                flags |= FLAG_MATE_UNMAPPED;
+            }
+        }
+        _ => {}
+    }
+
+    record[14..16].copy_from_slice(&flags.to_le_bytes());
+}
+
+/// Adds the read group (`-r`) and record number (`--order`) tags.
+fn tag_record(
+    record: &mut Vec<u8>,
+    rg: Option<&[u8]>,
+    order: Option<([u8; 2], Option<usize>)>,
+    read_number: &mut u64,
+) -> anyhow::Result<()> {
+    if let Some(rg) = rg {
+        append_string_tag(record, *b"RG", rg);
+    }
+
+    if let Some((order_tag, width)) = order {
+        match width {
+            Some(width) => {
+                let value = format!("{:0width$}", *read_number);
+                bam_raw::update_string_field(record, order_tag, value.as_bytes())?;
+            }
+            None => update_integer_tag(record, order_tag, *read_number)?,
+        }
+
+        *read_number += 1;
     }
 
     Ok(())

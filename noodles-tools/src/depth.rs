@@ -78,35 +78,14 @@ impl DepthWindow {
     where
         F: FnMut(usize, usize, Cell) -> io::Result<()>,
     {
-        let r = record.as_dyn();
-
         // BAM records are read raw; others through the record trait.
         let raw = match record {
             Rec::Bam(b) => Some(Record::new(b.as_ref())?),
             _ => None,
         };
 
-        let (id, start) = match &raw {
-            Some(raw) => {
-                let (Ok(id), Ok(position)) = (
-                    usize::try_from(raw.reference_sequence_id()),
-                    usize::try_from(raw.position()),
-                ) else {
-                    return Ok(());
-                };
-
-                (id, position + 1)
-            }
-            None => {
-                let (Some(id), Some(start)) = (
-                    r.reference_sequence_id(header).transpose()?,
-                    r.alignment_start().transpose()?,
-                ) else {
-                    return Ok(());
-                };
-
-                (id, usize::from(start))
-            }
+        let Some((id, start)) = record_position(record, raw.as_ref(), header)? else {
+            return Ok(());
         };
 
         if self.reference_sequence_id != Some(id) {
@@ -122,7 +101,18 @@ impl DepthWindow {
 
         self.flush_before(start, emit)?;
 
-        match &raw {
+        let needs_quality = self.load_record(record, raw.as_ref())?;
+        self.count_bases(start, needs_quality);
+
+        Ok(())
+    }
+
+    /// Reads a record's CIGAR, BAM-encoded, and its qualities if counting needs them; returns
+    /// whether it does.
+    fn load_record(&mut self, record: &Rec<'_>, raw: Option<&Record<'_>>) -> io::Result<bool> {
+        let r = record.as_dyn();
+
+        match raw {
             Some(raw) => raw.read_cigar(&mut self.ops)?,
             None => {
                 self.ops.clear();
@@ -136,14 +126,7 @@ impl DepthWindow {
             }
         }
 
-        let CountOptions {
-            min_base_quality,
-            include_deletions,
-            track_quality,
-            include_skips,
-        } = self.options;
-
-        let needs_quality = min_base_quality > 0 || track_quality;
+        let needs_quality = self.options.min_base_quality > 0 || self.options.track_quality;
 
         self.quality_scores.clear();
 
@@ -160,6 +143,19 @@ impl DepthWindow {
                 }
             }
         }
+
+        Ok(needs_quality)
+    }
+
+    /// Counts the bases of the record in [`Self::ops`] and [`Self::quality_scores`], which
+    /// starts at the 1-based `start`.
+    fn count_bases(&mut self, start: usize, needs_quality: bool) {
+        let CountOptions {
+            min_base_quality,
+            include_deletions,
+            include_skips,
+            ..
+        } = self.options;
 
         // Size the window once for the record's whole reference span.
         let span: usize = self
@@ -249,8 +245,6 @@ impl DepthWindow {
 
         self.ops = ops;
         self.quality_scores = quality_scores;
-
-        Ok(())
     }
 
     fn flush_before<F>(&mut self, position: usize, emit: &mut F) -> io::Result<()>
@@ -288,6 +282,41 @@ impl DepthWindow {
         self.reference_sequence_id = None;
         Ok(())
     }
+}
+
+/// A record's reference sequence ID and 1-based start, or `None` if it is unplaced; `raw` is
+/// the record's raw view if it is BAM.
+fn record_position(
+    record: &Rec<'_>,
+    raw: Option<&Record<'_>>,
+    header: &sam::Header,
+) -> io::Result<Option<(usize, usize)>> {
+    let r = record.as_dyn();
+
+    let position = match raw {
+        Some(raw) => {
+            let (Ok(id), Ok(position)) = (
+                usize::try_from(raw.reference_sequence_id()),
+                usize::try_from(raw.position()),
+            ) else {
+                return Ok(None);
+            };
+
+            (id, position + 1)
+        }
+        None => {
+            let (Some(id), Some(start)) = (
+                r.reference_sequence_id(header).transpose()?,
+                r.alignment_start().transpose()?,
+            ) else {
+                return Ok(None);
+            };
+
+            (id, usize::from(start))
+        }
+    };
+
+    Ok(Some(position))
 }
 
 /// The BAM code of a CIGAR operation.

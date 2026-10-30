@@ -145,6 +145,20 @@ pub(super) fn write_sample(
         line.extend_from_slice(qual);
     }
 
+    push_extra_columns(line, pileup, options, names);
+    push_tag_columns(line, pileup, options);
+
+    Ok(())
+}
+
+/// The `--output-*` columns: one per requested field, with the field of each read whose base is
+/// shown.
+fn push_extra_columns(
+    line: &mut Vec<u8>,
+    pileup: &Pileup,
+    options: &OutputOptions,
+    names: &[Vec<u8>],
+) {
     let mut flag = if options.flags == 0 {
         PRINT_LAST
     } else {
@@ -156,7 +170,7 @@ pub(super) fn write_sample(
             line.push(b'\t');
             let mut n = 0;
 
-            for entry in &pileup.entries()[..n_entries] {
+            for entry in pileup.entries() {
                 let read = pileup.read(entry);
 
                 if base_quality(read, entry) < options.min_bq {
@@ -168,44 +182,7 @@ pub(super) fn write_sample(
                 }
 
                 n += 1;
-
-                match flag {
-                    PRINT_MAPQ_CHAR => {
-                        line.push((read.mapping_quality() as u32 + 33).min(126) as u8)
-                    }
-                    PRINT_QPOS => push_int(line, entry.qpos + 1),
-                    PRINT_QPOS5 => {
-                        let pos5 = if read.is_reverse_complemented() {
-                            read.sequence_len() as i64 - entry.qpos + i64::from(entry.is_del)
-                        } else {
-                            entry.qpos + 1
-                        };
-                        push_int(line, pos5);
-                    }
-                    PRINT_QNAME => line.extend_from_slice(read.name()),
-                    PRINT_FLAG => push_int(line, i64::from(read.flags())),
-                    PRINT_RNAME => {
-                        if read.reference_sequence_id() >= 0 {
-                            line.extend_from_slice(&names[read.reference_sequence_id() as usize]);
-                        } else {
-                            line.push(b'*');
-                        }
-                    }
-                    PRINT_POS => push_int(line, read.position() + 1),
-                    PRINT_MAPQ => push_int(line, i64::from(read.mapping_quality())),
-                    PRINT_RNEXT => {
-                        if read.mate_reference_sequence_id() >= 0 {
-                            line.extend_from_slice(
-                                &names[read.mate_reference_sequence_id() as usize],
-                            );
-                        } else {
-                            line.push(b'*');
-                        }
-                    }
-                    PRINT_PNEXT => push_int(line, read.mate_position() + 1),
-                    PRINT_RLEN => push_int(line, read.sequence_len() as i64),
-                    _ => {}
-                }
+                push_read_field(line, flag, read, entry, names);
             }
 
             if n == 0 {
@@ -215,12 +192,52 @@ pub(super) fn write_sample(
 
         flag <<= 1;
     }
+}
 
+/// One read's value for an `--output-*` field.
+fn push_read_field(line: &mut Vec<u8>, flag: u32, read: &Read, entry: &Entry, names: &[Vec<u8>]) {
+    match flag {
+        PRINT_MAPQ_CHAR => line.push((read.mapping_quality() as u32 + 33).min(126) as u8),
+        PRINT_QPOS => push_int(line, entry.qpos + 1),
+        PRINT_QPOS5 => {
+            let pos5 = if read.is_reverse_complemented() {
+                read.sequence_len() as i64 - entry.qpos + i64::from(entry.is_del)
+            } else {
+                entry.qpos + 1
+            };
+            push_int(line, pos5);
+        }
+        PRINT_QNAME => line.extend_from_slice(read.name()),
+        PRINT_FLAG => push_int(line, i64::from(read.flags())),
+        PRINT_RNAME => {
+            if read.reference_sequence_id() >= 0 {
+                line.extend_from_slice(&names[read.reference_sequence_id() as usize]);
+            } else {
+                line.push(b'*');
+            }
+        }
+        PRINT_POS => push_int(line, read.position() + 1),
+        PRINT_MAPQ => push_int(line, i64::from(read.mapping_quality())),
+        PRINT_RNEXT => {
+            if read.mate_reference_sequence_id() >= 0 {
+                line.extend_from_slice(&names[read.mate_reference_sequence_id() as usize]);
+            } else {
+                line.push(b'*');
+            }
+        }
+        PRINT_PNEXT => push_int(line, read.mate_position() + 1),
+        PRINT_RLEN => push_int(line, read.sequence_len() as i64),
+        _ => {}
+    }
+}
+
+/// The `--output-extra` tag columns.
+fn push_tag_columns(line: &mut Vec<u8>, pileup: &Pileup, options: &OutputOptions) {
     for &tag in &options.aux_tags {
         line.push(b'\t');
         let mut n = 0;
 
-        for entry in &pileup.entries()[..n_entries] {
+        for entry in pileup.entries() {
             let read = pileup.read(entry);
 
             if base_quality(read, entry) < options.min_bq {
@@ -239,8 +256,6 @@ pub(super) fn write_sample(
             line.push(b'*');
         }
     }
-
-    Ok(())
 }
 
 /// An --output-extra tag value, as samtools prints it.

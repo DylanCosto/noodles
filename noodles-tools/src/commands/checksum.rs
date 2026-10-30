@@ -338,23 +338,7 @@ struct Report {
 }
 
 fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow::Result<Report> {
-    // Tag positions in the requested list (`tag_keep`), checked as samtools does.
-    let mut tag_index: HashMap<[u8; 2], usize> = HashMap::new();
-
-    for (i, tag) in options.tags.iter().enumerate() {
-        if tag[0] == b'*' {
-            continue;
-        }
-
-        if !(is_tag_char(tag[0]) && is_tag_char(tag[1])) {
-            bail!(
-                "[checksum] Illegal tag ID '{}'",
-                String::from_utf8_lossy(&tag[..2])
-            );
-        }
-
-        tag_index.insert([tag[0], tag[1]], i + 1);
-    }
+    let tag_index = tag_index(options)?;
 
     let (mut reader, _) = AlignmentReader::open(src, read_options)
         .with_context(|| format!("[checksum] Cannot open input file \"{src}\""))?;
@@ -369,9 +353,7 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
     let mut remaining = options.records;
     let mut encoder = RawEncoder::new();
     let mut record = Vec::new();
-    let mut seq = Vec::new();
-    let mut qual = Vec::new();
-    let mut aux = Vec::new();
+    let mut buffers = Buffers::default();
     let selection = if options.tag_str.starts_with('*') {
         TagSelection::AllExceptListed
     } else {
@@ -397,65 +379,7 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
 
         let r = Record::new(&record)?;
         let flags = r.flags();
-        let masked = (i32::from(flags) & options.flag_mask) as u8;
-
-        // The strand to undo: reverse-strand reads are reverse complemented unless `-c`.
-        let strand = if options.rev_comp {
-            Strand::of_flags(flags)
-        } else {
-            Strand::Forward
-        };
-        fill_seq_qual(&r, strand, &mut seq, &mut qual);
-
-        let crc = crc32(0, &[masked]);
-        let crc_seq = crc32(crc, &seq);
-
-        // samtools includes the name's NUL terminator.
-        let name = &r.as_bytes()[field::NAME..=field::NAME + r.name().len()];
-        let crc = crc32(0, name);
-        let crc = crc32(crc, &[masked]);
-        let crc_name = crc32(crc, &seq);
-
-        let crc_qual = crc32(crc_seq, &qual);
-
-        let read_group = select_tags(
-            r.data(),
-            selection,
-            &tag_index,
-            options.tags.len(),
-            &mut aux,
-        )?;
-        let crc_aux = crc32(crc_seq, &aux);
-
-        let mut crcs = Crcs {
-            seq: crc_seq,
-            name: crc_name,
-            qual: crc_qual,
-            aux: crc_aux,
-            pos: 0,
-            cigar: 0,
-            mate: 0,
-        };
-
-        if options.check_pos {
-            let mut buf = Vec::with_capacity(12);
-            buf.extend_from_slice(&r.reference_sequence_id().to_le_bytes());
-            buf.extend_from_slice(&i64::from(r.position()).to_le_bytes());
-            crcs.pos = crc32(crc_seq, &buf);
-        }
-
-        if options.check_mate {
-            let mut buf = Vec::with_capacity(20);
-            buf.extend_from_slice(&r.mate_reference_sequence_id().to_le_bytes());
-            buf.extend_from_slice(&i64::from(r.mate_position()).to_le_bytes());
-            buf.extend_from_slice(&i64::from(r.template_length()).to_le_bytes());
-            crcs.mate = crc32(crc_seq, &buf);
-        }
-
-        if options.check_cigar {
-            let crc = crc32(crc_seq, &u32::from(r.mapping_quality()).to_le_bytes());
-            crcs.cigar = crc32(crc, r.raw_cigar());
-        }
+        let (crcs, read_group) = read_crcs(&r, options, selection, &tag_index, &mut buffers)?;
 
         let qc = if flags & FLAG_QC_FAIL != 0 {
             Qc::Fail
@@ -463,21 +387,7 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
             Qc::Pass
         };
 
-        let count = match read_group {
-            Some(read_group) => {
-                let sums = report.read_groups.entry(read_group).or_default();
-                let count = sums.count[0];
-                sums.update(qc, &crcs, options, count);
-                count
-            }
-            None => {
-                let count = report.no_read_group.count[0];
-                report.no_read_group.update(qc, &crcs, options, count);
-                count
-            }
-        };
-
-        report.all.update(qc, &crcs, options, count);
+        report.add(qc, read_group, &crcs, options);
 
         if remaining != 0 {
             remaining -= 1;
@@ -491,6 +401,129 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
     })?;
 
     Ok(report)
+}
+
+/// The tag positions in the requested list (`tag_keep`), checked as samtools does.
+fn tag_index(options: &Options) -> anyhow::Result<HashMap<[u8; 2], usize>> {
+    let mut tag_index: HashMap<[u8; 2], usize> = HashMap::new();
+
+    for (i, tag) in options.tags.iter().enumerate() {
+        if tag[0] == b'*' {
+            continue;
+        }
+
+        if !(is_tag_char(tag[0]) && is_tag_char(tag[1])) {
+            bail!(
+                "[checksum] Illegal tag ID '{}'",
+                String::from_utf8_lossy(&tag[..2])
+            );
+        }
+
+        tag_index.insert([tag[0], tag[1]], i + 1);
+    }
+
+    Ok(tag_index)
+}
+
+/// Scratch buffers for [`read_crcs`].
+#[derive(Default)]
+struct Buffers {
+    seq: Vec<u8>,
+    qual: Vec<u8>,
+    aux: Vec<u8>,
+}
+
+/// One read's checksums, and its read group (the last `RG:Z` value among the selected tags).
+fn read_crcs(
+    r: &Record<'_>,
+    options: &Options,
+    selection: TagSelection,
+    tag_index: &HashMap<[u8; 2], usize>,
+    buffers: &mut Buffers,
+) -> anyhow::Result<(Crcs, Option<Vec<u8>>)> {
+    let flags = r.flags();
+    let masked = (i32::from(flags) & options.flag_mask) as u8;
+
+    // The strand to undo: reverse-strand reads are reverse complemented unless `-c`.
+    let strand = if options.rev_comp {
+        Strand::of_flags(flags)
+    } else {
+        Strand::Forward
+    };
+    fill_seq_qual(r, strand, &mut buffers.seq, &mut buffers.qual);
+
+    let crc = crc32(0, &[masked]);
+    let crc_seq = crc32(crc, &buffers.seq);
+
+    // samtools includes the name's NUL terminator.
+    let name = &r.as_bytes()[field::NAME..=field::NAME + r.name().len()];
+    let crc = crc32(0, name);
+    let crc = crc32(crc, &[masked]);
+    let crc_name = crc32(crc, &buffers.seq);
+
+    let crc_qual = crc32(crc_seq, &buffers.qual);
+
+    let read_group = select_tags(
+        r.data(),
+        selection,
+        tag_index,
+        options.tags.len(),
+        &mut buffers.aux,
+    )?;
+    let crc_aux = crc32(crc_seq, &buffers.aux);
+
+    let mut crcs = Crcs {
+        seq: crc_seq,
+        name: crc_name,
+        qual: crc_qual,
+        aux: crc_aux,
+        pos: 0,
+        cigar: 0,
+        mate: 0,
+    };
+
+    if options.check_pos {
+        let mut buf = Vec::with_capacity(12);
+        buf.extend_from_slice(&r.reference_sequence_id().to_le_bytes());
+        buf.extend_from_slice(&i64::from(r.position()).to_le_bytes());
+        crcs.pos = crc32(crc_seq, &buf);
+    }
+
+    if options.check_mate {
+        let mut buf = Vec::with_capacity(20);
+        buf.extend_from_slice(&r.mate_reference_sequence_id().to_le_bytes());
+        buf.extend_from_slice(&i64::from(r.mate_position()).to_le_bytes());
+        buf.extend_from_slice(&i64::from(r.template_length()).to_le_bytes());
+        crcs.mate = crc32(crc_seq, &buf);
+    }
+
+    if options.check_cigar {
+        let crc = crc32(crc_seq, &u32::from(r.mapping_quality()).to_le_bytes());
+        crcs.cigar = crc32(crc, r.raw_cigar());
+    }
+
+    Ok((crcs, read_group))
+}
+
+impl Report {
+    /// Adds a read's checksums overall, and to its read group or the ungrouped sums.
+    fn add(&mut self, qc: Qc, read_group: Option<Vec<u8>>, crcs: &Crcs, options: &Options) {
+        let count = match read_group {
+            Some(read_group) => {
+                let sums = self.read_groups.entry(read_group).or_default();
+                let count = sums.count[0];
+                sums.update(qc, crcs, options, count);
+                count
+            }
+            None => {
+                let count = self.no_read_group.count[0];
+                self.no_read_group.update(qc, crcs, options, count);
+                count
+            }
+        };
+
+        self.all.update(qc, crcs, options, count);
+    }
 }
 
 /// `fill_seq_qual`: the bases (reverse complemented if asked) and qualities + 33.
@@ -916,16 +949,6 @@ fn parse_report(
         mate: 1,
     };
 
-    let set_tags = |tag_str: &mut Option<String>, tags: &str| -> anyhow::Result<()> {
-        match tag_str {
-            None => *tag_str = Some(tags.to_string()),
-            Some(t) if t != tags => bail!("Aux tag mismatch, {t} - {tags}"),
-            Some(_) => {}
-        }
-
-        Ok(())
-    };
-
     for line in BufReader::new(file).lines() {
         let line = line?;
 
@@ -953,31 +976,7 @@ fn parse_report(
 
             have_header = true;
 
-            for token in line[2..].split_ascii_whitespace() {
-                columns.push(match token {
-                    "Group" => Column::Group,
-                    "QC" => Column::Qc,
-                    "count" => Column::Count,
-                    "flag+seq" => Column::Seq,
-                    "+name" => Column::Name,
-                    "+qual" => Column::Qual,
-                    "+aux" => Column::Aux,
-                    "+chr/pos" => {
-                        options.check_pos = true;
-                        Column::Pos
-                    }
-                    "+cigar" => {
-                        options.check_cigar = true;
-                        Column::Cigar
-                    }
-                    "+mate" => {
-                        options.check_mate = true;
-                        Column::Mate
-                    }
-                    "combined" => Column::Combined,
-                    t => bail!("Unrecognised header token '{t}'"),
-                });
-            }
+            columns = samtools_columns(&line, options)?;
 
             continue;
         }
@@ -1010,25 +1009,7 @@ fn parse_report(
             have_header = true;
             bambam = true;
 
-            for token in line.split_ascii_whitespace() {
-                columns.push(match token {
-                    "###" => Column::Group,
-                    "set" => Column::Qc,
-                    "count" => Column::Count,
-                    "b_seq" => Column::Seq,
-                    "name_b_seq" => Column::Name,
-                    "b_seq_qual" => Column::Qual,
-                    t if t.starts_with("b_seq_tags(") => {
-                        let tags = &t[11..];
-                        let tags = tags
-                            .strip_suffix(')')
-                            .unwrap_or(&tags[..tags.len().saturating_sub(1)]);
-                        set_tags(tag_str, tags)?;
-                        Column::Aux
-                    }
-                    t => bail!("Unrecognised header token '{t}'"),
-                });
-            }
+            columns = bambam_columns(&line, tag_str)?;
 
             continue;
         }
@@ -1041,60 +1022,146 @@ fn parse_report(
             continue;
         }
 
-        let mut fields: Vec<&str> = Vec::new();
-
-        if bambam && line.starts_with('\t') {
-            fields.push("");
-        }
-
-        fields.extend(line.split_ascii_whitespace().take(11 - fields.len()));
-
-        let min_fields = if bambam { 7 } else { 8 };
-
-        if fields.len() < min_fields || fields.len() != columns.len() {
-            bail!("Incorrect number of columns in line: {line}");
-        }
-
-        let mut qc = 0;
-        let mut count = 0;
-        let hex = |s: &str| u32::from_str_radix(s, 16).unwrap_or(0);
-
-        for (&column, &field) in columns.iter().zip(&fields) {
-            match column {
-                Column::Qc => {
-                    qc = match field {
-                        "all" => 0,
-                        "pass" => 1,
-                        "fail" => 2,
-                        _ => bail!("invalid QC column: {field}"),
-                    };
-                }
-                Column::Count => count = field.parse().unwrap_or(0),
-                Column::Seq => crcs.seq = hex(field),
-                Column::Name => crcs.name = hex(field),
-                Column::Qual => crcs.qual = hex(field),
-                Column::Aux => crcs.aux = hex(field),
-                Column::Pos => crcs.pos = hex(field),
-                Column::Cigar => crcs.cigar = hex(field),
-                Column::Mate => crcs.mate = hex(field),
-                Column::Group | Column::Combined => {}
-            }
-        }
-
-        let group = fields[0];
-
-        if group == "-" || group.is_empty() {
-            report.no_read_group.update_row(qc, &crcs, 0, count);
-        } else {
-            report
-                .read_groups
-                .entry(group.as_bytes().to_vec())
-                .or_default()
-                .update_row(qc, &crcs, 0, count);
-        }
-
-        report.all.update_row(qc, &crcs, 0, count);
+        add_row(report, &line, &columns, bambam, &mut crcs)?;
     }
+
+    Ok(())
+}
+
+/// The columns of a samtools report, from its `# Group` header line, noting which optional
+/// checksums it has.
+fn samtools_columns(line: &str, options: &mut Options) -> anyhow::Result<Vec<Column>> {
+    let mut columns = Vec::new();
+
+    for token in line[2..].split_ascii_whitespace() {
+        columns.push(match token {
+            "Group" => Column::Group,
+            "QC" => Column::Qc,
+            "count" => Column::Count,
+            "flag+seq" => Column::Seq,
+            "+name" => Column::Name,
+            "+qual" => Column::Qual,
+            "+aux" => Column::Aux,
+            "+chr/pos" => {
+                options.check_pos = true;
+                Column::Pos
+            }
+            "+cigar" => {
+                options.check_cigar = true;
+                Column::Cigar
+            }
+            "+mate" => {
+                options.check_mate = true;
+                Column::Mate
+            }
+            "combined" => Column::Combined,
+            t => bail!("Unrecognised header token '{t}'"),
+        });
+    }
+
+    Ok(columns)
+}
+
+/// The columns of a biobambam `bamseqchksum` report, from its `###` header line.
+fn bambam_columns(line: &str, tag_str: &mut Option<String>) -> anyhow::Result<Vec<Column>> {
+    let mut columns = Vec::new();
+
+    for token in line.split_ascii_whitespace() {
+        columns.push(match token {
+            "###" => Column::Group,
+            "set" => Column::Qc,
+            "count" => Column::Count,
+            "b_seq" => Column::Seq,
+            "name_b_seq" => Column::Name,
+            "b_seq_qual" => Column::Qual,
+            t if t.starts_with("b_seq_tags(") => {
+                let tags = &t[11..];
+                let tags = tags
+                    .strip_suffix(')')
+                    .unwrap_or(&tags[..tags.len().saturating_sub(1)]);
+                set_tags(tag_str, tags)?;
+                Column::Aux
+            }
+            t => bail!("Unrecognised header token '{t}'"),
+        });
+    }
+
+    Ok(columns)
+}
+
+/// Records the aux tags of a report, which must match those of the others.
+fn set_tags(tag_str: &mut Option<String>, tags: &str) -> anyhow::Result<()> {
+    match tag_str {
+        None => *tag_str = Some(tags.to_string()),
+        Some(t) if t != tags => bail!("Aux tag mismatch, {t} - {tags}"),
+        Some(_) => {}
+    }
+
+    Ok(())
+}
+
+/// Adds one data line of a report to `report`. `crcs` keeps the values of columns the report
+/// lacks.
+fn add_row(
+    report: &mut Report,
+    line: &str,
+    columns: &[Column],
+    bambam: bool,
+    crcs: &mut Crcs,
+) -> anyhow::Result<()> {
+    let mut fields: Vec<&str> = Vec::new();
+
+    if bambam && line.starts_with('\t') {
+        fields.push("");
+    }
+
+    fields.extend(line.split_ascii_whitespace().take(11 - fields.len()));
+
+    let min_fields = if bambam { 7 } else { 8 };
+
+    if fields.len() < min_fields || fields.len() != columns.len() {
+        bail!("Incorrect number of columns in line: {line}");
+    }
+
+    let mut qc = 0;
+    let mut count = 0;
+    let hex = |s: &str| u32::from_str_radix(s, 16).unwrap_or(0);
+
+    for (&column, &field) in columns.iter().zip(&fields) {
+        match column {
+            Column::Qc => {
+                qc = match field {
+                    "all" => 0,
+                    "pass" => 1,
+                    "fail" => 2,
+                    _ => bail!("invalid QC column: {field}"),
+                };
+            }
+            Column::Count => count = field.parse().unwrap_or(0),
+            Column::Seq => crcs.seq = hex(field),
+            Column::Name => crcs.name = hex(field),
+            Column::Qual => crcs.qual = hex(field),
+            Column::Aux => crcs.aux = hex(field),
+            Column::Pos => crcs.pos = hex(field),
+            Column::Cigar => crcs.cigar = hex(field),
+            Column::Mate => crcs.mate = hex(field),
+            Column::Group | Column::Combined => {}
+        }
+    }
+
+    let group = fields[0];
+
+    if group == "-" || group.is_empty() {
+        report.no_read_group.update_row(qc, crcs, 0, count);
+    } else {
+        report
+            .read_groups
+            .entry(group.as_bytes().to_vec())
+            .or_default()
+            .update_row(qc, crcs, 0, count);
+    }
+
+    report.all.update_row(qc, crcs, 0, count);
 
     Ok(())
 }
