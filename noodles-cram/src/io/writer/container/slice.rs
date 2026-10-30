@@ -3,6 +3,7 @@ pub mod records;
 
 use std::{collections::HashMap, io};
 
+use noodles_core::Position;
 use noodles_fasta as fasta;
 use noodles_sam as sam;
 
@@ -53,7 +54,7 @@ pub(super) fn build_slice(
     let mut block_content_ids = vec![core_data_block.content_id];
     block_content_ids.extend(external_data_blocks.iter().map(|block| block.content_id));
 
-    let reference_md5 = calculate_reference_sequence_md5(
+    let (reference_sequence_context, reference_md5) = calculate_reference_sequence_md5(
         &ctx.reference_sequence_repository,
         header,
         reference_sequence_context,
@@ -111,7 +112,7 @@ fn set_mates(records: &mut [Record]) {
         let record = &mut records[i];
         let flags = record.bam_flags;
 
-        if flags.is_segmented() && !flags.is_secondary() {
+        if flags.is_segmented() && !flags.is_secondary() && !flags.is_supplementary() {
             let name = record.name.as_ref().map(|name| name.to_owned());
 
             if let Some(j) = indices.insert(name, i) {
@@ -121,7 +122,11 @@ fn set_mates(records: &mut [Record]) {
                 let record = &mut left[i];
                 let mate = &mut right[j - mid];
 
-                set_downstream_mate(i, record, j, mate);
+                if decodes_as_attached(record, mate) {
+                    set_downstream_mate(i, record, j, mate);
+                } else {
+                    set_detached(record);
+                }
             } else {
                 set_detached(record);
             }
@@ -134,6 +139,77 @@ fn set_mates(records: &mut [Record]) {
         }
 
         i -= 1;
+    }
+}
+
+/// Returns whether `record` and its downstream `mate` decode to their own mate fields when they
+/// are attached (not detached), as HTSlib decodes them (`cram_decode_slice_xref`).
+///
+/// Decoders take each record's mate reference sequence, position, and mate flags from the other
+/// record, and compute template lengths, so a pair whose stored values differ from those must be
+/// detached. Like HTSlib's encoder (`process_one_read`), pairs are also kept detached when they
+/// are on different reference sequences, are both first or both last segments, or have a
+/// template length of 0 (which includes pairs with an unmapped segment). Only pairs are attached:
+/// a record that already has a downstream mate is not.
+fn decodes_as_attached(record: &Record, mate: &Record) -> bool {
+    let (flags, mate_flags) = (record.bam_flags, mate.bam_flags);
+
+    let points_to = |a: &Record, b: &Record| {
+        a.mate_reference_sequence_id == b.reference_sequence_id
+            && a.mate_alignment_start == b.alignment_start
+            && a.bam_flags.is_mate_unmapped() == b.bam_flags.is_unmapped()
+            && a.bam_flags.is_mate_reverse_complemented() == b.bam_flags.is_reverse_complemented()
+    };
+
+    !mate.cram_flags.contains(Flags::MATE_IS_DOWNSTREAM)
+        && record.reference_sequence_id == mate.reference_sequence_id
+        && record.template_length != 0
+        && !(flags.is_first_segment() && mate_flags.is_first_segment())
+        && !(flags.is_last_segment() && mate_flags.is_last_segment())
+        && points_to(record, mate)
+        && points_to(mate, record)
+        && decoded_template_lengths(record, mate) == (record.template_length, mate.template_length)
+}
+
+/// Returns the template lengths that HTSlib decodes for an attached pair.
+fn decoded_template_lengths(record: &Record, mate: &Record) -> (i32, i32) {
+    fn extent(record: &Record) -> (usize, usize) {
+        let start = record.alignment_start.map(usize::from).unwrap_or_default();
+
+        if record.bam_flags.is_unmapped() {
+            (start, start)
+        } else {
+            let end = (start + record.alignment_span()).saturating_sub(1);
+            (start, end.max(start))
+        }
+    }
+
+    if record.bam_flags.is_unmapped()
+        || mate.bam_flags.is_unmapped()
+        || record.reference_sequence_id.is_none()
+        || record.reference_sequence_id != mate.reference_sequence_id
+    {
+        return (0, 0);
+    }
+
+    let (start, end) = extent(record);
+    let (mate_start, mate_end) = extent(mate);
+
+    let (left, right) = (start.min(mate_start), end.max(mate_end));
+    let left_count = usize::from(start == left) + usize::from(mate_start == left);
+    let right_count = usize::from(end == right) + usize::from(mate_end == right);
+
+    let Ok(len) = i32::try_from(right - left + 1) else {
+        return (0, 0);
+    };
+
+    let is_leftmost = start == left && (end < right || left_count <= 1);
+    let is_tied = start == left && end == right && left_count > 1 && right_count > 1;
+
+    if is_leftmost || (is_tied && record.bam_flags.is_first_segment()) {
+        (len, -len)
+    } else {
+        (-len, len)
     }
 }
 
@@ -273,13 +349,18 @@ fn encode_block(
     }
 }
 
+/// Returns the slice's reference sequence context, clipped to the end of the reference sequence
+/// as in HTSlib, and the MD5 checksum of the reference bases it covers.
+///
+/// Records can overhang the end of the reference sequence. A slice that starts past the end has
+/// no bases to checksum, so its checksum is left unset.
 fn calculate_reference_sequence_md5(
     reference_sequence_repository: &fasta::Repository,
     header: &sam::Header,
     reference_sequence_context: ReferenceSequenceContext,
-) -> io::Result<Option<[u8; 16]>> {
+) -> io::Result<(ReferenceSequenceContext, Option<[u8; 16]>)> {
     let ReferenceSequenceContext::Some(context) = reference_sequence_context else {
-        return Ok(None);
+        return Ok((reference_sequence_context, None));
     };
 
     let reference_sequence_name = header
@@ -290,10 +371,110 @@ fn calculate_reference_sequence_md5(
 
     let reference_sequence = reference_sequence_repository
         .get(reference_sequence_name)
-        .expect("missing reference sequence")?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("missing reference sequence: {reference_sequence_name}"),
+            )
+        })??;
 
-    let interval = context.alignment_start()..=context.alignment_end();
-    let sequence = &reference_sequence[interval];
+    let start = context.alignment_start();
 
-    Ok(Some(calculate_normalized_sequence_digest(sequence)))
+    let Some(reference_end) = Position::new(reference_sequence.len()).filter(|end| *end >= start)
+    else {
+        return Ok((reference_sequence_context, None));
+    };
+
+    let end = context.alignment_end().min(reference_end);
+    let sequence = &reference_sequence[start..=end];
+
+    Ok((
+        ReferenceSequenceContext::some(context.reference_sequence_id(), start, end),
+        Some(calculate_normalized_sequence_digest(sequence)),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use noodles_sam::alignment::record::Flags as BamFlags;
+
+    use super::*;
+
+    fn segment(flags: BamFlags, start: usize, mate_start: usize, template_length: i32) -> Record {
+        Record {
+            bam_flags: BamFlags::SEGMENTED | flags,
+            reference_sequence_id: Some(0),
+            read_length: 10,
+            alignment_start: Position::new(start),
+            name: Some("r".into()),
+            mate_reference_sequence_id: Some(0),
+            mate_alignment_start: Position::new(mate_start),
+            template_length,
+            ..Default::default()
+        }
+    }
+
+    fn is_attached(mut records: [Record; 2]) -> bool {
+        set_mates(&mut records);
+        records[0].cram_flags.contains(Flags::MATE_IS_DOWNSTREAM)
+            && !records[1].cram_flags.contains(Flags::IS_DETACHED)
+    }
+
+    #[test]
+    fn test_set_mates() {
+        let r1 = BamFlags::FIRST_SEGMENT;
+        let r2 = BamFlags::LAST_SEGMENT;
+
+        // A consistent pair is attached.
+        assert!(is_attached([
+            segment(r1, 100, 150, 60),
+            segment(r2, 150, 100, -60),
+        ]));
+
+        // Template lengths that decoders would not reproduce.
+        assert!(!is_attached([
+            segment(r1, 100, 150, 999),
+            segment(r2, 150, 100, 5),
+        ]));
+        assert!(!is_attached([
+            segment(r1, 100, 150, 0),
+            segment(r2, 150, 100, 0)
+        ]));
+
+        // Identical extents: decoders give the first segment the positive length.
+        assert!(is_attached([
+            segment(r2, 100, 100, -10),
+            segment(r1, 100, 100, 10),
+        ]));
+        assert!(!is_attached([
+            segment(r2, 100, 100, 10),
+            segment(r1, 100, 100, -10),
+        ]));
+
+        // A mate position that is not the mate's.
+        assert!(!is_attached([
+            segment(r1, 100, 105, 60),
+            segment(r2, 150, 100, -60),
+        ]));
+
+        // Mates on different reference sequences.
+        let mut mate = segment(r2, 150, 100, 0);
+        mate.reference_sequence_id = Some(1);
+        let mut record = segment(r1, 100, 150, 0);
+        record.mate_reference_sequence_id = Some(1);
+        assert!(!is_attached([record, mate]));
+
+        // An unmapped segment (template length 0), as HTSlib keeps it.
+        let mut record = segment(r1 | BamFlags::MATE_UNMAPPED, 100, 100, 0);
+        record.mate_alignment_start = Position::new(100);
+        let mut mate = segment(r2 | BamFlags::UNMAPPED, 100, 100, 0);
+        mate.read_length = 0;
+        assert!(!is_attached([record, mate]));
+
+        // Supplementary alignments.
+        assert!(!is_attached([
+            segment(r1 | BamFlags::SUPPLEMENTARY, 100, 150, 60),
+            segment(r2, 150, 100, -60),
+        ]));
+    }
 }

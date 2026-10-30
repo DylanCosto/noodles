@@ -226,6 +226,10 @@ Intentional differences:
   to read its header.
 - Reading a CRAM detached record with the mate-reverse flag but not the paired flag (flag 52),
   ntools keeps the flags as stored; HTSlib adds the paired flag (53).
+- Writing CRAM, ntools attaches a pair as mates (leaving their mate fields and template lengths
+  to the decoder) only when HTSlib's decoder reproduces them; HTSlib's encoder also attaches
+  pairs that start at the same position with the second segment first and the shorter, whose
+  template length signs its decoder then swaps.
 
 ## Performance
 

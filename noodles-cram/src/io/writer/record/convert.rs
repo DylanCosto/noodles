@@ -1,6 +1,5 @@
 use std::io;
 
-use bstr::BStr;
 use noodles_core::Position;
 use noodles_fasta as fasta;
 use noodles_sam::{
@@ -33,18 +32,24 @@ impl Record {
             Sequence::from(record.sequence().iter().collect::<Vec<_>>())
         };
 
-        let quality_scores = if record.quality_scores().is_empty() {
-            QualityScores::default()
-        } else {
-            if bam_flags.is_unmapped() {
-                cram_flags.insert(Flags::QUALITY_SCORES_ARE_STORED_AS_ARRAY);
-            }
-
-            record.quality_scores().iter().collect::<io::Result<_>>()?
-        };
-
         let reference_sequence_id = record.reference_sequence_id(header).transpose()?;
         let alignment_start = record.alignment_start().transpose()?;
+
+        // As in HTSlib, a mapped record without a sequence (`*`) has the read length of its
+        // CIGAR, so decoders can rebuild the CIGAR from the features.
+        let read_length = if sequence.is_empty() && !bam_flags.is_unmapped() {
+            record.cigar().read_length()?
+        } else {
+            sequence.len()
+        };
+
+        // Quality scores are stored as an array of the read length; missing ones (`*`) are
+        // stored as 0xff, as in HTSlib.
+        let quality_scores = if record.quality_scores().is_empty() {
+            QualityScores::from(vec![0xff; read_length])
+        } else {
+            record.quality_scores().iter().collect::<io::Result<_>>()?
+        };
 
         let features = if let (Some(id), Some(start)) = (reference_sequence_id, alignment_start) {
             let (reference_sequence_name, _) = header
@@ -71,17 +76,13 @@ impl Record {
         };
 
         let data = record.data();
-        let (data_buf, read_group_name) = get_filtered_data(data.as_ref())?;
-
-        let read_group_id = read_group_name
-            .map(|name| get_read_group_id(header, name))
-            .transpose()?;
+        let (data_buf, read_group_id) = get_filtered_data(header, data.as_ref())?;
 
         Ok(Self {
             bam_flags,
             cram_flags,
             reference_sequence_id,
-            read_length: record.sequence().len(),
+            read_length,
             alignment_start,
             read_group_id,
             name: record.name().map(|s| s.into()),
@@ -99,13 +100,6 @@ impl Record {
     }
 }
 
-fn get_read_group_id(header: &sam::Header, read_group_name: &BStr) -> io::Result<usize> {
-    header
-        .read_groups()
-        .get_index_of(read_group_name)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid read group name"))
-}
-
 fn cigar_to_features(
     cigar: &dyn sam::alignment::record::Cigar,
     reference_sequence: &fasta::record::Sequence,
@@ -116,239 +110,369 @@ fn cigar_to_features(
 ) -> io::Result<Vec<Feature>> {
     use noodles_sam::alignment::record::cigar::op::Kind;
 
+    let reference_bases: &[u8] = reference_sequence.as_ref();
+    let bases: &[u8] = sequence.as_ref();
+    let scores: &[u8] = quality_scores.as_ref();
+    let stores_scores = !flags.quality_scores_are_stored_as_array();
+
     let mut features = Vec::new();
 
-    let mut reference_position = alignment_start;
-    let mut read_position = Position::MIN;
+    // 0-based offsets into the reference sequence and the read.
+    let mut reference_offset = usize::from(alignment_start) - 1;
+    let mut read_offset: usize = 0;
 
     for result in cigar.iter() {
         let op = result?;
+        let len = op.len();
+        let kind = op.kind();
 
-        match op.kind() {
+        let read_end = read_offset
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "CIGAR is too long"))?;
+
+        // A missing sequence (`*`) has no bases to compare or store; HTSlib writes `N` for its
+        // inserted and soft-clipped bases.
+        if kind.consumes_read() && !bases.is_empty() && read_end > bases.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CIGAR and query sequence are of different length",
+            ));
+        }
+
+        let position = read_position(read_offset)?;
+
+        match kind {
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                if op.len() == 1 {
-                    let raw_reference_base = reference_sequence[reference_position];
-                    let raw_read_base = sequence[read_position];
-
-                    let quality_score = quality_scores[read_position];
-
-                    if !flags.quality_scores_are_stored_as_array() {
-                        features.push(Feature::QualityScore {
-                            position: read_position,
-                            quality_score,
-                        });
+                if !bases.is_empty() {
+                    if stores_scores {
+                        push_scores(&mut features, position, scores, read_offset..read_end);
                     }
 
-                    if !raw_reference_base.eq_ignore_ascii_case(&raw_read_base) {
-                        let feature = if let (Ok(reference_base), Ok(read_base)) = (
-                            Base::try_from(raw_reference_base),
-                            Base::try_from(raw_read_base),
-                        ) {
-                            Feature::Substitution {
-                                position: read_position,
-                                reference_base,
-                                read_base,
-                            }
-                        } else {
-                            Feature::ReadBase {
-                                position: read_position,
-                                base: raw_read_base,
-                                quality_score,
-                            }
-                        };
-
-                        features.push(feature);
-                    }
-                } else {
-                    let read_end = read_position
-                        .checked_add(op.len())
-                        .expect("attempt to add with overflow");
-
-                    if !flags.quality_scores_are_stored_as_array() {
-                        let quality_scores = quality_scores[read_position..read_end].to_vec();
-
-                        features.push(Feature::Scores {
-                            position: read_position,
-                            quality_scores,
-                        });
-                    }
-
-                    let reference_end = reference_position
-                        .checked_add(op.len())
-                        .expect("attempt to add with overflow");
-
-                    let reference_bases = &reference_sequence[reference_position..reference_end];
-                    let read_bases = &sequence[read_position..read_end];
-
-                    for (i, (&raw_reference_base, &raw_read_base)) in
-                        reference_bases.iter().zip(read_bases).enumerate()
-                    {
-                        if !raw_reference_base.eq_ignore_ascii_case(&raw_read_base) {
-                            let position = read_position
-                                .checked_add(i)
-                                .expect("attempt to add with overflow");
-
-                            let feature = if let (Ok(reference_base), Ok(read_base)) = (
-                                Base::try_from(raw_reference_base),
-                                Base::try_from(raw_read_base),
-                            ) {
-                                Feature::Substitution {
-                                    position,
-                                    reference_base,
-                                    read_base,
-                                }
-                            } else {
-                                let quality_score = quality_scores[read_position];
-
-                                Feature::ReadBase {
-                                    position,
-                                    base: raw_read_base,
-                                    quality_score,
-                                }
-                            };
-
-                            features.push(feature);
-                        }
-                    }
+                    push_mismatches(
+                        &mut features,
+                        reference_bases,
+                        reference_offset,
+                        &bases[read_offset..read_end],
+                        scores,
+                        read_offset,
+                    )?;
                 }
             }
             Kind::Insertion => {
-                if op.len() == 1 {
-                    let base = sequence[read_position];
-                    features.push(Feature::InsertBase {
-                        position: read_position,
-                        base,
-                    });
+                let inserted = read_bases(bases, read_offset..read_end);
 
-                    if !flags.quality_scores_are_stored_as_array() {
-                        let quality_score = quality_scores[read_position];
-
-                        features.push(Feature::QualityScore {
-                            position: read_position,
-                            quality_score,
-                        });
-                    }
+                if let [base] = inserted[..] {
+                    features.push(Feature::InsertBase { position, base });
                 } else {
-                    let end = read_position
-                        .checked_add(op.len())
-                        .expect("attempt to add with overflow");
-
-                    let bases = sequence[read_position..end].to_vec();
                     features.push(Feature::Insertion {
-                        position: read_position,
-                        bases,
+                        position,
+                        bases: inserted,
                     });
+                }
 
-                    if !flags.quality_scores_are_stored_as_array() {
-                        let quality_scores = quality_scores[read_position..end].to_vec();
-
-                        features.push(Feature::Scores {
-                            position: read_position,
-                            quality_scores,
-                        });
-                    }
+                if stores_scores {
+                    push_scores(&mut features, position, scores, read_offset..read_end);
                 }
             }
-            Kind::Deletion => features.push(Feature::Deletion {
-                position: read_position,
-                len: op.len(),
-            }),
-            Kind::Skip => features.push(Feature::ReferenceSkip {
-                position: read_position,
-                len: op.len(),
-            }),
+            Kind::Deletion => features.push(Feature::Deletion { position, len }),
+            Kind::Skip => features.push(Feature::ReferenceSkip { position, len }),
             Kind::SoftClip => {
-                let end = read_position
-                    .checked_add(op.len())
-                    .expect("attempt to add with overflow");
-
-                let bases = &sequence[read_position..end];
-
                 features.push(Feature::SoftClip {
-                    position: read_position,
-                    bases: bases.to_vec(),
+                    position,
+                    bases: read_bases(bases, read_offset..read_end),
                 });
 
-                if !flags.quality_scores_are_stored_as_array() {
-                    if bases.len() == 1 {
-                        let quality_score = quality_scores[read_position];
-
-                        features.push(Feature::QualityScore {
-                            position: read_position,
-                            quality_score,
-                        });
-                    } else {
-                        let quality_scores = quality_scores[read_position..end].to_vec();
-
-                        features.push(Feature::Scores {
-                            position: read_position,
-                            quality_scores,
-                        });
-                    }
+                if stores_scores {
+                    push_scores(&mut features, position, scores, read_offset..read_end);
                 }
             }
-            Kind::HardClip => features.push(Feature::HardClip {
-                position: read_position,
-                len: op.len(),
-            }),
-            Kind::Pad => features.push(Feature::Padding {
-                position: read_position,
-                len: op.len(),
-            }),
+            Kind::HardClip => features.push(Feature::HardClip { position, len }),
+            Kind::Pad => features.push(Feature::Padding { position, len }),
         }
 
-        if op.kind().consumes_reference() {
-            reference_position = reference_position
-                .checked_add(op.len())
-                .expect("attempt to add with overflow");
+        if kind.consumes_reference() {
+            reference_offset = reference_offset
+                .checked_add(len)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "CIGAR is too long"))?;
         }
 
-        if op.kind().consumes_read() {
-            read_position = read_position
-                .checked_add(op.len())
-                .expect("attempt to add with overflow");
+        if kind.consumes_read() {
+            read_offset = read_end;
         }
     }
 
     Ok(features)
 }
 
+fn read_position(offset: usize) -> io::Result<Position> {
+    offset
+        .checked_add(1)
+        .and_then(Position::new)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid read position"))
+}
+
+/// Returns the read bases in `range`, or `N`s when the sequence is missing.
+fn read_bases(bases: &[u8], range: std::ops::Range<usize>) -> Vec<u8> {
+    if bases.is_empty() {
+        vec![b'N'; range.len()]
+    } else {
+        bases[range].to_vec()
+    }
+}
+
+/// Pushes a quality score feature for the scores in `range`, if the read has them.
+fn push_scores(
+    features: &mut Vec<Feature>,
+    position: Position,
+    scores: &[u8],
+    range: std::ops::Range<usize>,
+) {
+    let Some(scores) = scores.get(range) else {
+        return;
+    };
+
+    if let [quality_score] = *scores {
+        features.push(Feature::QualityScore {
+            position,
+            quality_score,
+        });
+    } else {
+        features.push(Feature::Scores {
+            position,
+            quality_scores: scores.to_vec(),
+        });
+    }
+}
+
+/// Pushes substitutions (or verbatim read bases) for the aligned bases `read_bases`, which start
+/// at `read_offset` in the read and `reference_offset` in the reference.
+///
+/// As in HTSlib, bases past the end of the reference are stored verbatim.
+fn push_mismatches(
+    features: &mut Vec<Feature>,
+    reference_bases: &[u8],
+    reference_offset: usize,
+    read_bases: &[u8],
+    scores: &[u8],
+    read_offset: usize,
+) -> io::Result<()> {
+    let reference_bases = reference_bases.get(reference_offset..).unwrap_or_default();
+    let n = reference_bases.len().min(read_bases.len());
+
+    // Most bases match: compare chunks first, and bases only in chunks that differ.
+    const CHUNK_LEN: usize = 16;
+
+    let chunks = reference_bases[..n]
+        .chunks(CHUNK_LEN)
+        .zip(read_bases[..n].chunks(CHUNK_LEN));
+
+    for (chunk_index, (reference_chunk, read_chunk)) in chunks.enumerate() {
+        if reference_chunk == read_chunk {
+            continue;
+        }
+
+        for (j, (&reference_base, &read_base)) in reference_chunk.iter().zip(read_chunk).enumerate()
+        {
+            if !reference_base.eq_ignore_ascii_case(&read_base) {
+                let i = chunk_index * CHUNK_LEN + j;
+                let position = read_position(read_offset + i)?;
+                features.push(mismatch(position, reference_base, read_base, || {
+                    scores.get(read_offset + i).copied()
+                }));
+            }
+        }
+    }
+
+    // Bases past the end of the reference.
+    for (i, &base) in read_bases.iter().enumerate().skip(n) {
+        features.push(Feature::ReadBase {
+            position: read_position(read_offset + i)?,
+            base,
+            quality_score: scores.get(read_offset + i).copied().unwrap_or(0xff),
+        });
+    }
+
+    Ok(())
+}
+
+/// A substitution, or the read base verbatim if either base cannot be substituted.
+fn mismatch<F>(position: Position, reference_base: u8, read_base: u8, score: F) -> Feature
+where
+    F: FnOnce() -> Option<u8>,
+{
+    match (Base::try_from(reference_base), Base::try_from(read_base)) {
+        (Ok(reference_base), Ok(read_base)) => Feature::Substitution {
+            position,
+            reference_base,
+            read_base,
+        },
+        // HTSlib stores missing quality scores (`*`) as 0xff.
+        _ => Feature::ReadBase {
+            position,
+            base: read_base,
+            quality_score: score().unwrap_or(0xff),
+        },
+    }
+}
+
+/// Returns the data fields to store as tags, and the read group ID of the `RG` field.
+///
+/// As in HTSlib, an `RG` field naming a read group that the header lacks (or that is not a
+/// string) is stored verbatim as a tag.
 #[allow(clippy::type_complexity)]
-fn get_filtered_data<'r>(
-    data: &dyn sam::alignment::record::Data<'r>,
-) -> io::Result<(Vec<(Tag, ValueBuf)>, Option<&'r BStr>)> {
+fn get_filtered_data(
+    header: &sam::Header,
+    data: &dyn sam::alignment::record::Data<'_>,
+) -> io::Result<(Vec<(Tag, ValueBuf)>, Option<usize>)> {
     let mut data_buf = Vec::new();
-    let mut read_group_name = None;
+    let mut read_group_id = None;
 
     for result in data.iter() {
         let (tag, value) = result?;
 
-        if tag == Tag::READ_GROUP {
-            let Value::String(s) = value else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid read group field value",
-                ));
-            };
-
-            read_group_name = Some(s);
-        } else {
-            data_buf.push((tag, value.try_into()?));
+        if tag == Tag::READ_GROUP
+            && read_group_id.is_none()
+            && let Value::String(name) = &value
+            && let Some(id) = header.read_groups().get_index_of(*name)
+        {
+            read_group_id = Some(id);
+            continue;
         }
+
+        data_buf.push((tag, value.try_into()?));
     }
 
-    Ok((data_buf, read_group_name))
+    Ok((data_buf, read_group_id))
 }
 
 #[cfg(test)]
 mod tests {
-    use bstr::ByteSlice;
     use noodles_sam::alignment::{
         record::cigar::{Op, op::Kind},
         record_buf::Cigar,
     };
 
     use super::*;
+
+    fn mapped_record(
+        cigar: &str,
+        sequence: &[u8],
+        quality_scores: &[u8],
+    ) -> sam::alignment::RecordBuf {
+        use sam::alignment::record_buf::Cigar;
+
+        let cigar: Cigar = cigar
+            .split_inclusive(|c: char| c.is_ascii_alphabetic() || c == '=')
+            .map(|s| {
+                let (n, op) = s.split_at(s.len() - 1);
+                let kind = match op {
+                    "M" => Kind::Match,
+                    "I" => Kind::Insertion,
+                    "D" => Kind::Deletion,
+                    "S" => Kind::SoftClip,
+                    _ => unreachable!(),
+                };
+                Op::new(kind, n.parse().unwrap())
+            })
+            .collect();
+
+        sam::alignment::RecordBuf::builder()
+            .set_flags(sam::alignment::record::Flags::empty())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::MIN)
+            .set_cigar(cigar)
+            .set_sequence(Sequence::from(sequence.to_vec()))
+            .set_quality_scores(QualityScores::from(quality_scores.to_vec()))
+            .build()
+    }
+
+    fn convert(record: &sam::alignment::RecordBuf) -> io::Result<Record> {
+        let header =
+            sam::Header::builder()
+                .add_reference_sequence(
+                    "sq0",
+                    sam::header::record::value::Map::<
+                        sam::header::record::value::map::ReferenceSequence,
+                    >::new(std::num::NonZero::new(4).unwrap()),
+                )
+                .build();
+
+        let repository = fasta::Repository::new(vec![fasta::Record::new(
+            fasta::record::Definition::new("sq0", None),
+            fasta::record::Sequence::from(b"ACGT".to_vec()),
+        )]);
+
+        Record::try_from_alignment_record(&repository, &header, record)
+    }
+
+    #[test]
+    fn missing_sequence_takes_the_cigar_read_length() -> io::Result<()> {
+        // SEQ and QUAL `*`, as HTSlib stores them: the read length is the CIGAR's, qualities
+        // are 0xff, and inserted and soft-clipped bases are `N`.
+        let record = convert(&mapped_record("1S2M2I", b"", b""))?;
+
+        assert!(record.cram_flags.contains(Flags::SEQUENCE_IS_MISSING));
+        assert_eq!(record.read_length, 5);
+        assert_eq!(record.quality_scores, [0xff; 5]);
+        assert_eq!(
+            record.features,
+            [
+                Feature::SoftClip {
+                    position: Position::MIN,
+                    bases: b"N".to_vec(),
+                },
+                Feature::Insertion {
+                    position: Position::try_from(4).unwrap(),
+                    bases: b"NN".to_vec(),
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn missing_quality_scores_are_stored_as_0xff() -> io::Result<()> {
+        let record = convert(&mapped_record("2M", b"AC", b""))?;
+        assert_eq!(record.read_length, 2);
+        assert_eq!(record.quality_scores, [0xff; 2]);
+        assert!(record.features.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn bases_past_the_reference_end_are_stored_verbatim() -> io::Result<()> {
+        // The reference is ACGT; the read covers positions 3 to 6.
+        let mut record = mapped_record("4M", b"GTCA", b"ABCD");
+        *record.alignment_start_mut() = Position::new(3);
+        let record = convert(&record)?;
+
+        assert_eq!(
+            record.features,
+            [
+                Feature::ReadBase {
+                    position: Position::try_from(3).unwrap(),
+                    base: b'C',
+                    quality_score: b'C',
+                },
+                Feature::ReadBase {
+                    position: Position::try_from(4).unwrap(),
+                    base: b'A',
+                    quality_score: b'D',
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn cigar_longer_than_the_sequence_is_an_error() {
+        assert!(matches!(
+            convert(&mapped_record("4M", b"AC", b"")),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
 
     #[test]
     fn read_group_uses_dedicated_series_without_duplicate_auxiliary_tag() -> io::Result<()> {
@@ -369,20 +493,27 @@ mod tests {
     }
 
     #[test]
-    fn test_get_read_group_id() -> io::Result<()> {
-        let read_group_name = b"rg0".as_bstr();
-
+    fn read_group_missing_from_the_header_is_stored_as_a_tag() -> io::Result<()> {
         let header = sam::Header::builder()
-            .add_read_group(read_group_name, Default::default())
+            .add_read_group("rg0", Default::default())
             .build();
-        assert_eq!(get_read_group_id(&header, read_group_name)?, 0);
-
-        let header = sam::Header::default();
-        assert!(matches!(
-            get_read_group_id(&header, read_group_name),
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput
-        ));
-
+        let data = [(Tag::READ_GROUP, "nosuch"), (Tag::COMMENT, "note")];
+        let data: sam::alignment::record_buf::Data = data
+            .into_iter()
+            .map(|(tag, s)| (tag, ValueBuf::from(s)))
+            .collect();
+        let record = sam::alignment::RecordBuf::builder()
+            .set_data(data.clone())
+            .build();
+        let actual =
+            Record::try_from_alignment_record(&fasta::Repository::default(), &header, &record)?;
+        assert_eq!(actual.read_group_id, None);
+        assert_eq!(
+            actual.data,
+            data.iter()
+                .map(|(tag, value)| (tag, value.clone()))
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 

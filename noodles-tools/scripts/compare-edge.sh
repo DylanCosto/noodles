@@ -64,9 +64,15 @@ known() {
         "fixmate"*" ends") echo "samtools soft clips deletion bases past the reference end (3M3D9S for 5 bases)" ;;
         "calmd -e -r -A beyond "*) echo "samtools BAQ reads uninitialized memory for a read past the reference end" ;;
         "cram-size -v -e empty_"*) echo "samtools cram-size fails on a CRAM file without data containers" ;;
+        "view -C round trip (fields 1-11) mates")
+            echo "HTSlib attaches m_samestart as mates, then decodes swapped TLEN signs; ntools keeps it detached" ;;
+        "view -C round trip (fields 1-11) headers")
+            echo "samtools warns about an RG tag without @RG (message only)" ;;
         "view -C "*" "*) ;;
         "view -C "*)
-            echo "CRAM written by ntools has no @SQ UR field, and decoding adds NM before MD (md_nm.rs)" ;;
+            echo "ntools keeps stored MD/NM in order (HTSlib regenerates MD, NM); flag 52 decodes as 53; samtools cannot decode reads past the reference end" ;;
+        "index "*" 3.0.cram")
+            echo "HTSlib indexes unplaced CRAM 3.0 slices with their stored span (1), ntools with 0; queries are the same" ;;
         "import edge.fa") echo "samtools import fails on an empty FASTA record or a missing final newline" ;;
     esac
 }

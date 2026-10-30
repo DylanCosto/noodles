@@ -70,7 +70,40 @@ pub enum AlignmentWriter {
         encoder: bam::io::Writer<Vec<u8>>,
     },
     Bam(bam::io::Writer<BgzfWriter<Sink>>),
-    Cram(Box<cram::io::Writer<Sink>>),
+    Cram(Box<cram::io::Writer<Sink>>, CramReference),
+}
+
+/// The reference of CRAM output, for the `@SQ` fields HTSlib's CRAM writer fills in.
+pub struct CramReference {
+    /// The reference FASTA's absolute path (`UR`), as HTSlib makes it (without resolving links).
+    uri: String,
+    repository: noodles_fasta::Repository,
+}
+
+impl CramReference {
+    /// Returns `header` with HTSlib's `@SQ` fields: `M5`, when missing, from the reference (if
+    /// it has the sequence), and `UR`, the reference's absolute path, replacing any.
+    fn annotate(&self, header: &sam::Header) -> io::Result<sam::Header> {
+        use sam::header::record::value::map::reference_sequence::tag;
+
+        let mut header = header.clone();
+
+        for (name, reference_sequence) in header.reference_sequences_mut() {
+            let fields = reference_sequence.other_fields_mut();
+
+            if !fields.contains_key(&tag::MD5_CHECKSUM)
+                && let Some(Ok(sequence)) = self.repository.get(name)
+            {
+                let checksum = cram::calculate_normalized_sequence_digest(&sequence[..]);
+                let hex: String = checksum.iter().map(|b| format!("{b:02x}")).collect();
+                fields.insert(tag::MD5_CHECKSUM, hex.into());
+            }
+
+            fields.insert(tag::URI, self.uri.clone().into());
+        }
+
+        Ok(header)
+    }
 }
 
 impl AlignmentWriter {
@@ -109,11 +142,26 @@ impl AlignmentWriter {
                 }
 
                 let repository = reference_repository(options.reference.as_deref())?;
-                Self::Cram(Box::new(
-                    cram::io::writer::Builder::default()
-                        .set_reference_sequence_repository(repository)
-                        .build_from_writer(sink),
-                ))
+
+                let reference = CramReference {
+                    uri: options
+                        .reference
+                        .as_deref()
+                        .and_then(|path| std::path::absolute(path).ok())
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    repository: repository.clone(),
+                };
+
+                Self::Cram(
+                    Box::new(
+                        cram::io::writer::Builder::default()
+                            .set_reference_sequence_repository(repository)
+                            .build_from_writer(sink),
+                    ),
+                    reference,
+                )
             }
         })
     }
@@ -127,7 +175,7 @@ impl AlignmentWriter {
                 writer.write_text(text.into_inner())
             }
             Self::Bam(w) => w.write_header(header),
-            Self::Cram(w) => w.write_header(header),
+            Self::Cram(w, reference) => w.write_header(&reference.annotate(header)?),
         }
     }
 
@@ -160,7 +208,7 @@ impl AlignmentWriter {
 
                 Ok(())
             }
-            Self::Cram(w) => w.write_header(header),
+            Self::Cram(w, reference) => w.write_header(&reference.annotate(header)?),
         }
     }
 
@@ -193,7 +241,7 @@ impl AlignmentWriter {
             }
             (Self::Sam { writer, .. }, _) => writer.write_alignment_record(header, record.as_dyn()),
             (Self::Bam(w), _) => w.write_alignment_record(header, record.as_dyn()),
-            (Self::Cram(w), _) => w.write_alignment_record(header, record.as_dyn()),
+            (Self::Cram(w, _), _) => w.write_alignment_record(header, record.as_dyn()),
         }
     }
 
@@ -216,7 +264,7 @@ impl AlignmentWriter {
         match self {
             Self::Sam { .. } | Self::ParallelSam { .. } => Some(OutputFormat::Sam),
             Self::Bam(_) => Some(OutputFormat::Bam),
-            Self::Cram(_) => None,
+            Self::Cram(..) => None,
         }
     }
 
@@ -249,7 +297,7 @@ impl AlignmentWriter {
             Self::Sam { writer, .. } => writer.into_inner().flush(),
             Self::ParallelSam { writer, .. } => writer.finish(),
             Self::Bam(w) => w.into_inner().finish()?.flush(),
-            Self::Cram(mut w) => {
+            Self::Cram(mut w, _) => {
                 w.finish(header)?;
                 w.get_mut().flush()
             }

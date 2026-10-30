@@ -19,8 +19,11 @@ pub use self::{file_definition::FileDefinition, record::Record};
 const MAGIC_NUMBER: [u8; 4] = *b"CRAM";
 const MD5_OUTPUT_SIZE: usize = 16;
 
-// _Sequence Alignment/Map Format Specification_ (2021-06-03) § 1.3.2 "Reference MD5 calculation"
-fn calculate_normalized_sequence_digest(mut sequence: &[u8]) -> [u8; MD5_OUTPUT_SIZE] {
+/// Calculates the MD5 checksum of a reference sequence as `@SQ` `M5` fields hold it.
+///
+/// _Sequence Alignment/Map Format Specification_ (2021-06-03) § 1.3.2 "Reference MD5
+/// calculation": lowercase bases are uppercased, and characters outside `!`..`~` are skipped.
+pub fn calculate_normalized_sequence_digest(mut sequence: &[u8]) -> [u8; MD5_OUTPUT_SIZE] {
     const MD5_BLOCK_SIZE: usize = 64;
     const CHUNK_SIZE: usize = 8 * MD5_BLOCK_SIZE;
 
