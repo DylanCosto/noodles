@@ -4,13 +4,19 @@ use std::{collections::VecDeque, io};
 
 use noodles_sam::{
     self as sam,
-    alignment::record::{
-        Flags,
-        cigar::{Op, op::Kind},
-    },
+    alignment::record::{Flags, cigar::op::Kind},
 };
 
-use crate::alignment::Rec;
+use crate::{alignment::Rec, bam_raw::Record};
+
+// BAM CIGAR operation codes.
+const CIGAR_MATCH: u32 = 0;
+const CIGAR_INSERTION: u32 = 1;
+const CIGAR_DELETION: u32 = 2;
+const CIGAR_SKIP: u32 = 3;
+const CIGAR_SOFT_CLIP: u32 = 4;
+const CIGAR_SEQUENCE_MATCH: u32 = 7;
+const CIGAR_SEQUENCE_MISMATCH: u32 = 8;
 
 /// samtools' default filter for depth and coverage.
 pub const DEFAULT_EXCLUDE_FLAGS: Flags = Flags::UNMAPPED
@@ -52,8 +58,8 @@ pub struct DepthWindow {
     start: usize,
     cells: VecDeque<Cell>,
     options: CountOptions,
-    /// Reused per record.
-    ops: Vec<Op>,
+    /// Reused per record: the CIGAR, BAM-encoded (length << 4 | operation).
+    ops: Vec<u32>,
     quality_scores: Vec<u8>,
 }
 
@@ -74,14 +80,34 @@ impl DepthWindow {
     {
         let r = record.as_dyn();
 
-        let (Some(id), Some(start)) = (
-            r.reference_sequence_id(header).transpose()?,
-            r.alignment_start().transpose()?,
-        ) else {
-            return Ok(());
+        // BAM records are read raw; others through the record trait.
+        let raw = match record {
+            Rec::Bam(b) => Some(Record::new(b.as_ref())?),
+            _ => None,
         };
 
-        let start = usize::from(start);
+        let (id, start) = match &raw {
+            Some(raw) => {
+                let (Ok(id), Ok(position)) = (
+                    usize::try_from(raw.reference_sequence_id()),
+                    usize::try_from(raw.position()),
+                ) else {
+                    return Ok(());
+                };
+
+                (id, position + 1)
+            }
+            None => {
+                let (Some(id), Some(start)) = (
+                    r.reference_sequence_id(header).transpose()?,
+                    r.alignment_start().transpose()?,
+                ) else {
+                    return Ok(());
+                };
+
+                (id, usize::from(start))
+            }
+        };
 
         if self.reference_sequence_id != Some(id) {
             self.finish(emit)?;
@@ -96,16 +122,16 @@ impl DepthWindow {
 
         self.flush_before(start, emit)?;
 
-        self.ops.clear();
-        match record {
-            Rec::Bam(r) => {
+        match &raw {
+            Some(raw) => raw.read_cigar(&mut self.ops)?,
+            None => {
+                self.ops.clear();
+
                 for result in r.cigar().iter() {
-                    self.ops.push(result?);
-                }
-            }
-            _ => {
-                for result in r.cigar().iter() {
-                    self.ops.push(result?);
+                    let op = result?;
+                    let len = u32::try_from(op.len())
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    self.ops.push(len << 4 | kind_code(op.kind()));
                 }
             }
         }
@@ -122,14 +148,12 @@ impl DepthWindow {
         self.quality_scores.clear();
 
         if needs_quality {
-            match record {
-                Rec::Bam(r) => self
+            match (&raw, record) {
+                (Some(raw), _) => self.quality_scores.extend_from_slice(raw.quality_scores()),
+                (None, Rec::Buf(r)) => self
                     .quality_scores
                     .extend_from_slice(r.quality_scores().as_ref()),
-                Rec::Buf(r) => self
-                    .quality_scores
-                    .extend_from_slice(r.quality_scores().as_ref()),
-                _ => {
+                (None, _) => {
                     for result in r.quality_scores().iter() {
                         self.quality_scores.push(result?);
                     }
@@ -141,8 +165,8 @@ impl DepthWindow {
         let span: usize = self
             .ops
             .iter()
-            .filter(|op| op.kind().consumes_reference())
-            .map(|op| op.len())
+            .filter(|&&op| consumes_reference(op & 0xf))
+            .map(|&op| (op >> 4) as usize)
             .sum();
         let needed = start + span - self.start;
         if needed > self.cells.len() {
@@ -153,19 +177,23 @@ impl DepthWindow {
         let ops = std::mem::take(&mut self.ops);
         let quality_scores = std::mem::take(&mut self.quality_scores);
 
+        // One slice for the whole record (rotating the ring only when it has wrapped), so the
+        // loops below run over plain slices.
+        let window = self.cells.make_contiguous();
+
         let mut reference_position = start;
         let mut read_position = 0;
 
-        for op in &ops {
-            let len = op.len();
+        for &op in &ops {
+            let len = (op >> 4) as usize;
             let offset = reference_position - self.start;
 
-            match op.kind() {
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                    let cells = self.cells.range_mut(offset..offset + len);
+            match op & 0xf {
+                CIGAR_MATCH | CIGAR_SEQUENCE_MATCH | CIGAR_SEQUENCE_MISMATCH => {
+                    let cells = &mut window[offset..offset + len];
 
                     if needs_quality {
-                        for (i, cell) in cells.enumerate() {
+                        for (i, cell) in cells.iter_mut().enumerate() {
                             cell.touched = true;
 
                             // Missing qualities (0xff) count, as in samtools.
@@ -194,8 +222,8 @@ impl DepthWindow {
                     reference_position += len;
                     read_position += len;
                 }
-                Kind::Deletion => {
-                    for cell in self.cells.range_mut(offset..offset + len) {
+                CIGAR_DELETION => {
+                    for cell in &mut window[offset..offset + len] {
                         cell.touched = true;
 
                         if include_deletions {
@@ -205,17 +233,17 @@ impl DepthWindow {
 
                     reference_position += len;
                 }
-                Kind::Skip => {
+                CIGAR_SKIP => {
                     if include_skips {
-                        for cell in self.cells.range_mut(offset..offset + len) {
+                        for cell in &mut window[offset..offset + len] {
                             cell.depth += 1;
                         }
                     }
 
                     reference_position += len;
                 }
-                Kind::Insertion | Kind::SoftClip => read_position += len,
-                Kind::HardClip | Kind::Pad => {}
+                CIGAR_INSERTION | CIGAR_SOFT_CLIP => read_position += len,
+                _ => {}
             }
         }
 
@@ -260,6 +288,29 @@ impl DepthWindow {
         self.reference_sequence_id = None;
         Ok(())
     }
+}
+
+/// The BAM code of a CIGAR operation.
+fn kind_code(kind: Kind) -> u32 {
+    match kind {
+        Kind::Match => CIGAR_MATCH,
+        Kind::Insertion => CIGAR_INSERTION,
+        Kind::Deletion => CIGAR_DELETION,
+        Kind::Skip => CIGAR_SKIP,
+        Kind::SoftClip => CIGAR_SOFT_CLIP,
+        Kind::HardClip => 5,
+        Kind::Pad => 6,
+        Kind::SequenceMatch => CIGAR_SEQUENCE_MATCH,
+        Kind::SequenceMismatch => CIGAR_SEQUENCE_MISMATCH,
+    }
+}
+
+/// Whether a BAM CIGAR operation code consumes the reference.
+fn consumes_reference(code: u32) -> bool {
+    matches!(
+        code,
+        CIGAR_MATCH | CIGAR_DELETION | CIGAR_SKIP | CIGAR_SEQUENCE_MATCH | CIGAR_SEQUENCE_MISMATCH
+    )
 }
 
 /// Formats like C's `printf("%.*g", precision, value)`.

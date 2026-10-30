@@ -158,8 +158,8 @@ libdeflate. "short" is 1M synthetic 150 bp paired reads, "tagged" 250k reads wit
 | fixmate -m, short, -@4 | 0.882 | 0.450 | 1.96x |
 | markdup, short | 3.817 | 2.458 | 1.55x |
 | markdup, short, -@4 | 0.909 | 0.756 | 1.20x |
-| fastq, short | 0.607 | 0.691 | 0.88x |
-| depth, short | 0.284 | 0.317 | 0.90x |
+| fastq, short | 0.608 | 0.292 | 2.08x |
+| depth, short | 0.282 | 0.254 | 1.11x |
 | stats, short | 1.659 | 1.142 | 1.45x |
 | stats, short, -@4 | 1.581 | 0.727 | 2.17x |
 | stats, long, -@8 | 5.699 | 1.577 | 3.61x |

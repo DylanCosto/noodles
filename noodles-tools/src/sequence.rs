@@ -1,15 +1,26 @@
 //! Nucleotide sequence helpers.
 
+/// [`complement`] for every byte.
+static COMPLEMENTS: [u8; 256] = {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = complement(i as u8);
+        i += 1;
+    }
+    table
+};
+
 /// Reverse complements IUPAC nucleotides in place, preserving case, as samtools does.
 pub fn reverse_complement(sequence: &mut [u8]) {
     sequence.reverse();
 
     for base in sequence {
-        *base = complement(*base);
+        *base = COMPLEMENTS[usize::from(*base)];
     }
 }
 
-fn complement(base: u8) -> u8 {
+const fn complement(base: u8) -> u8 {
     let c = match base.to_ascii_uppercase() {
         b'A' => b'T',
         b'C' => b'G',

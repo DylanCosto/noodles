@@ -4,18 +4,7 @@
 //! string, out-of-range qualities, or a long CIGAR stored in a `CG` tag) is declined, and the
 //! caller formats it with the noodles SAM writer instead, so output and errors are unchanged.
 
-use crate::bam_raw::{BASES, field, le_u16, le_u32};
-
-/// Decodes a byte of two 4-bit bases to its two characters.
-static BASE_PAIRS: [[u8; 2]; 256] = {
-    let mut table = [[0; 2]; 256];
-    let mut i = 0;
-    while i < 256 {
-        table[i] = [BASES[i >> 4], BASES[i & 0x0f]];
-        i += 1;
-    }
-    table
-};
+use crate::bam_raw::{BASE_PAIRS, field, le_u16, le_u32};
 
 const CIGAR_OPS: &[u8; 9] = b"MIDNSHP=X";
 

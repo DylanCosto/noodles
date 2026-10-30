@@ -137,7 +137,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .keys()
             .map(|name| name.to_vec())
             .collect(),
-        line: Vec::new(),
+        buf: Vec::with_capacity(OUTPUT_BUFFER_LEN + 4096),
     };
 
     if args.print_header {
@@ -190,7 +190,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         written
     })?;
 
-    out.writer.flush()?;
+    out.finish()?;
 
     Ok(())
 }
@@ -285,51 +285,47 @@ impl Stream {
     }
 }
 
+/// Rows are formatted into a buffer of about this many bytes before each write.
+const OUTPUT_BUFFER_LEN: usize = 1 << 17;
+
 struct Output {
     writer: BufWriter<output::Sink>,
     names: Vec<Vec<u8>>,
-    line: Vec<u8>,
+    buf: Vec<u8>,
 }
 
 impl Output {
     fn write(&mut self, id: usize, position: usize, depths: &[u32]) -> io::Result<()> {
-        let mut buf = itoa_buf();
-
-        self.line.clear();
-        self.line.extend_from_slice(&self.names[id]);
-        self.line.push(b'\t');
-        self.line
-            .extend_from_slice(format_usize(&mut buf, position));
+        self.buf.extend_from_slice(&self.names[id]);
+        self.buf.push(b'\t');
+        push_number(&mut self.buf, position);
 
         for &depth in depths {
-            self.line.push(b'\t');
-            self.line
-                .extend_from_slice(format_usize(&mut buf, depth as usize));
+            self.buf.push(b'\t');
+            push_number(&mut self.buf, depth);
         }
 
-        self.line.push(b'\n');
-        self.writer.write_all(&self.line)
+        self.buf.push(b'\n');
+
+        if self.buf.len() >= OUTPUT_BUFFER_LEN {
+            self.writer.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+
+        Ok(())
+    }
+
+    /// Writes the buffered rows and flushes the writer.
+    fn finish(&mut self) -> io::Result<()> {
+        self.writer.write_all(&self.buf)?;
+        self.buf.clear();
+        self.writer.flush()
     }
 }
 
-fn itoa_buf() -> [u8; 20] {
-    [0; 20]
-}
-
-fn format_usize(buf: &mut [u8; 20], mut n: usize) -> &[u8] {
-    let mut i = buf.len();
-
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-
-        if n == 0 {
-            break;
-        }
-    }
-
-    &buf[i..]
+fn push_number<N: lexical_core::ToLexical>(dst: &mut Vec<u8>, n: N) {
+    let mut buf = [0; lexical_core::BUFFER_SIZE];
+    dst.extend_from_slice(lexical_core::write(n, &mut buf));
 }
 
 /// Which positions are reported.
@@ -487,6 +483,13 @@ impl Domain {
 
 /// Pops the smallest position across streams, filling `depths` with each input's depth there.
 fn next_position(streams: &mut [Stream], depths: &mut [u32]) -> Option<(usize, usize)> {
+    if let ([stream], [depth]) = (&mut *streams, &mut *depths) {
+        let (id, position, d) = stream.peek()?;
+        stream.advance();
+        *depth = d;
+        return Some((id, position));
+    }
+
     let next = streams
         .iter_mut()
         .filter_map(|s| s.peek().map(|(id, pos, _)| (id, pos)))

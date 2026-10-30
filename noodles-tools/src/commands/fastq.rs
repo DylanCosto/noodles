@@ -15,6 +15,7 @@ use noodles_sam::alignment::record::{
 
 use crate::{
     alignment::{AlignmentReader, ReadOptions, Rec},
+    bam_raw::Record,
     bgzf_stream::BgzfWriter,
     filter::Filter,
     flags,
@@ -136,9 +137,9 @@ impl Read {
 
         match record {
             Rec::Bam(r) => {
-                self.sequence.extend(r.sequence().iter());
-                self.quality_scores
-                    .extend_from_slice(r.quality_scores().as_ref());
+                let raw = Record::new(r.as_ref())?;
+                raw.decode_sequence(&mut self.sequence);
+                self.quality_scores.extend_from_slice(raw.quality_scores());
             }
             Rec::Buf(r) => {
                 self.sequence.extend_from_slice(r.sequence().as_ref());
