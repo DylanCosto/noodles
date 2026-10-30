@@ -4,7 +4,8 @@
 //! bytes, SAM records are parsed lazily, and CRAM records are decoded into record buffers.
 
 use std::{
-    io::{self, BufRead, BufReader},
+    fs::File,
+    io::{self, BufRead, BufReader, Read},
     mem,
     path::{Path, PathBuf},
 };
@@ -536,14 +537,26 @@ impl<'a> Queries<'a> {
 /// Reads an explicit BAI or CSI index (by extension), or the one associated with `path`.
 fn read_bam_index(path: &Path, index: Option<&Path>) -> anyhow::Result<bam::Index> {
     let result = match index {
-        Some(index) if index.extension().is_some_and(|ext| ext == "csi") => {
-            noodles_csi::fs::read(index).map(bam::Index::Csi)
-        }
-        Some(index) => bam::bai::fs::read(index).map(bam::Index::Bai),
+        Some(index) => read_bai_or_csi(index),
         None => bam::fs::read_associated_index(path),
     };
 
     result.with_context(|| format!("reading index for {}", path.display()))
+}
+
+/// Reads a BAI or CSI index, told apart by content as HTSlib does: a BAI starts with its magic
+/// number, and a CSI is BGZF-compressed.
+fn read_bai_or_csi(path: &Path) -> io::Result<bam::Index> {
+    const BAI_MAGIC: &[u8; 4] = b"BAI\x01";
+
+    let mut magic = [0; 4];
+    File::open(path)?.read_exact(&mut magic)?;
+
+    if &magic == BAI_MAGIC {
+        bam::bai::fs::read(path).map(bam::Index::Bai)
+    } else {
+        noodles_csi::fs::read(path).map(bam::Index::Csi)
+    }
 }
 
 fn parse_region(s: &str) -> anyhow::Result<Region> {

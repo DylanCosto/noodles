@@ -1,6 +1,10 @@
 //! Per-position read depth over coordinate-sorted alignments, as samtools depth counts it.
 
-use std::{collections::VecDeque, io};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, VecDeque},
+    io,
+};
 
 use noodles_sam::{
     self as sam,
@@ -44,6 +48,8 @@ pub struct Cell {
     /// Deletions and reference skips at this position, whether or not `depth` counts them.
     pub gaps: u32,
     pub quality_sum: u64,
+    /// Counted bases without a quality (no sequence, or `0xff`), so not in `quality_sum`.
+    pub missing_quality: u32,
     /// Whether any read aligns here, counted or not (e.g., a filtered base or a deletion).
     /// samtools reports touched positions even at depth 0.
     pub touched: bool,
@@ -63,12 +69,23 @@ pub struct DepthWindow {
     /// Reused per record: the CIGAR, BAM-encoded (length << 4 | operation).
     ops: Vec<u32>,
     quality_scores: Vec<u8>,
+    cap: Option<PileupCap>,
 }
 
 impl DepthWindow {
     pub fn new(options: CountOptions) -> Self {
         Self {
             options,
+            ..Self::default()
+        }
+    }
+
+    /// A window that leaves out reads as HTSlib's pileup does with a maximum count (`maxcnt`,
+    /// samtools coverage's `-d`).
+    pub fn with_max_count(options: CountOptions, max_count: usize) -> Self {
+        Self {
+            options,
+            cap: Some(PileupCap::new(max_count)),
             ..Self::default()
         }
     }
@@ -119,7 +136,21 @@ impl DepthWindow {
         self.flush_before(start, emit)?;
 
         let needs_quality = self.load_record(record, raw.as_ref())?;
-        self.count_bases(start, needs_quality, clip);
+
+        let span: usize = self
+            .ops
+            .iter()
+            .filter(|&&op| consumes_reference(op & 0xf))
+            .map(|&op| (op >> 4) as usize)
+            .sum();
+
+        if let Some(cap) = &mut self.cap
+            && !cap.admit(id, start - 1, start - 1 + span)
+        {
+            return Ok(());
+        }
+
+        self.count_bases(start, span, needs_quality, clip);
 
         Ok(())
     }
@@ -165,8 +196,8 @@ impl DepthWindow {
     }
 
     /// Counts the bases of the record in [`Self::ops`] and [`Self::quality_scores`], which
-    /// starts at the 1-based `start`.
-    fn count_bases(&mut self, start: usize, needs_quality: bool, clip: usize) {
+    /// starts at the 1-based `start` and spans `span` reference bases.
+    fn count_bases(&mut self, start: usize, span: usize, needs_quality: bool, clip: usize) {
         let CountOptions {
             min_base_quality,
             include_deletions,
@@ -175,12 +206,6 @@ impl DepthWindow {
         } = self.options;
 
         // Size the window once for the record's whole reference span.
-        let span: usize = self
-            .ops
-            .iter()
-            .filter(|&&op| consumes_reference(op & 0xf))
-            .map(|&op| (op >> 4) as usize)
-            .sum();
         let needed = start + span - self.start;
         if needed > self.cells.len() {
             self.cells.resize(needed, Cell::default());
@@ -222,6 +247,7 @@ impl DepthWindow {
                                 Some(&q) if q != 0xff => q,
                                 _ => {
                                     cell.depth += 1;
+                                    cell.missing_quality += 1;
                                     continue;
                                 }
                             };
@@ -329,6 +355,59 @@ impl DepthWindow {
         self.flush_before(usize::MAX, emit)?;
         self.reference_sequence_id = None;
         Ok(())
+    }
+}
+
+/// HTSlib's pileup depth limit (`maxcnt`) for one input: a read that starts where the previous
+/// one did is left out once `maxcnt` reads are buffered. The buffer holds the reads that have
+/// not ended before the position just before the new read's start.
+#[derive(Clone, Debug)]
+struct PileupCap {
+    max_count: usize,
+    /// The pileup's reference sequence and 0-based position: the last added read's start.
+    id: usize,
+    position: usize,
+    /// The 0-based exclusive ends of the buffered reads.
+    ends: BinaryHeap<Reverse<usize>>,
+}
+
+impl PileupCap {
+    fn new(max_count: usize) -> Self {
+        Self {
+            max_count,
+            id: 0,
+            position: 0,
+            ends: BinaryHeap::new(),
+        }
+    }
+
+    /// Returns whether a read at the 0-based `start` with the exclusive `end` enters the pileup
+    /// (`bam_plp_push`).
+    fn admit(&mut self, id: usize, start: usize, end: usize) -> bool {
+        let new_reference = id != self.id;
+
+        if new_reference {
+            self.ends.clear();
+        } else {
+            // The pileup has dropped the reads that end before `start - 1`.
+            while self.ends.peek().is_some_and(|&Reverse(e)| e < start) {
+                self.ends.pop();
+            }
+
+            if start == self.position && self.ends.len() >= self.max_count {
+                return false;
+            }
+        }
+
+        // An empty read starting at the pileup's position is not buffered.
+        if new_reference || end > self.position {
+            self.ends.push(Reverse(end));
+        }
+
+        self.id = id;
+        self.position = start;
+
+        true
     }
 }
 
@@ -484,6 +563,25 @@ fn trim_fraction(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pileup_cap() {
+        let mut cap = PileupCap::new(2);
+
+        assert!(cap.admit(0, 10, 20));
+        assert!(cap.admit(0, 10, 20));
+        // Two reads are buffered at the pileup's position.
+        assert!(!cap.admit(0, 10, 20));
+        // The first read at a new position is always added.
+        assert!(cap.admit(0, 11, 12));
+        assert!(!cap.admit(0, 11, 30));
+        // The reads before have ended; an empty read is buffered only when it comes first.
+        assert!(cap.admit(0, 40, 40));
+        assert!(cap.admit(0, 40, 40));
+        assert!(cap.admit(0, 40, 50));
+        assert!(!cap.admit(0, 40, 50));
+        assert!(cap.admit(1, 40, 50));
+    }
 
     #[test]
     fn test_format_g() {

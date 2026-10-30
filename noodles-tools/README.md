@@ -20,12 +20,12 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `view` | `view` | SAM/BAM/CRAM conversion; `-c`, `-f/-F/-G`, `-q`, `-m`, `-e` (filter expressions), `-L`, `-M`, `-P`, `-s`, `-N`, `-r/-R/-n`, `-d/-D`, `-x`, `-U`, `-p`, `-B`, `-t`, `-X`, `-l` (library), `-h/-H`, `-b/-C/-u/-1`, `--output-fmt-option level=N`, `--write-index`, `-?`, `-S`, regions and `*` |
 | `sort` | `sort` | coordinate, `-n` (natural), `-N` (bytewise); `-m`, `-T`, `-@`; stable, like samtools |
 | `merge` | `merge -c -p` | BAM inputs; reference dictionaries are merged and IDs translated |
-| `index` | `index` | BAI (default) or CSI (`-c`) for BAM; CRAI for CRAM |
+| `index` | `index` | BAI (default) or CSI (`-c`, `-m` minimum shift, with HTSlib's level count) for BAM; CRAI for CRAM; `-M` (several inputs), `-o` or a second argument naming the index |
 | `faidx`, `fqidx` | `faidx`, `fqidx` | FASTA and FASTQ, plain or BGZF (`.fai` and `.gzi` as HTSlib builds them); regions as HTSlib parses them (`{name}` quoting, `1,000`, `2k`), `-r`, `-o` (BGZF for `.gz`), `-n`, `-c`, `-i`, `--mark-strand`, `--fai-idx/--gzi-idx`, `--write-index`, `-f` |
 | `flagstat` | `flagstat` | default, `-O tsv`, `-O json` |
-| `idxstats` | `idxstats` | from BAM index metadata; scans CRAM/SAM |
-| `depth` | `depth` | `-a/-aa`, `-r`, `-b`, `-J`, `-s`, `-q/-Q`, `-g/-G`, `-l`, `-H`, several inputs |
-| `coverage` | `coverage` | per reference or `-r` region; `-q/-Q`, `-l`, flag filters (no `-m` histogram) |
+| `idxstats` | `idxstats` | from BAM index metadata (`-X` names the index); scans CRAM/SAM |
+| `depth` | `depth` | `-a/-aa`, `-r`, `-b`, `-J`, `-s`, `-q/-Q`, `-g/-G`, `--incl-flags`, `--require-flags`, `-l`, `-H`, `-o`, several inputs, `-f` (input list), `-X` (index files after the inputs); `-d/-m` are ignored, as in samtools |
+| `coverage` | `coverage` | per reference or `-r` region; `-q/-Q`, `-l`, `--rf/--incl-flags`, `--ff/--excl-flags`, `-d` (the pileup's limit, applied as HTSlib does), `--min-depth`, `-m/-D/-A/-w` histograms (sized to the terminal like samtools), `-H`, `-o`, several inputs or `-b` list |
 | `fastq`, `fasta` | `fastq`, `fasta` | `-0/-1/-2/-s/-o`, `-n/-N`, `-t/-T` (`*` for all tags), `-F/-f/-G/--rf`, `-d/-D` (tag filters), `-O` (OQ qualities), `-i` (CASAVA), `--i1/--i2`, `--index-format`, `--barcode-tag/--quality-tag`, `-v`, `-U/--UMI-tag`, `--no-sc/--sc-aux/--no-sc-bkp`, `-c`, `.gz` output |
 | `quickcheck` | `quickcheck` | `-v`, `-q`, `-u` |
 | `reheader` | `reheader` | BAM; copies compressed blocks |
@@ -34,7 +34,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `collate` | `collate` | groups templates by name; `-f`, `-O/-o`, `-u`, `-l`, `-m`, `-T` |
 | `fixmate` | `fixmate` | `-m`, `-c`, `-r`, `-p`, `-z`, `-M` (base modification tags); parallel with `-@` |
 | `dict` | `dict` | `-a`, `-s`, `-u`, `-H`, `-o`, `-A` (`AN` aliases), `-l` (`AH` for alternate loci) |
-| `bedcov` | `bedcov` | `-c`, `-d`, `-j`, `-Q`, `-g/-G`, `-H`; several inputs |
+| `bedcov` | `bedcov` | `-c`, `-d`, `-j`, `-Q`, `-g/-G`, `-H`; several inputs; `-X` (index files after the inputs) |
 | `addreplacerg` | `addreplacerg` | `-r` (repeatable, `\t` escapes), `-R`, `-m overwrite_all\|orphan_only`, `-w` |
 | `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-S`, `-t`, `-d` (optical duplicates), `-T`, `-s/-f`, `--json`, `--no-multi-dup`, `--include-fails`, `--use-read-groups`, `--duplicate-count`, `--read-coords`/`--coords-order`, `--barcode-tag`/`-name`/`-rgx`, `--move-umi-to-tag`, `--umi-separator` |
 | `stats` | `stats` | all sections; `-r`, `-t`, regions, `-f/-F/-d`, `-c`, `-i`, `-m`, `-q`, `-l`, `-I`, `-S/-P`, `-p`, `-g`, `-x`, `--GC-depth`, `--ref-stats`; per-cycle counts use `-@` threads |
@@ -145,6 +145,14 @@ Intentional differences:
   records), and qualities above 100 use the tables' quality-100 values instead of reading past
   them. With `-@` and a `-T` FASTA that lacks a needed sequence, ntools stops with an error where
   samtools writes truncated or garbage sequence.
+- `coverage` averages base qualities over the bases that have one: a read with `QUAL` `*`
+  (stored as `0xff`) is left out of `meanbaseq`, as one without a sequence is (with the same
+  warning), where samtools counts its bases as quality 255. samtools also reports 255 for CRAM
+  input unless `-Q` is given, as it does not decode CRAM qualities otherwise; ntools reports
+  the qualities. Histogram bins count in 64 bits, so `-D` cannot overflow.
+- `depth -X` with an odd number of files is an error (samtools' check never fires, and it
+  pairs the files up wrongly), and `-H` labels the columns with the input names; samtools
+  prints the index file names.
 - `bedcov -d` adds its column without changing the depth sum, which counts deletions and
   reference skips unless `-j`, as documented; samtools also drops them from the sum when `-d`
   is given. The `-d` column counts aligned bases, as in samtools.

@@ -16,6 +16,7 @@ use crate::{
     alignment::{AlignmentReader, Queries, RawEncoder, ReadOptions, Rec},
     bam_raw::Record,
     depth::{CountOptions, DEFAULT_EXCLUDE_FLAGS, DepthWindow, used_query_length},
+    file_list,
     filter::Filter,
     flags, output,
     regions::RegionSet,
@@ -29,9 +30,18 @@ type Point = (usize, usize, u32);
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
-    /// Coordinate-sorted SAM, BAM, or CRAM files.
-    #[arg(required = true)]
+    /// Coordinate-sorted SAM, BAM, or CRAM files; with `-X`, followed by their index files.
+    #[arg(required_unless_present = "file_list")]
     inputs: Vec<String>,
+
+    /// Read the input file names from this file, one per line, instead of the arguments.
+    #[arg(short = 'f')]
+    file_list: Option<PathBuf>,
+
+    /// The inputs are followed by their index files, in the same order (`-X a.bam b.bam a.bai
+    /// b.bai`), for `-r`.
+    #[arg(short = 'X')]
+    customized_index: bool,
 
     /// Output all positions (-a), including unused reference sequences (-aa).
     #[arg(short = 'a', action = clap::ArgAction::Count)]
@@ -50,11 +60,11 @@ pub struct Args {
     print_header: bool,
 
     /// Exclude bases with base quality below this value.
-    #[arg(short = 'q', long = "min-BQ", default_value_t = 0)]
+    #[arg(short = 'q', long = "min-BQ", alias = "min-bq", default_value_t = 0)]
     min_base_quality: u8,
 
     /// Exclude reads with mapping quality below this value.
-    #[arg(short = 'Q', long = "min-MQ", default_value_t = 0)]
+    #[arg(short = 'Q', long = "min-MQ", alias = "min-mq", default_value_t = 0)]
     min_mapping_quality: u8,
 
     /// Do not count bases of a read that overlap its mate (the read seen first keeps them).
@@ -76,6 +86,20 @@ pub struct Args {
     /// Only include reads with all of these flags set.
     #[arg(long = "require-flags", value_parser = flags::parse)]
     require_flags: Option<Flags>,
+
+    /// Only include reads with at least one of these flags set.
+    #[arg(long = "incl-flags", value_parser = flags::parse)]
+    include_flags: Option<Flags>,
+
+    /// Ignored (samtools' former depth limit).
+    #[arg(
+        short = 'd',
+        short_alias = 'm',
+        hide = true,
+        action = clap::ArgAction::Append,
+        allow_hyphen_values = true
+    )]
+    max_depth: Vec<String>,
 
     /// Exclude reads shorter than this.
     #[arg(short = 'l', default_value_t = 0)]
@@ -100,12 +124,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         reference: args.reference.clone(),
     };
 
-    let mut inputs = Vec::with_capacity(args.inputs.len());
+    let (sources, indexes) = input_files(&args)?;
+    let mut inputs = Vec::with_capacity(sources.len());
 
-    for src in &args.inputs {
+    for (i, src) in sources.iter().enumerate() {
         let (mut reader, path) = AlignmentReader::open(src, &options)?;
         let header = reader.read_header()?;
-        inputs.push((reader, path, header));
+        let index = indexes.as_ref().map(|indexes| PathBuf::from(&indexes[i]));
+        inputs.push((reader, path, header, index));
     }
 
     let header = inputs[0].2.clone();
@@ -113,11 +139,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let exclude = (DEFAULT_EXCLUDE_FLAGS - args.unexclude_flags.unwrap_or_else(Flags::empty))
         | args.exclude_flags.unwrap_or_else(Flags::empty);
 
-    let filter = Filter {
-        require: args.require_flags.unwrap_or_else(Flags::empty),
-        exclude,
-        min_mapping_quality: args.min_mapping_quality,
-        ..Filter::default()
+    let selection = Selection {
+        filter: Filter {
+            require: args.require_flags.unwrap_or_else(Flags::empty),
+            exclude,
+            min_mapping_quality: args.min_mapping_quality,
+            ..Filter::default()
+        },
+        include: args.include_flags.unwrap_or_else(Flags::empty),
+        min_read_length: args.min_read_length,
     };
 
     let count_options = CountOptions {
@@ -148,34 +178,33 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     if args.print_header {
         write!(out.writer, "#CHROM\tPOS")?;
-        for src in &args.inputs {
+        for src in &sources {
             write!(out.writer, "\t{src}")?;
         }
         writeln!(out.writer)?;
     }
 
     let region_queries = domain.queries();
-    let min_read_length = args.min_read_length;
     let remove_overlaps = args.remove_overlaps;
 
     thread::scope(|scope| -> anyhow::Result<()> {
         let mut streams = Vec::with_capacity(inputs.len());
         let mut handles = Vec::with_capacity(inputs.len());
 
-        for (reader, path, input_header) in &mut inputs {
+        for (reader, path, input_header, index) in &mut inputs {
             let (tx, rx) = crossbeam_channel::bounded::<Vec<Point>>(4);
-            let filter = &filter;
+            let selection = &selection;
             let region_queries = &region_queries;
 
             handles.push(scope.spawn(move || {
                 read_depths(
                     reader,
                     path.as_deref(),
+                    index.as_deref(),
                     input_header,
                     region_queries.as_ref(),
-                    filter,
+                    selection,
                     count_options,
-                    min_read_length,
                     remove_overlaps,
                     &tx,
                 )
@@ -211,11 +240,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 fn read_depths(
     reader: &mut AlignmentReader,
     path: Option<&Path>,
+    index: Option<&Path>,
     header: &sam::Header,
     queries: Option<&RegionSet>,
-    filter: &Filter,
+    selection: &Selection,
     count_options: CountOptions,
-    min_read_length: usize,
     overlaps: bool,
     tx: &Sender<Vec<Point>>,
 ) -> anyhow::Result<()> {
@@ -239,11 +268,7 @@ fn read_depths(
     let mut cigar = Vec::new();
 
     let mut visit = |record: Rec<'_>| -> anyhow::Result<()> {
-        if !filter.matches(&record, header)? {
-            return Ok(());
-        }
-
-        if min_read_length > 0 && used_query_length(&record)? < min_read_length {
+        if !selection.matches(&record, header)? {
             return Ok(());
         }
 
@@ -261,7 +286,7 @@ fn read_depths(
 
     match (queries, path) {
         (Some(set), Some(path)) => {
-            reader.for_each_in_queries(path, None, header, &Queries::Set(set), &mut visit)?;
+            reader.for_each_in_queries(path, index, header, &Queries::Set(set), &mut visit)?;
         }
         _ => reader.for_each(header, &mut visit)?,
     }
@@ -274,6 +299,51 @@ fn read_depths(
     }
 
     Ok(())
+}
+
+/// The input files and, with `-X`, their index files.
+fn input_files(args: &Args) -> anyhow::Result<(Vec<String>, Option<Vec<String>>)> {
+    if let Some(list) = &args.file_list {
+        if args.customized_index {
+            bail!("The -f option cannot be combined with -X");
+        }
+
+        return Ok((file_list::read(list)?, None));
+    }
+
+    if args.customized_index {
+        // samtools does not catch an odd count (`nfiles%1`) and pairs the files up wrongly.
+        if !args.inputs.len().is_multiple_of(2) {
+            bail!("-X needs one index specified per bam file");
+        }
+
+        let n = args.inputs.len() / 2;
+        return Ok((args.inputs[..n].to_vec(), Some(args.inputs[n..].to_vec())));
+    }
+
+    Ok((args.inputs.clone(), None))
+}
+
+/// Which reads are counted.
+struct Selection {
+    filter: Filter,
+    /// Reads need at least one of these flags (`--incl-flags`; none when empty).
+    include: Flags,
+    min_read_length: usize,
+}
+
+impl Selection {
+    fn matches(&self, record: &Rec<'_>, header: &sam::Header) -> io::Result<bool> {
+        if !self.filter.matches(record, header)? {
+            return Ok(false);
+        }
+
+        if !self.include.is_empty() && !record.flags()?.intersects(self.include) {
+            return Ok(false);
+        }
+
+        Ok(self.min_read_length == 0 || used_query_length(record)? >= self.min_read_length)
+    }
 }
 
 /// The 0-based end of each paired read whose mate may still overlap it, by name

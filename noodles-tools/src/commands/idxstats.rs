@@ -6,12 +6,11 @@ use std::{
 };
 
 use anyhow::Context;
-use noodles_bam as bam;
 use noodles_csi::BinningIndex;
 use noodles_sam as sam;
 
 use crate::{
-    alignment::{AlignmentReader, ReadOptions},
+    alignment::{AlignmentIndex, AlignmentReader, ReadOptions},
     source::Format,
 };
 
@@ -19,6 +18,14 @@ use crate::{
 pub struct Args {
     /// Input BAM (indexed), CRAM, or SAM file.
     input: String,
+
+    /// The BAM file's index (with `-X`).
+    #[arg(requires = "customized_index")]
+    index: Option<PathBuf>,
+
+    /// Use the index file given after the input.
+    #[arg(short = 'X', requires = "index")]
+    customized_index: bool,
 
     /// Reference FASTA (indexed) for CRAM input.
     #[arg(short = 'T', long = "reference")]
@@ -44,10 +51,21 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let (mut reader, path) = AlignmentReader::open(&args.input, &options)?;
     let header = reader.read_header()?;
 
+    // samtools reads counts from the index for BAM only.
     let index_stats = match (reader.format(), &path) {
-        (Format::Bam, Some(path)) => bam::fs::read_associated_index(path)
-            .ok()
-            .and_then(|index| from_index(&index, &header)),
+        (Format::Bam, Some(path)) => {
+            match AlignmentIndex::read(Format::Bam, path, args.index.as_deref()) {
+                Ok(AlignmentIndex::Bam(index)) => from_index(&index, &header),
+                _ => {
+                    eprintln!(
+                        "samtools idxstats: fail to load index for \"{}\", reverting to slow \
+                         method",
+                        args.input
+                    );
+                    None
+                }
+            }
+        }
         _ => None,
     };
 

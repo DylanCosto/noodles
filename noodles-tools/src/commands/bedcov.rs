@@ -3,11 +3,11 @@
 use std::{
     fs,
     io::{self, BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
 };
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use noodles_sam::alignment::record::Flags;
 
 use crate::{
@@ -24,9 +24,14 @@ pub struct Args {
     /// BED file of regions.
     bed: PathBuf,
 
-    /// Indexed BAM or CRAM files.
+    /// Indexed BAM or CRAM files; with `-X`, followed by their index files.
     #[arg(required = true)]
     inputs: Vec<String>,
+
+    /// The inputs are followed by their index files, in the same order (`-X in.bed a.bam b.bam
+    /// a.bai b.bai`).
+    #[arg(short = 'X')]
+    customized_index: bool,
 
     /// Exclude reads with mapping quality below this value.
     #[arg(short = 'Q', long = "min-MQ", default_value_t = 0)]
@@ -83,13 +88,25 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         reference: args.reference.clone(),
     };
 
-    let mut inputs = Vec::with_capacity(args.inputs.len());
+    let (sources, indexes) = if args.customized_index {
+        if !args.inputs.len().is_multiple_of(2) {
+            bail!("odd number of filenames detected! Each BAM file should have an index file");
+        }
 
-    for src in &args.inputs {
+        let (sources, indexes) = args.inputs.split_at(args.inputs.len() / 2);
+        (sources, Some(indexes))
+    } else {
+        (args.inputs.as_slice(), None)
+    };
+
+    let mut inputs = Vec::with_capacity(sources.len());
+
+    for (i, src) in sources.iter().enumerate() {
         let (mut reader, path) = AlignmentReader::open(src, &options)?;
         let header = reader.read_header()?;
         let path = path.with_context(|| format!("{src}: bedcov needs indexed files, not stdin"))?;
-        let index = AlignmentIndex::read(reader.format(), &path, None)?;
+        let explicit = indexes.map(|indexes| Path::new(&indexes[i]));
+        let index = AlignmentIndex::read(reader.format(), &path, explicit)?;
         inputs.push((reader, index, header));
     }
 
@@ -114,7 +131,7 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
     let mut out = BufWriter::new(output::raw_stdout()?);
 
     if args.print_header {
-        write_header(&mut out, &args)?;
+        write_header(&mut out, &args, sources)?;
     }
 
     let mut counts = vec![RegionCounts::default(); inputs.len()];
@@ -286,21 +303,21 @@ fn count_region(
     Ok(counts)
 }
 
-fn write_header<W: Write>(out: &mut W, args: &Args) -> io::Result<()> {
+fn write_header<W: Write>(out: &mut W, args: &Args, sources: &[String]) -> io::Result<()> {
     write!(out, "#chrom\tchromStart\tchromEnd")?;
 
-    for src in &args.inputs {
+    for src in sources {
         write!(out, "\t{src}_cov")?;
     }
 
     if args.depth_threshold.is_some() {
-        for src in &args.inputs {
+        for src in sources {
             write!(out, "\t{src}_depth")?;
         }
     }
 
     if args.read_counts {
-        for src in &args.inputs {
+        for src in sources {
             write!(out, "\t{src}_count")?;
         }
     }
