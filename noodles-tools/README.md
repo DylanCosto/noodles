@@ -75,6 +75,13 @@ pipeline, and marks the same 26,749 duplicates in identical records.
 corpus (short paired-end, tagged, and nanopore long reads; BAM, SAM, and CRAM 3.0/3.1). All
 checks pass.
 
+`scripts/make-edge-corpus.sh` builds small edge-case inputs (empty files, unmapped-only reads,
+`*` sequences and qualities, CIGARs of more than 65,535 operations, reads at and past the
+reference ends, every tag type, odd flags and headers, 400 tiny references) as SAM, BAM, and
+CRAM 2.1/3.0/3.1, and `scripts/compare-edge.sh` runs every command over them against samtools,
+comparing output, exit status, and whether anything was written to stderr, and checking that
+`-@ 1` and `-@ 4` agree. Expected differences are reported as KNOWN with their reason.
+
 Intentional differences:
 
 - `@PG` lines name ntools. Use `--no-PG` (or `-P` for `reheader`) for identical headers.
@@ -182,6 +189,22 @@ Intentional differences:
 - `fixmate -M`: a hard-clipped secondary or supplementary alignment whose `ML` tag is not a
   `B:C` array loses its base modification tags, as invalid ones are; samtools drops `ML` and
   every tag after it, and writes corrupt records when `ML` has fewer values than `MM` calls.
+- `fixmate` soft clips only read bases when it trims an alignment that runs past the end of
+  its reference: samtools also counts deletions and reference skips, so `3M10D2M` three bases
+  before the end becomes `3M3D9S` for a 5-base read, a corrupt record (ntools writes `3M3D2S`).
+  `checksum -a`, which only hashes the CIGAR, keeps samtools' result so checksums stay comparable.
+- Only CRAM 3.0 and 3.1 can be read; CRAM 2.1 input is an error ("unsupported CRAM version"),
+  except for `reheader`, which copies its containers. `quickcheck` reports a CRAM 2.1 header as
+  unreadable.
+- Headers with duplicate `@RG` or `@PG` IDs (or duplicate `@SQ` names) are rejected. samtools
+  warns and keeps both lines (it rejects duplicate `@SQ` names too).
+- An empty (0-byte) SAM file reads as a file with an empty header and no records; samtools fails
+  to read its header.
+- `mpileup`, `depth`, `coverage`, `fastq`, and `stats` decode `MD`/`NM` from CRAM as `view` does;
+  samtools turns off their regeneration in these commands, so, for example, `mpileup
+  --output-extra MD` prints `*` for CRAM records whose `MD` tag HTSlib dropped when writing.
+- Reading a CRAM detached record with the mate-reverse flag but not the paired flag (flag 52),
+  ntools keeps the flags as stored; HTSlib adds the paired flag (53).
 
 ## Performance
 
