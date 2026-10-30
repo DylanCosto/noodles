@@ -12,6 +12,7 @@ use noodles_sam::{
     alignment::record::data::field::{Tag, Value},
 };
 
+use crate::global_args::{self, InputFormatOptions, OutputFormatOptions};
 use crate::{
     alignment::{AlignmentReader, ReadOptions},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
@@ -39,7 +40,7 @@ pub struct Args {
     format: Option<String>,
 
     /// Zero-pad %# to this many digits.
-    #[arg(short = 'p', default_value_t = 0)]
+    #[arg(short = 'p', long = "zero-pad", default_value_t = 0)]
     pad: usize,
 
     /// Split by the value of this tag instead of by read group.
@@ -74,21 +75,37 @@ pub struct Args {
     /// Do not add an @PG line to the headers.
     #[arg(long = "no-PG")]
     no_pg: bool,
+
+    /// Index the output files (CSI for BAM, CRAI for CRAM).
+    #[arg(long = "write-index")]
+    write_index: bool,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    htslib_verbosity: global_args::Verbosity,
 }
 
 /// One output file.
 struct Group {
     writer: AlignmentWriter,
     header: sam::Header,
+    path: PathBuf,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let options = ReadOptions {
+    let mut options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    args.input_format_options.configure(&mut options)?;
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &options)?;
+    args.input_format_options.apply(&mut reader)?;
     let mut header = reader.read_header()?;
 
     if !args.no_pg {
@@ -97,7 +114,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let write_options = WriteOptions {
         format: args.output_format,
-        level: output::parse_level(6)?,
+        level: output::parse_level(args.output_format_options.level(6)?)?,
         threads: args.threads,
         reference: args.reference.clone(),
     };
@@ -212,12 +229,22 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         Ok(())
     })?;
 
+    let mut written = Vec::with_capacity(groups.len() + 1);
+
     for group in groups {
         group.writer.finish(&group.header)?;
+        written.push(group.path);
     }
 
     if let Some(writer) = unaccounted {
         writer.finish(&header)?;
+        written.extend(args.unaccounted.clone());
+    }
+
+    if args.write_index {
+        for path in &written {
+            global_args::write_index(Some(path), args.output_format, args.threads)?;
+        }
     }
 
     Ok(())
@@ -242,7 +269,12 @@ fn open_group(
 
     let mut writer = AlignmentWriter::create(Some(path), options, &header)?;
     writer.write_header(&header)?;
-    Ok(Group { writer, header })
+
+    Ok(Group {
+        writer,
+        header,
+        path: path.to_path_buf(),
+    })
 }
 
 /// The header with only the given read group's `@RG` line.

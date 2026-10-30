@@ -196,6 +196,24 @@ check "view -t" "$st view --no-PG -h -t $ref.fai nosq.sam | sort" "$nt view --no
 check "view -T (fai for SAM)" "$st view --no-PG -b -T $ref nosq.sam | $st view --no-PG -h -" "$nt view --no-PG -b -T $ref nosq.sam | $st view --no-PG -h -"
 check "view -S" "$st view -S -c $short" "$nt view -S -c $short"
 
+# view long-only options: flag edits, --rf, tag keeping, --no-header, --region-file, --save-counts,
+# subsampling (seeds from the header with auto; @CO line), -X/--customised-index, decode_md
+check "view --add-flags --remove-flags" "$st view --no-PG -f 0x40 --add-flags DUP,0x200 --remove-flags 0x40 $short" "$nt view --no-PG -f 0x40 --add-flags DUP,0x200 --remove-flags 0x40 $short"
+check "view --rf -F" "$st view --no-PG --rf 0x80,0x10 -F 0x400 $tagged" "$nt view --no-PG --rf 0x80,0x10 -F 0x400 $tagged"
+check "view -c --incl-flags" "$st view -c --incl-flags READ2 $tagged" "$nt view -c --incl-flags READ2 $tagged"
+check "view --keep-tag (overrides -x)" "$st view --no-PG -x NM --keep-tag NM,XA --keep-tag CB $tagged" "$nt view --no-PG -x NM --keep-tag NM,XA --keep-tag CB $tagged"
+check "view -x ^TAGS -b" "$st view --no-PG -b -x ^CB,UB -x AS $tagged | $st view --no-PG -" "$nt view --no-PG -b -x ^CB,UB -x AS $tagged | $st view --no-PG -"
+check "view --no-header" "$st view --no-PG -h --no-header $short | head -3; $st view --no-PG --no-header -h $short | head -3" "$nt view --no-PG -h --no-header $short | head -3; $nt view --no-PG --no-header -h $short | head -3"
+check "view --region-file" "$st view --no-PG --region-file q.bed $short" "$nt view --no-PG --region-file q.bed $short"
+check "view --save-counts" "$st view --no-PG -q 30 -U /dev/null --save-counts /dev/stdout -o /dev/null $short; $st view -c -f 2 --save-counts st.counts $short; cat st.counts" "$nt view --no-PG -q 30 -U /dev/null --save-counts /dev/stdout -o /dev/null $short; $nt view -c -f 2 --save-counts nt.counts $short; cat nt.counts"
+check "view --save-counts region" "$st view --no-PG -o /dev/null --save-counts /dev/stdout -q 20 $short chrS:100000-200000" "$nt view --no-PG -o /dev/null --save-counts /dev/stdout -q 20 $short chrS:100000-200000"
+for opts in "--subsample 0.3" "--subsample 0.3 --subsample-seed 42" "-s 42.3" "-s auto.25" "--subsample 0.5 --subsample-seed 0x10" "-r synthetic --subsample 0.5 --subsample-seed auto"; do
+    check "view -h $opts" "$st view --no-PG -h $opts $tagged" "$nt view --no-PG -h $opts $tagged"
+done
+check "view --customised-index (-X)" "$st view --no-PG --customised-index $short $corpus/short/input.bam.csi chrS:1-100000 chrS:300000-400000" "$nt view --no-PG --customised-index $short $corpus/short/input.bam.csi chrS:1-100000 chrS:300000-400000"
+check "view --QNAME-file" "$st view --no-PG --QNAME-file <($st view $short | head -100 | cut -f1) $short" "$nt view --no-PG --QNAME-file <($st view $short | head -100 | cut -f1) $short"
+check "view --input-fmt-option decode_md=0" "$st view --no-PG --input-fmt-option decode_md=0 -T $ref $corpus/short/input.3.1.cram chrS:1-100000" "$nt view --no-PG --input-fmt-option decode_md=0 -T $ref $corpus/short/input.3.1.cram chrS:1-100000"
+
 # statistics
 for set in short tagged long; do
     for fmt in default tsv json; do
@@ -468,6 +486,7 @@ if command -v python3 >/dev/null; then
             "$nt markdup --no-PG -f nt.md.stats $opts mdbc.named.bam - | $st view --no-PG -h -; tail -n +2 nt.md.stats"
     done
 fi
+check "markdup --write-index" "$st markdup --no-PG --write-index fixed.bam st.mdw.bam && ls st.mdw.bam.csi && $st view st.mdw.bam chrS:100000-150000" "$nt markdup --no-PG --write-index fixed.bam nt.mdw.bam && ls nt.mdw.bam.csi | sed s/nt/st/ && $st view nt.mdw.bam chrS:100000-150000"
 check "collate grouping" "$st view $short | cut -f1 | sort -u | wc -l" "$nt collate --no-PG -O $short | $st view - | awk -F'\\t' '\$1 != p { print \$1; p = \$1 }' | sort | uniq | wc -l"
 check "collate -n -r (accepted, ignored)" "$st view $short | cut -f1 | sort -u | wc -l" "$nt collate --no-PG -n 8 -r 100 -O $short | $st view - | awk -F'\\t' '\$1 != p { print \$1; p = \$1 }' | sort | uniq | wc -l"
 check "collate header (GO, SS kept)" "$st collate --no-PG -O short.name.bam | $st view --no-PG -H -" "$nt collate --no-PG -O short.name.bam | $st view --no-PG -H -"
@@ -565,6 +584,7 @@ cp "$corpus/fragmented-reference.fa" frag.fa
 check "faidx index" "cat expected.fai" "cat frag.fa.fai"
 check "faidx regions" "$st faidx -r $corpus/fasta-regions.1024.txt frag.fa" "$nt faidx -r $corpus/fasta-regions.1024.txt frag.fa"
 check "faidx -i -n 25 --mark-strand sign -c" "$st faidx -i -n 25 --mark-strand sign -c frag.fa nope $(head -1 frag.fa.fai | cut -f1):5-300" "$nt faidx -i -n 25 --mark-strand sign -c frag.fa nope $(head -1 frag.fa.fai | cut -f1):5-300"
+check "faidx -o .gz --output-fmt-option level=1" "$st faidx --output-fmt-option level=1 -o st.frag.fa.gz frag.fa $(head -2 frag.fa.fai | cut -f1 | tr '\n' ' ') && gzip -dc st.frag.fa.gz" "$nt faidx --output-fmt-option level=1 -o nt.frag.fa.gz frag.fa $(head -2 frag.fa.fai | cut -f1 | tr '\n' ' ') && gzip -dc nt.frag.fa.gz"
 bgzip=$(dirname "$st")/bgzip
 if [ -x "$bgzip" ]; then
     "$bgzip" -c frag.fa > frag.fa.gz
@@ -617,6 +637,13 @@ mkdir -p split-s split-n
 for f in multi_0.bam multi_1.bam u.bam; do
     check "split $f" "$st view --no-PG -h split-s/$f" "$st view --no-PG -h split-n/$f"
 done
+# split --zero-pad and --write-index (CSI, queried with samtools)
+mkdir -p split-ws split-wn
+(cd split-ws && "$st" split --no-PG --write-index --zero-pad 3 -u u.bam ../multi.bam)
+(cd split-wn && "$nt" split --no-PG --write-index --zero-pad 3 -u u.bam ../multi.bam)
+for f in multi_000.bam multi_001.bam u.bam; do
+    check "split --zero-pad --write-index $f" "ls split-ws/$f.*; $st view --no-PG -h split-ws/$f chrS:100000-150000" "ls split-wn/$f.* | sed s/split-wn/split-ws/; $st view --no-PG -h split-wn/$f chrS:100000-150000"
+done
 
 # dict, bedcov, addreplacerg
 check "dict" "$st dict -a A -s S -u U frag.fa" "$nt dict -a A -s S -u U frag.fa"
@@ -632,6 +659,9 @@ check "dict -A frag.fa" "$st dict -A -u U frag.fa" "$nt dict -A -u U frag.fa"
 check "bedcov -c -d 5" "$st bedcov -c -d 5 q.bed $short" "$nt bedcov -c -d 5 q.bed $short"
 check "bedcov long -j" "$st bedcov -j $(head -30 "$corpus/long/queries.100.bed" > lq.bed; echo lq.bed) $long" "$nt bedcov -j lq.bed $long"
 check "addreplacerg records" "$st addreplacerg --no-PG -r 'ID:z\tSM:z' multi.bam | grep -v '^@'" "$nt addreplacerg --no-PG -r 'ID:z\tSM:z' multi.bam | grep -v '^@'"
+check "addreplacerg --write-index" "$st addreplacerg --no-PG -r ID:z --write-index -o st.arg.bam multi.bam && ls st.arg.bam.csi && $st view st.arg.bam chrS:100000-150000" "$nt addreplacerg --no-PG -r ID:z --write-index -o nt.arg.bam multi.bam && ls nt.arg.bam.csi | sed s/nt/st/ && $st view nt.arg.bam chrS:100000-150000"
+check "addreplacerg --input-fmt cram,decode_md=0" "$st addreplacerg --no-PG -r ID:z --input-fmt cram,decode_md=0 --reference $ref $corpus/short/input.3.1.cram" "$nt addreplacerg --no-PG -r ID:z --input-fmt cram,decode_md=0 --reference $ref $corpus/short/input.3.1.cram"
+check "bedcov --min-mq" "$st bedcov --min-mq 30 q.bed $short" "$nt bedcov --min-mq 30 q.bed $short"
 
 # stats, without the version and command lines
 strip_stats="grep -v '^# This file was produced\|^# The command line'"
@@ -674,6 +704,8 @@ check "mpileup long -f -@8" "$st mpileup -f $long_ref mp.long.bam 2>/dev/null" "
 check "mpileup CRAM -f" "$st mpileup -f $ref -r chrS:1-300000 $corpus/short/input.3.1.cram 2>/dev/null" "$nt mpileup -f $ref -r chrS:1-300000 $corpus/short/input.3.1.cram 2>/dev/null"
 check "mpileup -aa -r -l -s -O --output-extra" "$st mpileup -aa -r chrS:1000-60000 -l targets.txt -s -O --output-BP-5 --output-extra QNAME,FLAG,RG,NM mp.short.bam 2>/dev/null" "$nt mpileup -aa -r chrS:1000-60000 -l targets.txt -s -O --output-BP-5 --output-extra QNAME,FLAG,RG,NM mp.short.bam 2>/dev/null"
 check "mpileup long ins/del options -@8" "$st mpileup --reverse-del --no-output-ins --no-output-del --no-output-ends -f $long_ref mp.long.bam 2>/dev/null" "$nt mpileup -@ 8 --reverse-del --no-output-ins --no-output-del --no-output-ends -f $long_ref mp.long.bam 2>/dev/null"
+# --reference stands in for -f
+check "mpileup --reference" "$st mpileup --reference $ref -r chrS:1-100000 mp.short.bam 2>/dev/null" "$nt mpileup --reference $ref -r chrS:1-100000 mp.short.bam 2>/dev/null"
 
 if [ -f md.bam ]; then
     check "mpileup overlapping pairs -A -Q 0 -d 3" "$st mpileup -A -Q 0 -d 3 md.bam 2>/dev/null" "$nt mpileup -A -Q 0 -d 3 md.bam 2>/dev/null"
@@ -717,6 +749,30 @@ check "view CRAM without MD/NM" "$st view -T $ref mp.short.nomd.cram" "$nt view 
 check "view long CRAM with dropped MD/NM" "$st view -T $long_ref mp.long.cram" "$nt view -T $long_ref mp.long.cram"
 check "consensus CRAM with dropped MD/NM" "$st consensus mp.short.cram" "$nt consensus mp.short.cram"
 
+# Regenerated MD and NM go after the stored tags, MD first; a stored NM (here a wrong one, so
+# kept) stays before a regenerated MD, and a stored wrong MD before a regenerated NM.
+"$st" view -h mp.short.bam | awk 'BEGIN { OFS = "\t" } /^@/ { print; next } { n++; for (i = 12; i <= NF; i++) { if (n % 3 == 1 && $i ~ /^MD:Z:/) $i = "MD:Z:0A0" substr($i, 6); if (n % 3 == 2 && $i ~ /^NM:i:/) $i = "NM:i:99" } print }' > mp.mixmd.sam
+"$st" view -C -T "$ref" -o mp.mixmd.cram mp.mixmd.sam && "$st" index mp.mixmd.cram
+check "view CRAM with stored and regenerated MD/NM" "$st view -T $ref mp.mixmd.cram" "$nt view -T $ref mp.mixmd.cram"
+check "view CRAM with stored and regenerated MD/NM -@4 -b" "$st view -b -T $ref mp.mixmd.cram | $st view" "$nt view -@ 4 -b -T $ref mp.mixmd.cram | $st view"
+check "view CRAM region with regenerated MD/NM" "$st view -T $ref mp.mixmd.cram chrS:50000-150000" "$nt view -T $ref mp.mixmd.cram chrS:50000-150000"
+# samtools fastq and mpileup turn regeneration off (CRAM_OPT_DECODE_MD=0): only stored tags show
+check "fastq -T MD,NM CRAM (no regeneration)" "$st fastq -T MD,NM --reference $ref mp.mixmd.cram" "$nt fastq -T MD,NM --reference $ref mp.mixmd.cram"
+check "mpileup --output-extra MD,NM CRAM (no regeneration)" "$st mpileup -f $ref --output-extra NM,MD mp.mixmd.cram 2>/dev/null" "$nt mpileup -f $ref --output-extra NM,MD mp.mixmd.cram 2>/dev/null"
+
+# samtools' shared long options: --verbosity (ignored), --write-index where there is nothing to
+# index (ignored, as samtools does), --input-fmt-option decode_md, --output-fmt-option level
+# (compressed SAM compared decompressed: samtools writes BGZF SAM when a level is given)
+g="--verbosity 1"
+check "head/flagstat/idxstats/depth/coverage shared options" "$st head $g --write-index --input-fmt-option decode_md=0 -n 3 -T $ref mp.mixmd.cram; $st flagstat $g --write-index --input-fmt-option decode_md=0 $short; $st idxstats $g --write-index $short; $st depth $g --write-index -r chrS:1-3000 $short; $st coverage $g --write-index $short" "$nt head $g --write-index --input-fmt-option decode_md=0 -n 3 -T $ref mp.mixmd.cram; $nt flagstat $g --write-index --input-fmt-option decode_md=0 $short; $nt idxstats $g --write-index $short; $nt depth $g --write-index -r chrS:1-3000 $short; $nt coverage $g --write-index $short"
+check "stats/cram-size/reference shared options" "$st stats $g --write-index --input-fmt-option decode_md=0 --reference $ref mp.mixmd.cram | grep -v '^#' | grep -v '^ID'; $st cram-size $g --write-index mp.mixmd.cram; $st reference $g --write-index mp.short.bam | md5sum" "$nt stats $g --write-index --input-fmt-option decode_md=0 --reference $ref mp.mixmd.cram | grep -v '^#' | grep -v '^ID'; $nt cram-size $g --write-index mp.mixmd.cram; $nt reference $g --write-index mp.short.bam | md5sum"
+for cmd in "fixmate -O sam" "reset -O sam" "ampliconclip -b /dev/null -O sam" "rmdup -O sam"; do
+    check "${cmd%% *} shared options" "$st $cmd --no-PG $g --write-index --input-fmt-option decode_md=0 --output-fmt-option level=1 --reference $ref mp.mixmd.cram - 2>/dev/null | gzip -dcf" "$nt $cmd --no-PG $g --write-index --input-fmt-option decode_md=0 --output-fmt-option level=1 --reference $ref mp.mixmd.cram - 2>/dev/null | gzip -dcf"
+done
+check "collate/cat/calmd shared options" "$st collate --no-PG $g --write-index --input-fmt-option decode_md=0 --output-fmt-option level=1 -O --reference $ref mp.mixmd.cram | $st view | sort; $st cat --no-PG $g --write-index --output-fmt-option level=1 mp.short.bam | $st view; $st calmd --no-PG $g --write-index --input-fmt-option decode_md=0 --output-fmt-option level=1 -b mp.short.bam $ref 2>/dev/null | $st view" "$nt collate --no-PG $g --write-index --input-fmt-option decode_md=0 --output-fmt-option level=1 -O --reference $ref mp.mixmd.cram | $st view | sort; $nt cat --no-PG $g --write-index --output-fmt-option level=1 mp.short.bam | $st view; $nt calmd --no-PG $g --write-index --input-fmt-option decode_md=0 --output-fmt-option level=1 -b mp.short.bam $ref 2>/dev/null | $st view"
+check "fastq/bedcov/mpileup/checksum shared options" "$st fastq $g --write-index --input-fmt-option decode_md=1 -T MD,NM --reference $ref mp.mixmd.cram 2>/dev/null; $st bedcov $g --write-index --input-fmt-option decode_md=0 q.bed $short; $st mpileup $g --write-index --input-fmt-option decode_md=1 -f $ref --output-extra NM,MD -r chrS:1-50000 mp.mixmd.cram 2>/dev/null; $st checksum $g --write-index $short" "$nt fastq $g --write-index --input-fmt-option decode_md=1 -T MD,NM --reference $ref mp.mixmd.cram 2>/dev/null; $nt bedcov $g --write-index --input-fmt-option decode_md=0 q.bed $short; $nt mpileup $g --write-index --input-fmt-option decode_md=1 -f $ref --output-extra NM,MD -r chrS:1-50000 mp.mixmd.cram 2>/dev/null; $nt checksum $g --write-index $short"
+check "addreplacerg --output-fmt-option level=0" "$st addreplacerg --no-PG $g -r ID:z --output-fmt-option level=0 -O bam mp.short.bam | $st view" "$nt addreplacerg --no-PG $g -r ID:z --output-fmt-option level=0 -O bam mp.short.bam | $st view"
+
 # import: FASTQ written by samtools fastq (with MM/ML tags, paired files, interleaved names)
 "$st" fastq -T MM,ML mp.long.bam > imp.long.fq 2>/dev/null
 "$st" collate -u -O mp.short.bam 2>/dev/null | "$st" fastq -1 imp.R1.fq -2 imp.R2.fq -s imp.S.fq -0 /dev/null - 2>/dev/null
@@ -735,6 +791,7 @@ check "reset" "$st reset --no-PG $tagged" "$nt reset --no-PG $tagged"
 check "reset CRAM" "$st reset --no-PG $corpus/short/input.3.1.cram" "$nt reset --no-PG $corpus/short/input.3.1.cram"
 check "checksum" "$st checksum $tagged" "$nt checksum $tagged"
 check "checksum -a long" "$st checksum -a $long" "$nt checksum -a $long"
+check "checksum --input-fmt-option decode_md=0" "$st checksum -t '*' --input-fmt-option decode_md=0 --reference $ref mp.mixmd.cram" "$nt checksum -t '*' --input-fmt-option decode_md=0 --reference $ref mp.mixmd.cram"
 
 if [ -f md.bam ]; then
     check "reset --dupflag -x ^RG,ms --reject-PG" "$st reset --no-PG --dupflag -x '^RG,ms' --reject-PG samtools.1 md.bam" "$nt reset --no-PG --dupflag -x '^RG,ms' --reject-PG samtools.1 md.bam"
@@ -814,6 +871,7 @@ check "calmd -e -r -A -E -@4" "$st calmd --no-PG -e -r -A -E mp.short.bam $ref 2
 check "calmd -r -n 1 -d -q -C 50" "$st calmd --no-PG -r -n 1 -d -q -C 50 mp.short.bam $ref 2>/dev/null" "$nt calmd --no-PG -r -n 1 -d -q -C 50 mp.short.bam $ref 2>/dev/null"
 check "calmd long -e -r -A -@8" "$st calmd --no-PG -e -r -A mp.long.bam $long_ref 2>/dev/null" "$nt calmd --no-PG -@ 8 -e -r -A mp.long.bam $long_ref 2>/dev/null"
 check "calmd CRAM -u" "$st calmd --no-PG -u $corpus/short/input.3.1.cram $ref 2>/dev/null | $st view -h -" "$nt calmd --no-PG -u $corpus/short/input.3.1.cram $ref 2>/dev/null | $st view -h -"
+check "calmd --output-fmt BAM" "$st calmd --no-PG --output-fmt BAM mp.short.bam $ref 2>/dev/null | $st view -h -" "$nt calmd --no-PG --output-fmt BAM mp.short.bam $ref 2>/dev/null | $st view -h -"
 
 # cram-size
 for set in short tagged long; do
@@ -866,6 +924,25 @@ check "bedcov -j -d" "$st bedcov -j -d 5 dcov.bed $tagged" "$nt bedcov -j -d 5 d
 # bedcov -X: index files follow the inputs
 ln -sf "$short" bedcov.bam
 check "bedcov -X" "$st bedcov -H -c -X q.bed bedcov.bam $tagged $corpus/short/input.bam.csi $corpus/tagged/input.bam.bai" "$nt bedcov -H -c -X q.bed bedcov.bam $tagged $corpus/short/input.bam.csi $corpus/tagged/input.bam.bai"
+
+# bedcov --max-depth: HTSlib's pileup limit, on reads that start together, an empty read, deletions,
+# and skips (the read count -c counts only the reads the pileup keeps); at least the -d threshold
+printf "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:a\tLN:40\n@SQ\tSN:b\tLN:30\n" > bedcov.cap.sam
+for r in "5 5S AAAAA" "5 3M AAA" "5 3M AAA" "5 2M1D1M AAA" "5 4I AAAA" "6 1M A" "6 6M AAAAAA" \
+    "6 2M3N2M AAAA" "8 3M AAA" "8 3M AAA" "8 1M2D1M AA" "8 3M AAA" "9 2S2M AAAA"; do
+    read -r pos cigar seq <<<"$r"
+    printf "r\t0\ta\t%s\t30\t%s\t*\t0\t0\t%s\t%s\n" "$pos" "$cigar" "$seq" "$(echo "$seq" | tr A I)" >> bedcov.cap.sam
+done
+printf "s\t0\tb\t3\t30\t2M\t*\t0\t0\tAA\tII\n" >> bedcov.cap.sam
+"$st" view -b -o bedcov.cap.bam bedcov.cap.sam && "$st" index bedcov.cap.bam
+printf "a\t0\t40\nb\t0\t30\na\t5\t9\n" > bedcov.cap.bed
+for d in -1 0 1 2 3 100; do
+    check "bedcov -c --max-depth $d" "$st bedcov -c --max-depth $d bedcov.cap.bed bedcov.cap.bam" "$nt bedcov -c --max-depth $d bedcov.cap.bed bedcov.cap.bam"
+done
+check "bedcov -c -j -d 3 --max-depth 1" "$st bedcov -c -j -d 3 --max-depth 1 bedcov.cap.bed bedcov.cap.bam" "$nt bedcov -c -j -d 3 --max-depth 1 bedcov.cap.bed bedcov.cap.bam"
+check "bedcov -c --max-depth 2 two inputs" "$st bedcov -c --max-depth 2 q.bed $short $tagged" "$nt bedcov -c --max-depth 2 q.bed $short $tagged"
+check "bedcov long -c -j --max-depth 2" "$st bedcov -c -j --max-depth 2 lq.bed $long" "$nt bedcov -c -j --max-depth 2 lq.bed $long"
+check "bedcov CRAM -c --max-depth 1" "$st bedcov -c --max-depth 1 --reference $ref q.bed $corpus/short/input.3.1.cram" "$nt bedcov -c --max-depth 1 --reference $ref q.bed $corpus/short/input.3.1.cram"
 
 # depth: -s (overlapping mates), -l (soft clips excluded), deletions' qualities with -J -q, and
 # spliced reads' skips

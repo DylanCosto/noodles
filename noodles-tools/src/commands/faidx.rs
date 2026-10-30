@@ -17,7 +17,11 @@ use flate2::read::DeflateDecoder;
 use noodles_bgzf as bgzf;
 use noodles_fasta::fai;
 
+use crate::global_args::{OutputFormatOptions, Verbosity};
 use crate::{hts_region, sequence::reverse_complement};
+
+/// samtools faidx's BGZF compression level for compressed output.
+const DEFAULT_BGZF_LEVEL: u8 = 4;
 
 /// samtools' default line length (`DEFAULT_FASTA_LINE_LEN`).
 const DEFAULT_LINE_LENGTH: i64 = 60;
@@ -88,6 +92,12 @@ pub struct Args {
     /// Print help.
     #[arg(short = 'h', long = "help", action = clap::ArgAction::Help)]
     help: Option<bool>,
+
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// One indexed sequence (`faidx1_t`).
@@ -847,7 +857,15 @@ fn run_with_format(args: Args, format: SequenceFormat) -> anyhow::Result<ExitCod
                     bail!("--write-index with compressed output is not supported");
                 }
 
-                Box::new(bgzf::io::Writer::new(file))
+                let level = args.output_format_options.level(DEFAULT_BGZF_LEVEL)?;
+                let level = bgzf::io::writer::CompressionLevel::new(level)
+                    .with_context(|| format!("invalid compression level: {level}"))?;
+
+                Box::new(
+                    bgzf::io::writer::Builder::default()
+                        .set_compression_level(level)
+                        .build_from_writer(file),
+                )
             } else {
                 Box::new(BufWriter::new(file))
             }

@@ -70,6 +70,9 @@ pub struct DepthWindow {
     ops: Vec<u32>,
     quality_scores: Vec<u8>,
     cap: Option<PileupCap>,
+    /// HTSlib's pileup reference sequence and 0-based position, as far as adding reads goes:
+    /// the last added read's.
+    pileup: (usize, usize),
 }
 
 impl DepthWindow {
@@ -90,10 +93,17 @@ impl DepthWindow {
         }
     }
 
-    /// Adds a record's aligned bases, first emitting every position before its start.
+    /// Adds a record's aligned bases, first emitting every position before its start. Returns
+    /// whether HTSlib's pileup would buffer the record (and call its constructor): not if the
+    /// maximum count leaves it out, or if it is empty and starts at the pileup's position.
     ///
     /// `emit` receives `(reference sequence ID, position, cell)` for every touched position.
-    pub fn add<F>(&mut self, record: &Rec<'_>, header: &sam::Header, emit: &mut F) -> io::Result<()>
+    pub fn add<F>(
+        &mut self,
+        record: &Rec<'_>,
+        header: &sam::Header,
+        emit: &mut F,
+    ) -> io::Result<bool>
     where
         F: FnMut(usize, usize, Cell) -> io::Result<()>,
     {
@@ -108,7 +118,7 @@ impl DepthWindow {
         header: &sam::Header,
         clip: usize,
         emit: &mut F,
-    ) -> io::Result<()>
+    ) -> io::Result<bool>
     where
         F: FnMut(usize, usize, Cell) -> io::Result<()>,
     {
@@ -119,7 +129,7 @@ impl DepthWindow {
         };
 
         let Some((id, start)) = record_position(record, raw.as_ref(), header)? else {
-            return Ok(());
+            return Ok(true);
         };
 
         if self.reference_sequence_id != Some(id) {
@@ -147,12 +157,15 @@ impl DepthWindow {
         if let Some(cap) = &mut self.cap
             && !cap.admit(id, start - 1, start - 1 + span)
         {
-            return Ok(());
+            return Ok(false);
         }
+
+        let buffered = span > 0 || id != self.pileup.0 || start - 1 > self.pileup.1;
+        self.pileup = (id, start - 1);
 
         self.count_bases(start, span, needs_quality, clip);
 
-        Ok(())
+        Ok(buffered)
     }
 
     /// Reads a record's CIGAR, BAM-encoded, and its qualities if counting needs them; returns

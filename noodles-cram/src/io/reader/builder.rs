@@ -6,12 +6,13 @@ use std::{
 
 use noodles_fasta as fasta;
 
-use super::Reader;
+use super::{MdNm, Reader};
 
 /// A CRAM reader builder.
 #[derive(Debug, Default)]
 pub struct Builder {
     reference_sequence_repository: fasta::Repository,
+    md_nm: MdNm,
 }
 
 impl Builder {
@@ -33,6 +34,21 @@ impl Builder {
         reference_sequence_repository: fasta::Repository,
     ) -> Self {
         self.reference_sequence_repository = reference_sequence_repository;
+        self
+    }
+
+    /// Sets whether decoded records get the MD and NM tags the file left out.
+    ///
+    /// By default, they are regenerated, as HTSlib does.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use noodles_cram::io::reader::{Builder, MdNm};
+    /// let builder = Builder::default().set_md_nm(MdNm::AsStored);
+    /// ```
+    pub fn set_md_nm(mut self, md_nm: MdNm) -> Self {
+        self.md_nm = md_nm;
         self
     }
 
@@ -69,6 +85,7 @@ impl Builder {
         Reader {
             inner: reader,
             reference_sequence_repository: self.reference_sequence_repository,
+            md_nm: self.md_nm,
         }
     }
 }

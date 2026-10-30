@@ -5,18 +5,25 @@
 //! NM after the stored tags. This ports `cram_decode_seq`'s MD/NM generation (HTSlib 1.24), so
 //! records decode with the same tags. A `cF` tag (CRAM flags) is removed; its bits 1 and 2 stop
 //! MD and NM from being generated.
+//!
+//! Placement follows HTSlib: a regenerated MD goes after every stored tag, and a regenerated NM
+//! after that (so a stored NM stays where it was, before a regenerated MD). The read group, a
+//! separate data series, comes last. HTSlib's decoder also accepts `MD*` and `NM*` placeholder
+//! tags that mark where regenerated tags go, but no HTSlib release writes them; noodles does not
+//! read them.
 
 use std::{borrow::Cow, io::Write};
 
 use noodles_sam::alignment::record::data::field::Tag;
 
 use super::{Feature, Record, data::field::Value};
-use crate::io::reader::container::slice::ReferenceSequence;
+use crate::io::reader::{MdNm, container::slice::ReferenceSequence};
 
 const CRAM_FLAGS: Tag = Tag::new(b'c', b'F');
 
-/// Removes a `cF` tag and adds the MD and NM tags HTSlib generates for this record.
-pub(crate) fn add_missing_md_nm(record: &mut Record<'_>) {
+/// Removes a `cF` tag and, with [`MdNm::Regenerate`], adds the MD and NM tags HTSlib generates
+/// for this record.
+pub(crate) fn add_missing_md_nm(record: &mut Record<'_>, md_nm: MdNm) {
     let mut cram_flags = 0;
 
     if let Some(i) = record.data.iter().position(|(tag, _)| *tag == CRAM_FLAGS)
@@ -26,7 +33,10 @@ pub(crate) fn add_missing_md_nm(record: &mut Record<'_>) {
         record.data.remove(i);
     }
 
-    if record.bam_flags.is_unmapped() || record.cram_flags.sequence_is_missing() {
+    if md_nm == MdNm::AsStored
+        || record.bam_flags.is_unmapped()
+        || record.cram_flags.sequence_is_missing()
+    {
         return;
     }
 
@@ -351,10 +361,15 @@ mod tests {
         let header = header();
         let mut r = record(&header, Vec::new());
         r.data.push((CRAM_FLAGS, Value::UInt8(2)));
-        add_missing_md_nm(&mut r);
+        add_missing_md_nm(&mut r, MdNm::Regenerate);
 
         assert_eq!(r.data.len(), 1);
         assert_eq!(r.data[0].0, Tag::MISMATCHED_POSITIONS);
         assert!(matches!(&r.data[0].1, Value::String(s) if s.as_ref() == BStr::new("3N4")));
+
+        let mut r = record(&header, Vec::new());
+        r.data.push((CRAM_FLAGS, Value::UInt8(2)));
+        add_missing_md_nm(&mut r, MdNm::AsStored);
+        assert!(r.data.is_empty());
     }
 }

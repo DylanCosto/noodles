@@ -8,6 +8,7 @@ use std::{
 use anyhow::Context;
 use noodles_sam as sam;
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentReader, ReadOptions},
     output::{AlignmentWriter, OutputFormat, WriteOptions},
@@ -39,15 +40,26 @@ pub struct Args {
     /// Print help.
     #[arg(long = "help", action = clap::ArgAction::Help)]
     help: Option<bool>,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let read_options = ReadOptions {
+    let mut read_options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    args.input_format_options.configure(&mut read_options)?;
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &read_options)?;
+    args.input_format_options.apply(&mut reader)?;
     let header = reader
         .read_header()
         .with_context(|| format!("[head] failed to read the header from \"{}\"", args.input))?;

@@ -291,6 +291,8 @@ pub(super) fn read_input(
     tx: &crossbeam_channel::Sender<anyhow::Result<Vec<Read>>>,
 ) -> anyhow::Result<()> {
     let (mut reader, path) = AlignmentReader::open(input, read_options)?;
+    // samtools mpileup sets CRAM_OPT_DECODE_MD to 0, so --output-extra sees stored tags only.
+    reader.keep_stored_md_nm();
     let header = reader.read_header()?;
     let names: Vec<Vec<u8>> = header
         .reference_sequences()

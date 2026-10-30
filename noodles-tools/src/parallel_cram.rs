@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::Context;
-use noodles_cram as cram;
+use noodles_cram::{self as cram, io::reader::MdNm};
 use noodles_fasta as fasta;
 use noodles_sam as sam;
 
@@ -38,6 +38,7 @@ where
     M: FnMut(T) -> anyhow::Result<()>,
 {
     let workers = workers.max(1);
+    let md_nm = reader.md_nm();
 
     thread::scope(|scope| {
         let (work_tx, work_rx) = crossbeam_channel::bounded::<(u64, cram::io::reader::Container)>(
@@ -70,7 +71,7 @@ where
 
             scope.spawn(move || {
                 for (id, container) in work_rx {
-                    let result = decode_container(&container, header, repository, fold);
+                    let result = decode_container(&container, header, repository, md_nm, fold);
 
                     if done_tx.send((id, result)).is_err() {
                         break;
@@ -105,6 +106,7 @@ fn decode_container<T, F>(
     container: &cram::io::reader::Container,
     header: &sam::Header,
     repository: &fasta::Repository,
+    md_nm: MdNm,
     fold: &F,
 ) -> io::Result<T>
 where
@@ -118,12 +120,13 @@ where
         let slice = result?;
         let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
 
-        let records = slice.records(
+        let records = slice.records_with_md_nm(
             repository.clone(),
             header,
             &compression_header,
             &core_data_src,
             &external_data_srcs,
+            md_nm,
         )?;
 
         for record in &records {

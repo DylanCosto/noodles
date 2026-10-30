@@ -56,6 +56,7 @@ use self::{
     },
     report::{write_json_report, write_stats},
 };
+use crate::global_args::{self, InputFormatOptions, OutputFormatOptions, Verbosity};
 
 /// Base qualities below this are not scored (`MD_MIN_QUALITY`).
 const MIN_SCORED_QUALITY: u8 = 15;
@@ -162,6 +163,10 @@ pub struct Args {
     #[arg(long = "duplicate-count")]
     duplicate_count: bool,
 
+    /// Index the output file (CSI for BAM, CRAI for CRAM).
+    #[arg(long = "write-index")]
+    write_index: bool,
+
     /// Output format [default: from the output extension, else BAM].
     #[arg(short = 'O', long = "output-fmt", ignore_case = true)]
     output_format: Option<OutputFormat>,
@@ -207,6 +212,15 @@ pub struct Args {
     /// The separator removed with the UMI from read names.
     #[arg(long = "umi-separator", default_value = ":")]
     umi_separator: String,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// `key_data_t`. Single-read keys leave the mate fields zero, so derived equality matches
@@ -369,12 +383,14 @@ struct Options {
 pub fn run(args: Args) -> anyhow::Result<()> {
     let names = ReadNameOptions::from_args(&args)?;
 
-    let read_options = ReadOptions {
+    let mut read_options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    args.input_format_options.configure(&mut read_options)?;
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &read_options)?;
+    args.input_format_options.apply(&mut reader)?;
     let mut header = reader.read_header()?;
 
     let is_queryname_sorted = header
@@ -463,6 +479,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     writer.finish(&header)?;
 
+    if args.write_index {
+        global_args::write_index(Some(&args.output), output_format(&args), args.threads)?;
+    }
+
     state.report_warnings();
 
     if args.stats || args.stats_file.is_some() || args.json {
@@ -544,16 +564,22 @@ fn read_group_indices(header: &sam::Header) -> HashMap<Vec<u8>, usize> {
         .collect()
 }
 
+/// The output format: `-O`, else from the output extension, else BAM.
+fn output_format(args: &Args) -> OutputFormat {
+    args.output_format
+        .or_else(|| OutputFormat::from_path(&args.output))
+        .unwrap_or(OutputFormat::Bam)
+}
+
 /// Opens the output, with a temporary file for records held back for `-S`.
 fn open_output(args: &Args, header: &sam::Header) -> anyhow::Result<Output> {
-    let format = args
-        .output_format
-        .or_else(|| OutputFormat::from_path(&args.output))
-        .unwrap_or(OutputFormat::Bam);
-
     let write_options = WriteOptions {
-        format,
-        level: output::parse_level(if args.uncompressed { 0 } else { 6 })?,
+        format: output_format(args),
+        level: output::parse_level(if args.uncompressed {
+            0
+        } else {
+            args.output_format_options.level(6)?
+        })?,
         threads: args.threads,
         reference: args.reference.clone(),
     };

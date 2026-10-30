@@ -467,6 +467,19 @@ pub fn unmap(record: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
+/// Sets the `add` flag bits of a record, then clears the `remove` ones (samtools view's
+/// `--add-flags` and `--remove-flags`).
+///
+/// # Errors
+///
+/// Returns an error if the record is too short to hold flags.
+pub fn edit_flags(record: &mut [u8], add: u16, remove: u16) -> io::Result<()> {
+    let field = record.get_mut(field::FLAGS).ok_or_else(truncated)?;
+    let flags = (le_u16(field) | add) & !remove;
+    field.copy_from_slice(&flags.to_le_bytes());
+    Ok(())
+}
+
 /// `bam_remove_B` (samtools' `bam.c`, 1.24): collapses backward (`B`) CIGAR operations, merging
 /// the overlapping bases into a consensus. A `B` that cannot be removed (first in the CIGAR, or
 /// longer than the query before it) marks the record unmapped instead.

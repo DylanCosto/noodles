@@ -10,6 +10,7 @@ use std::{collections::HashSet, path::PathBuf};
 use anyhow::bail;
 use noodles_sam as sam;
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, OutputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentReader, RawEncoder, ReadOptions},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
@@ -80,6 +81,18 @@ pub struct Args {
     /// Additional threads for compression and decompression.
     #[arg(short = '@', long = "threads", default_value_t = 0)]
     threads: usize,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// Which tags records keep (`update_aux_conf`): a keep list takes priority over a remove list.
@@ -132,12 +145,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     };
 
-    let read_options = ReadOptions {
+    let mut read_options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    args.input_format_options.configure(&mut read_options)?;
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &read_options)?;
+    args.input_format_options.apply(&mut reader)?;
     let input_header = reader.read_header()?;
     let mut header = output_header(&input_header, &args)?;
 
@@ -152,7 +167,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let write_options = WriteOptions {
         format,
-        level: output::parse_level(6)?,
+        level: output::parse_level(args.output_format_options.level(6)?)?,
         threads: args.threads,
         reference: args.reference.clone(),
     };
