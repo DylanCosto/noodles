@@ -20,12 +20,10 @@ use noodles_sam as sam;
 use regex::bytes::Regex;
 
 use crate::{
-    bam_raw,
+    bam_raw::{self, BASES},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     source::{Compression, Input},
 };
-
-const SEQ_NT16_STR: &[u8; 16] = b"=ACMGRSVTWYHKDBN";
 
 const FLAG_PAIRED: u16 = 0x1;
 const FLAG_UNMAPPED: u16 = 0x4;
@@ -1255,7 +1253,7 @@ fn append_index(bases: &mut Vec<u8>, qualities: &mut Vec<u8>, record: &[u8]) {
 
     for i in 0..len {
         let code = (record[seq_start + i / 2] >> (4 * (1 - i % 2))) & 0xf;
-        bases.push(SEQ_NT16_STR[usize::from(code)]);
+        bases.push(BASES[usize::from(code)]);
         qualities.push(record[qual_start + i].wrapping_add(b'!'));
     }
 }

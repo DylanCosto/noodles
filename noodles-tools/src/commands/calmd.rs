@@ -13,7 +13,7 @@ use noodles_pileup::{
 };
 
 use crate::{
-    alignment::{AlignmentReader, ReadOptions, Rec},
+    alignment::{AlignmentReader, RawEncoder, ReadOptions},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     program,
     reference::IndexedFasta,
@@ -172,7 +172,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut reference: Option<Arc<Vec<u8>>> = None;
     let mut cache: Vec<Option<Arc<Vec<u8>>>> = Vec::new();
     let mut skipped = 0u32;
-    let mut encoder = noodles_bam::io::Writer::from(Vec::new());
+    let mut encoder = RawEncoder::new();
     let mut batch: Vec<Job> = Vec::with_capacity(BATCH_SIZE);
 
     let context = Context {
@@ -199,16 +199,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     };
 
     reader.for_each(&input_header, |rec| {
-        use noodles_sam::alignment::io::Write as _;
-
-        let raw = match &rec {
-            Rec::Bam(r) => r.as_ref().to_vec(),
-            _ => {
-                encoder.get_mut().clear();
-                encoder.write_alignment_record(&input_header, rec.as_dyn())?;
-                encoder.get_ref()[size_of::<u32>()..].to_vec()
-            }
-        };
+        let raw = rec.encode_raw(&input_header, &mut encoder)?.to_vec();
 
         let tid = crate::bam_raw::le_u32(&raw[0..4]).cast_signed();
 

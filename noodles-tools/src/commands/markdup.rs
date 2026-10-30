@@ -27,20 +27,17 @@ use anyhow::{Context, bail};
 use noodles_bam as bam;
 use noodles_sam::{
     self as sam,
-    alignment::{
-        io::Write as _,
-        record::{
-            Flags,
-            cigar::op::Kind,
-            data::field::{Tag, Value},
-        },
+    alignment::record::{
+        Flags,
+        cigar::op::Kind,
+        data::field::{Tag, Value},
     },
     header::record::value::map::header::{sort_order::QUERY_NAME, tag::SORT_ORDER},
 };
 use regex::bytes::{Regex, RegexBuilder};
 
 use crate::{
-    alignment::{AlignmentReader, ReadOptions, Rec},
+    alignment::{AlignmentReader, RawEncoder, ReadOptions},
     bam_raw::{self, field, le_u16, le_u32},
     bgzf_stream::{BgzfReader, BgzfWriter},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
@@ -541,18 +538,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let mut prev_tid: i32 = 0;
     let mut prev_coord: i64 = 0;
-    let mut encoder = bam::io::Writer::from(Vec::new());
+    let mut encoder = RawEncoder::new();
     let mut cleared = Vec::new();
 
     reader.for_each(&header.clone(), |rec| {
-        let mut raw: Vec<u8> = match &rec {
-            Rec::Bam(r) => r.as_ref().to_vec(),
-            _ => {
-                encoder.get_mut().clear();
-                encoder.write_alignment_record(&header, rec.as_dyn())?;
-                encoder.get_ref()[size_of::<u32>()..].to_vec()
-            }
-        };
+        let mut raw: Vec<u8> = rec.encode_raw(&header, &mut encoder)?.to_vec();
 
         if args.clear && flags_of(&raw).is_duplicate() {
             let flags = flags_of(&raw) - Flags::DUPLICATE;

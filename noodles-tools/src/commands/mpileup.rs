@@ -26,7 +26,7 @@ use noodles_pileup::{
 use noodles_sam as sam;
 
 use crate::{
-    alignment::{AlignmentReader, Queries, ReadOptions, Rec},
+    alignment::{AlignmentReader, Queries, RawEncoder, ReadOptions, Rec},
     flags, output,
     reference::IndexedFasta,
 };
@@ -1194,7 +1194,7 @@ fn read_input(
 
     let _ = header_tx.send(Some(header.clone()));
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
-    let mut encoder = noodles_bam::io::Writer::from(Vec::new());
+    let mut encoder = RawEncoder::new();
 
     // An `Err` with no cause signals that the consumer hung up.
     let send = |batch: &mut Vec<Vec<u8>>| -> anyhow::Result<()> {
@@ -1208,16 +1208,7 @@ fn read_input(
     };
 
     let mut visit = |rec: Rec<'_>| -> anyhow::Result<()> {
-        use noodles_sam::alignment::io::Write as _;
-
-        let raw = match &rec {
-            Rec::Bam(r) => r.as_ref().to_vec(),
-            _ => {
-                encoder.get_mut().clear();
-                encoder.write_alignment_record(&header, rec.as_dyn())?;
-                encoder.get_ref()[size_of::<u32>()..].to_vec()
-            }
-        };
+        let raw = rec.encode_raw(&header, &mut encoder)?.to_vec();
 
         batch.push(raw);
 

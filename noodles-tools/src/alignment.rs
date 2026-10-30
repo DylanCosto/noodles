@@ -83,6 +83,50 @@ impl Rec<'_> {
     pub fn mate_reference_sequence_id(&self, header: &sam::Header) -> io::Result<Option<usize>> {
         self.as_dyn().mate_reference_sequence_id(header).transpose()
     }
+
+    /// Returns the record's BAM encoding (without `block_size`): a BAM record's own bytes, or
+    /// any other record encoded into `encoder`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the record cannot be encoded.
+    pub fn encode_raw<'r>(
+        &'r self,
+        header: &sam::Header,
+        encoder: &'r mut RawEncoder,
+    ) -> io::Result<&'r [u8]> {
+        use sam::alignment::io::Write as _;
+
+        match self {
+            Self::Bam(r) => Ok(r.as_ref()),
+            _ => {
+                encoder.writer.get_mut().clear();
+                encoder
+                    .writer
+                    .write_alignment_record(header, self.as_dyn())?;
+                Ok(&encoder.writer.get_ref()[mem::size_of::<u32>()..])
+            }
+        }
+    }
+}
+
+/// A reusable buffer for [`Rec::encode_raw`].
+pub struct RawEncoder {
+    writer: bam::io::Writer<Vec<u8>>,
+}
+
+impl RawEncoder {
+    pub fn new() -> Self {
+        Self {
+            writer: bam::io::Writer::from(Vec::new()),
+        }
+    }
+}
+
+impl Default for RawEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 type BamReader = bam::io::Reader<BgzfReader<BufReader<Stream>>>;

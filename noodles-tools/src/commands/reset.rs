@@ -8,11 +8,10 @@
 use std::{collections::HashSet, path::PathBuf};
 
 use anyhow::bail;
-use noodles_bam as bam;
-use noodles_sam::{self as sam, alignment::io::Write as _};
+use noodles_sam as sam;
 
 use crate::{
-    alignment::{AlignmentReader, ReadOptions, Rec},
+    alignment::{AlignmentReader, RawEncoder, ReadOptions},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     program,
 };
@@ -161,18 +160,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut writer = AlignmentWriter::create(Some(&args.output), &write_options, &header)?;
     writer.write_header(&header)?;
 
-    let mut encoder = bam::io::Writer::from(Vec::new());
+    let mut encoder = RawEncoder::new();
     let mut record = Vec::new();
 
     reader.for_each(&input_header, |rec| {
-        let raw: &[u8] = match &rec {
-            Rec::Bam(r) => r.as_ref(),
-            _ => {
-                encoder.get_mut().clear();
-                encoder.write_alignment_record(&input_header, rec.as_dyn())?;
-                &encoder.get_ref()[size_of::<u32>()..]
-            }
-        };
+        let raw: &[u8] = rec.encode_raw(&input_header, &mut encoder)?;
 
         if reset(raw, &filter, args.dupflag, &mut record)? {
             writer.write_raw(&header, &record)?;

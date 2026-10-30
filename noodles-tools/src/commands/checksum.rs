@@ -13,11 +13,10 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use noodles_bam as bam;
-use noodles_sam::alignment::io::Write as _;
 
 use crate::{
-    alignment::{AlignmentReader, ReadOptions, Rec},
+    alignment::{AlignmentReader, RawEncoder, ReadOptions},
+    bam_raw::{BASES, Record, field},
     commands::flags,
     sanitize::{Sanitize, sanitize_raw},
 };
@@ -28,7 +27,6 @@ const PRIME: u64 = (1 << 31) - 1;
 const FLAG_REVERSE: u16 = 0x10;
 const FLAG_QC_FAIL: u16 = 0x200;
 
-const SEQ_NT16_STR: &[u8; 16] = b"=ACMGRSVTWYHKDBN";
 const SEQ_NT16_COMPLEMENT_STR: &[u8; 16] = b"=TGKCYSBAWRDMHVN";
 
 #[derive(Debug, clap::Args)]
@@ -353,7 +351,7 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
 
     let mut report = Report::default();
     let mut remaining = options.records;
-    let mut encoder = bam::io::Writer::from(Vec::new());
+    let mut encoder = RawEncoder::new();
     let mut record = Vec::new();
     let mut seq = Vec::new();
     let mut qual = Vec::new();
@@ -363,16 +361,9 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
     reader.for_each_while(&header, |rec| {
         record.clear();
 
-        match &rec {
-            Rec::Bam(r) => record.extend_from_slice(r.as_ref()),
-            _ => {
-                encoder.get_mut().clear();
-                encoder.write_alignment_record(&header, rec.as_dyn())?;
-                record.extend_from_slice(&encoder.get_ref()[size_of::<u32>()..]);
-            }
-        }
+        record.extend_from_slice(rec.encode_raw(&header, &mut encoder)?);
 
-        let flags = u16::from_le_bytes([record[14], record[15]]);
+        let flags = Record::new(&record)?.flags();
 
         if flags & options.exclude_flags != 0
             || flags & options.require_flags != options.require_flags
@@ -384,43 +375,29 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
             sanitize_raw(&mut record, &lengths, options.sanitize)?;
         }
 
-        let r = &record;
-        let flags = u16::from_le_bytes([r[14], r[15]]);
+        let r = Record::new(&record)?;
+        let flags = r.flags();
         let masked = (i32::from(flags) & options.flag_mask) as u8;
-        let l_name = usize::from(r[8]);
-        let n_cigar = usize::from(u16::from_le_bytes([r[12], r[13]]));
-        let len = u32::from_le_bytes([r[16], r[17], r[18], r[19]]) as usize;
-        let cigar_start = 32 + l_name;
-        let seq_start = cigar_start + 4 * n_cigar;
-        let qual_start = seq_start + len.div_ceil(2);
-        let aux_start = qual_start + len;
 
-        fill_seq_qual(
-            r,
-            seq_start,
-            qual_start,
-            len,
-            flags & FLAG_REVERSE != 0 && options.rev_comp,
-            &mut seq,
-            &mut qual,
-        );
+        let orientation = if flags & FLAG_REVERSE != 0 && options.rev_comp {
+            Orientation::Reverse
+        } else {
+            Orientation::Forward
+        };
+        fill_seq_qual(&r, orientation, &mut seq, &mut qual);
 
         let crc = crc32(0, &[masked]);
         let crc_seq = crc32(crc, &seq);
 
-        let crc = crc32(0, &r[32..32 + l_name]);
+        // samtools includes the name's NUL terminator.
+        let name = &r.as_bytes()[field::NAME..=field::NAME + r.name().len()];
+        let crc = crc32(0, name);
         let crc = crc32(crc, &[masked]);
         let crc_name = crc32(crc, &seq);
 
         let crc_qual = crc32(crc_seq, &qual);
 
-        let read_group = select_tags(
-            &r[aux_start..],
-            all_tags,
-            &tag_index,
-            options.tags.len(),
-            &mut aux,
-        )?;
+        let read_group = select_tags(r.data(), all_tags, &tag_index, options.tags.len(), &mut aux)?;
         let crc_aux = crc32(crc_seq, &aux);
 
         let mut crcs = Crcs {
@@ -435,28 +412,22 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
 
         if options.check_pos {
             let mut buf = Vec::with_capacity(12);
-            buf.extend_from_slice(&r[0..4]);
-            buf.extend_from_slice(
-                &i64::from(i32::from_le_bytes([r[4], r[5], r[6], r[7]])).to_le_bytes(),
-            );
+            buf.extend_from_slice(&r.reference_sequence_id().to_le_bytes());
+            buf.extend_from_slice(&i64::from(r.position()).to_le_bytes());
             crcs.pos = crc32(crc_seq, &buf);
         }
 
         if options.check_mate {
             let mut buf = Vec::with_capacity(20);
-            buf.extend_from_slice(&r[20..24]);
-            buf.extend_from_slice(
-                &i64::from(i32::from_le_bytes([r[24], r[25], r[26], r[27]])).to_le_bytes(),
-            );
-            buf.extend_from_slice(
-                &i64::from(i32::from_le_bytes([r[28], r[29], r[30], r[31]])).to_le_bytes(),
-            );
+            buf.extend_from_slice(&r.mate_reference_sequence_id().to_le_bytes());
+            buf.extend_from_slice(&i64::from(r.mate_position()).to_le_bytes());
+            buf.extend_from_slice(&i64::from(r.template_length()).to_le_bytes());
             crcs.mate = crc32(crc_seq, &buf);
         }
 
         if options.check_cigar {
-            let crc = crc32(crc_seq, &u32::from(r[9]).to_le_bytes());
-            crcs.cigar = crc32(crc, &r[cigar_start..seq_start]);
+            let crc = crc32(crc_seq, &u32::from(r.mapping_quality()).to_le_bytes());
+            crcs.cigar = crc32(crc, r.raw_cigar());
         }
 
         let qc_fail = flags & FLAG_QC_FAIL != 0;
@@ -491,27 +462,29 @@ fn checksum(options: &Options, read_options: &ReadOptions, src: &str) -> anyhow:
     Ok(report)
 }
 
+/// Whether [`fill_seq_qual`] reverse complements a read.
+#[derive(Clone, Copy)]
+enum Orientation {
+    Forward,
+    Reverse,
+}
+
 /// `fill_seq_qual`: the bases (reverse complemented if asked) and qualities + 33.
-fn fill_seq_qual(
-    r: &[u8],
-    seq_start: usize,
-    qual_start: usize,
-    len: usize,
-    reverse: bool,
-    seq: &mut Vec<u8>,
-    qual: &mut Vec<u8>,
-) {
-    let code = |i: usize| usize::from((r[seq_start + i / 2] >> (4 * (1 - i % 2))) & 0xf);
-    let q = |i: usize| r[qual_start + i].wrapping_add(33);
+fn fill_seq_qual(r: &Record<'_>, orientation: Orientation, seq: &mut Vec<u8>, qual: &mut Vec<u8>) {
+    let len = r.sequence_len();
+    let packed = r.packed_sequence();
+    let quals = r.quality_scores();
+    let code = |i: usize| usize::from((packed[i / 2] >> ((!i & 1) << 2)) & 0x0f);
+    let q = |i: usize| quals[i].wrapping_add(33);
 
     seq.clear();
     qual.clear();
 
-    if reverse {
+    if let Orientation::Reverse = orientation {
         seq.extend((0..len).rev().map(|i| SEQ_NT16_COMPLEMENT_STR[code(i)]));
         qual.extend((0..len).rev().map(q));
     } else {
-        seq.extend((0..len).map(|i| SEQ_NT16_STR[code(i)]));
+        seq.extend((0..len).map(|i| BASES[code(i)]));
         qual.extend((0..len).map(q));
     }
 }

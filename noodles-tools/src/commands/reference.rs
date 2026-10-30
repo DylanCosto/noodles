@@ -13,13 +13,12 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use noodles_bam as bam;
 use noodles_cram as cram;
-use noodles_sam::{self as sam, alignment::io::Write as _};
+use noodles_sam as sam;
 
 use crate::{
-    alignment::{AlignmentIndex, AlignmentReader, ReadOptions, Rec},
-    bam_raw::{self, field, le_u16, le_u32},
+    alignment::{AlignmentIndex, AlignmentReader, RawEncoder, ReadOptions, Rec},
+    bam_raw::{BASES, Record},
     cram_raw::read_slice_header,
     hts_region::{self, POS_MAX},
 };
@@ -53,9 +52,6 @@ pub struct Args {
     #[arg(long = "reference")]
     reference: Option<PathBuf>,
 }
-
-/// SAM's sequence code to base mapping.
-const SEQ_NT16_STR: &[u8; 16] = b"=ACMGRSVTWYHKDBN";
 
 /// The FASTA line width.
 const LINE_WIDTH: usize = 60;
@@ -247,23 +243,14 @@ fn md_reference(args: &Args, src: &str, dumper: &mut Dumper<'_>) -> anyhow::Resu
         .transpose()?;
 
     let mut current: Option<Current> = None;
-    let mut encoder = bam::io::Writer::from(Vec::new());
-    let mut raw = Vec::new();
+    let mut encoder = RawEncoder::new();
     let mut cigar = Vec::new();
 
     let mut visit = |rec: Rec<'_>| -> anyhow::Result<()> {
-        let record: &[u8] = match &rec {
-            Rec::Bam(r) => r.as_ref(),
-            _ => {
-                encoder.get_mut().clear();
-                encoder.write_alignment_record(&header, rec.as_dyn())?;
-                raw.clear();
-                raw.extend_from_slice(&encoder.get_ref()[size_of::<u32>()..]);
-                &raw
-            }
-        };
+        let record = rec.encode_raw(&header, &mut encoder)?;
 
-        let tid = i32::from_le_bytes(record[field::REFERENCE_SEQUENCE_ID].try_into()?);
+        let record = Record::new(record)?;
+        let tid = record.reference_sequence_id();
         let reference_sequence_id = usize::try_from(tid).ok();
 
         if current
@@ -278,7 +265,7 @@ fn md_reference(args: &Args, src: &str, dumper: &mut Dumper<'_>) -> anyhow::Resu
         }
 
         let sequence = &mut current.as_mut().expect("current is set above").sequence;
-        patch_reference(record, &mut cigar, sequence)
+        patch_reference(&record, &mut cigar, sequence)
     };
 
     match region {
@@ -310,30 +297,26 @@ fn md_reference(args: &Args, src: &str, dumper: &mut Dumper<'_>) -> anyhow::Resu
 /// Copies a record's bases into `reference` where its MD tag says they match, and the MD tag's
 /// bases where they differ (samtools' `build_ref`). Records without an `MD:Z` tag are skipped.
 fn patch_reference(
-    record: &[u8],
+    record: &Record<'_>,
     cigar: &mut Vec<u32>,
     reference: &mut [u8],
 ) -> anyhow::Result<()> {
-    let Some(md) = bam_raw::find_field(record, *b"MD")? else {
+    let Some(md) = record.find_field(*b"MD")? else {
         return Ok(());
     };
 
-    if record[md.start + 2] != b'Z' {
+    let raw = record.as_bytes();
+
+    if raw[md.start + 2] != b'Z' {
         return Ok(());
     }
 
-    let md = &record[md.start + 3..md.end - 1];
+    let md = &raw[md.start + 3..md.end - 1];
+    let l_seq = record.sequence_len();
 
-    let name_len = usize::from(record[field::NAME_LENGTH]);
-    let n_cigar = usize::from(le_u16(&record[field::CIGAR_OP_COUNT]));
-    let l_seq = usize::try_from(le_u32(&record[field::SEQUENCE_LENGTH]))?;
-    let cigar_start = field::NAME + name_len;
-    let seq_start = cigar_start + 4 * n_cigar;
-    let seq = &record[seq_start..seq_start + l_seq.div_ceil(2)];
+    record.read_cigar(cigar)?;
 
-    bam_raw::read_cigar(record, cigar)?;
-
-    let pos = i32::from_le_bytes(record[field::POSITION].try_into()?);
+    let pos = record.position();
     let mut ops = CigarWalker::new(cigar);
     let mut iseq = 0;
     let mut iref = i64::from(pos);
@@ -368,8 +351,7 @@ fn patch_reference(
                     bail!("MD:Z and CIGAR are incompatible");
                 }
 
-                let code = (seq[iseq / 2] >> (4 * (1 - iseq % 2))) & 0x0f;
-                set(iref, SEQ_NT16_STR[usize::from(code)]);
+                set(iref, BASES[usize::from(record.base(iseq))]);
                 iseq += 1;
                 iref += 1;
                 len -= 1;
@@ -603,6 +585,9 @@ fn copy_embedded<R: Read>(
 
 #[cfg(test)]
 mod tests {
+    use noodles_bam as bam;
+    use noodles_sam::alignment::io::Write as _;
+
     use super::*;
 
     fn encode(line: &str) -> anyhow::Result<Vec<u8>> {
@@ -616,7 +601,7 @@ mod tests {
     fn patch(line: &str) -> anyhow::Result<String> {
         let record = encode(line)?;
         let mut reference = vec![b'N'; 20];
-        patch_reference(&record, &mut Vec::new(), &mut reference)?;
+        patch_reference(&Record::new(&record)?, &mut Vec::new(), &mut reference)?;
         Ok(String::from_utf8(reference)?)
     }
 

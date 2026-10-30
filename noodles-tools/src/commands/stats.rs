@@ -17,8 +17,8 @@ use anyhow::{Context, bail};
 use noodles_sam::{self as sam, alignment::record::Flags};
 
 use crate::{
-    alignment::{AlignmentReader, Queries, ReadOptions, Rec},
-    bam_raw::{self, field, le_u16, le_u32},
+    alignment::{AlignmentReader, Queries, RawEncoder, ReadOptions, Rec},
+    bam_raw::{self, Record, le_u16, le_u32},
     flags, output,
     reference::IndexedFasta as Reference,
     regions::RegionSet,
@@ -594,54 +594,23 @@ struct Bam<'a> {
 
 impl<'a> Bam<'a> {
     fn parse(raw: &'a [u8]) -> anyhow::Result<Self> {
-        let i32_at = |offset: usize| le_u32(&raw[offset..offset + 4]).cast_signed();
-
-        let name_len = usize::from(raw[field::NAME_LENGTH]);
-        let n_cigar = usize::from(le_u16(&raw[field::CIGAR_OP_COUNT]));
-        let l_seq = usize::try_from(le_u32(&raw[field::SEQUENCE_LENGTH]))?;
-
-        let cigar_start = field::NAME + name_len;
-        let seq_start = cigar_start + 4 * n_cigar;
-        let qual_start = seq_start + l_seq.div_ceil(2);
-        let data = bam_raw::data_range(raw)?;
-
-        let mut cigar: Vec<u32> = raw[cigar_start..seq_start]
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| u32::from_le_bytes(*b))
-            .collect();
-
-        // As in htslib, a `kSmN` placeholder CIGAR is replaced by the CG tag's operations.
-        if cigar.len() == 2
-            && cigar[0] & 0xf == CIGAR_SOFT_CLIP
-            && (cigar[0] >> 4) as usize == l_seq
-            && cigar[1] & 0xf == CIGAR_SKIP
-            && let Some(range) = bam_raw::find_field(raw, *b"CG")?
-            && raw[range.start + 2] == b'B'
-            && raw[range.start + 3] == b'I'
-        {
-            cigar = raw[range.start + 8..range.end]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| u32::from_le_bytes(*b))
-                .collect();
-        }
+        let record = Record::new(raw)?;
+        let mut cigar = Vec::new();
+        record.read_cigar(&mut cigar)?;
 
         Ok(Self {
-            tid: i32_at(0),
-            pos: i64::from(i32_at(4)),
-            mapq: raw[9],
-            flag: le_u16(&raw[field::FLAGS]),
-            mtid: i32_at(20),
-            mpos: i64::from(i32_at(24)),
-            isize: i32_at(28),
-            name: &raw[field::NAME..cigar_start - 1],
+            tid: record.reference_sequence_id(),
+            pos: i64::from(record.position()),
+            mapq: record.mapping_quality(),
+            flag: record.flags(),
+            mtid: record.mate_reference_sequence_id(),
+            mpos: i64::from(record.mate_position()),
+            isize: record.template_length(),
+            name: record.name(),
             cigar,
-            seq: &raw[seq_start..qual_start],
-            qual: &raw[qual_start..data.start],
-            l_seq,
+            seq: record.packed_sequence(),
+            qual: record.quality_scores(),
+            l_seq: record.sequence_len(),
             raw,
         })
     }
@@ -822,23 +791,14 @@ pub fn run(mut args: Args) -> anyhow::Result<()> {
         })
         .transpose()?;
 
-    let mut encoder = noodles_bam::io::Writer::from(Vec::new());
+    let mut encoder = RawEncoder::new();
 
     let mut process = |rec: Rec<'_>,
                        all: &mut Stats,
                        info: &Info,
                        pairs: &mut HashMap<Vec<u8>, Pair>|
      -> anyhow::Result<()> {
-        use noodles_sam::alignment::io::Write as _;
-
-        let raw: &[u8] = match &rec {
-            Rec::Bam(r) => r.as_ref(),
-            _ => {
-                encoder.get_mut().clear();
-                encoder.write_alignment_record(&header, rec.as_dyn())?;
-                &encoder.get_ref()[size_of::<u32>()..]
-            }
-        };
+        let raw: &[u8] = rec.encode_raw(&header, &mut encoder)?;
 
         let bam = Bam::parse(raw)?;
 

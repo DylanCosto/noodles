@@ -16,11 +16,10 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use noodles_bam as bam;
-use noodles_sam::{self as sam, alignment::io::Write as _};
+use noodles_sam as sam;
 
 use crate::{
-    alignment::{AlignmentReader, ReadOptions, Rec},
+    alignment::{AlignmentReader, RawEncoder, ReadOptions},
     bam_raw::{self, le_u16, le_u32},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     program,
@@ -247,19 +246,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     };
 
     let mut counts = Counts::default();
-    let mut encoder = bam::io::Writer::from(Vec::new());
+    let mut encoder = RawEncoder::new();
     let mut last_tid = None;
     let mut sites: Option<usize> = None;
 
     reader.for_each(&header.clone(), |rec| {
-        let mut raw: Vec<u8> = match &rec {
-            Rec::Bam(r) => r.as_ref().to_vec(),
-            _ => {
-                encoder.get_mut().clear();
-                encoder.write_alignment_record(&header, rec.as_dyn())?;
-                encoder.get_ref()[size_of::<u32>()..].to_vec()
-            }
-        };
+        let mut raw: Vec<u8> = rec.encode_raw(&header, &mut encoder)?.to_vec();
 
         counts.reads += 1;
 

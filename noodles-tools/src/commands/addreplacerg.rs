@@ -5,11 +5,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use bstr::BString;
-use noodles_bam as bam;
-use noodles_sam::{self as sam, alignment::io::Write as _};
+use noodles_sam as sam;
 
 use crate::{
-    alignment::{AlignmentReader, ReadOptions, Rec},
+    alignment::{AlignmentReader, RawEncoder, ReadOptions},
     bam_raw,
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     program,
@@ -105,18 +104,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     rg_field.extend_from_slice(read_group_id.as_ref());
     rg_field.push(0);
 
-    let mut encoder = bam::io::Writer::from(Vec::new());
+    let mut encoder = RawEncoder::new();
     let mut edited = Vec::new();
 
     reader.for_each(&input_header, |record| {
-        let raw = match &record {
-            Rec::Bam(r) => r.as_ref(),
-            _ => {
-                encoder.get_mut().clear();
-                encoder.write_alignment_record(&input_header, record.as_dyn())?;
-                &encoder.get_ref()[size_of::<u32>()..]
-            }
-        };
+        let raw = record.encode_raw(&input_header, &mut encoder)?;
 
         bam_raw::strip_fields(raw, &mut edited, |tag| tag == *b"RG")?;
         let had_read_group = edited.len() != raw.len();

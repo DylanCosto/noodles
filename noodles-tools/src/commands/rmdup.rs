@@ -21,14 +21,11 @@ use std::{
 };
 
 use anyhow::bail;
-use noodles_bam as bam;
-use noodles_sam::{
-    self as sam, alignment::io::Write as _, header::record::value::map::read_group::tag::LIBRARY,
-};
+use noodles_sam::{self as sam, header::record::value::map::read_group::tag::LIBRARY};
 
 use crate::{
-    alignment::{AlignmentReader, ReadOptions, Rec},
-    bam_raw::{self, field, le_u16, le_u32},
+    alignment::{AlignmentReader, RawEncoder, ReadOptions},
+    bam_raw::{self, Record},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
 };
 
@@ -105,7 +102,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     writer.write_header(&header)?;
 
     let libraries = Libraries::new(&header);
-    let mut encoder = bam::io::Writer::from(Vec::new());
+    let mut encoder = RawEncoder::new();
 
     let single_end = if args.force_single_end {
         Some(SingleEnd::All)
@@ -119,7 +116,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         Some(mode) => {
             let mut dedup = SingleEndDedup::new(libraries, mode);
             reader.for_each(&header, |rec| {
-                let record = raw_record(&header, &rec, &mut encoder)?;
+                let record = rec.encode_raw(&header, &mut encoder)?;
                 dedup.push(record, &mut write)
             })?;
             dedup.finish(&mut write)?
@@ -127,7 +124,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         None => {
             let mut dedup = PairedDedup::new(libraries, &header);
             reader.for_each(&header, |rec| {
-                let record = raw_record(&header, &rec, &mut encoder)?;
+                let record = rec.encode_raw(&header, &mut encoder)?;
                 dedup.push(record, &mut write)
             })?;
             dedup.finish(&mut write)?
@@ -154,75 +151,17 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Returns a record's raw BAM encoding, encoding non-BAM records into `encoder`.
-fn raw_record<'r>(
-    header: &sam::Header,
-    rec: &'r Rec<'_>,
-    encoder: &'r mut bam::io::Writer<Vec<u8>>,
-) -> anyhow::Result<&'r [u8]> {
-    Ok(match rec {
-        Rec::Bam(r) => r.as_ref(),
-        _ => {
-            encoder.get_mut().clear();
-            encoder.write_alignment_record(header, rec.as_dyn())?;
-            &encoder.get_ref()[size_of::<u32>()..]
-        }
-    })
-}
-
-/// Fixed fields of a raw BAM record.
-struct Fields {
-    reference_sequence_id: i32,
-    position: i32,
-    flags: u16,
-    mate_reference_sequence_id: i32,
-    template_length: i32,
-}
-
-impl Fields {
-    fn new(record: &[u8]) -> Self {
-        let i32_at =
-            |i: usize| i32::from_le_bytes([record[i], record[i + 1], record[i + 2], record[i + 3]]);
-
-        Self {
-            reference_sequence_id: i32_at(field::REFERENCE_SEQUENCE_ID.start),
-            position: i32_at(field::POSITION.start),
-            flags: le_u16(&record[field::FLAGS]),
-            mate_reference_sequence_id: i32_at(field::MATE_REFERENCE_SEQUENCE_ID.start),
-            template_length: i32_at(28),
-        }
-    }
-}
-
-/// The read name, without its NUL terminator.
-fn name(record: &[u8]) -> &[u8] {
-    let len = usize::from(record[field::NAME_LENGTH]);
-    &record[field::NAME..field::NAME + len - 1]
-}
-
 /// The sum of base qualities (samtools' `sum_qual`).
-fn quality_sum(record: &[u8]) -> u64 {
-    let name_len = usize::from(record[field::NAME_LENGTH]);
-    let n_cigar = usize::from(le_u16(&record[field::CIGAR_OP_COUNT]));
-    let l_seq = le_u32(&record[field::SEQUENCE_LENGTH]) as usize;
-    let start = field::NAME + name_len + 4 * n_cigar + l_seq.div_ceil(2);
-    record[start..start + l_seq]
-        .iter()
-        .map(|&q| u64::from(q))
-        .sum()
+fn quality_sum(record: &Record<'_>) -> u64 {
+    record.quality_scores().iter().map(|&q| u64::from(q)).sum()
 }
 
 /// The 0-based exclusive end position (HTSlib's `bam_endpos`): at least one past the start.
-fn end_position(
-    record: &[u8],
-    flags: u16,
-    position: i32,
-    cigar: &mut Vec<u32>,
-) -> anyhow::Result<i64> {
+fn end_position(record: &Record<'_>, cigar: &mut Vec<u32>) -> anyhow::Result<i64> {
     let mut len = 0;
 
-    if flags & FLAG_UNMAPPED == 0 {
-        bam_raw::read_cigar(record, cigar)?;
+    if record.flags() & FLAG_UNMAPPED == 0 {
+        record.read_cigar(cigar)?;
         len = cigar
             .iter()
             .filter(|&&op| matches!(op & 0xf, 0 | 2 | 3 | 7 | 8))
@@ -230,7 +169,7 @@ fn end_position(
             .sum();
     }
 
-    Ok(i64::from(position) + len.max(1))
+    Ok(i64::from(record.position()) + len.max(1))
 }
 
 /// Libraries by read group, with duplicate counts.
@@ -358,27 +297,27 @@ impl<'h> PairedDedup<'h> {
             return Ok(write(record)?);
         }
 
-        let fields = Fields::new(record);
+        let fields = Record::new(record)?;
 
-        if fields.reference_sequence_id != self.last_reference_sequence_id
-            || fields.position != self.last_position
+        if fields.reference_sequence_id() != self.last_reference_sequence_id
+            || fields.position() != self.last_position
         {
             self.flush(write)?;
 
-            if fields.reference_sequence_id != self.last_reference_sequence_id {
+            if fields.reference_sequence_id() != self.last_reference_sequence_id {
                 if !self.removed.is_empty() {
                     eprintln!("[bam_rmdup_core] {} unmatched pairs", self.removed.len());
                     self.removed.clear();
                 }
 
-                if fields.reference_sequence_id == -1 {
+                if fields.reference_sequence_id() == -1 {
                     self.copying = true;
                     return Ok(write(record)?);
                 }
 
-                self.last_reference_sequence_id = fields.reference_sequence_id;
+                self.last_reference_sequence_id = fields.reference_sequence_id();
 
-                let name = usize::try_from(fields.reference_sequence_id)
+                let name = usize::try_from(fields.reference_sequence_id())
                     .ok()
                     .and_then(|i| self.header.reference_sequences().get_index(i))
                     .map(|(name, _)| name.to_string())
@@ -387,35 +326,35 @@ impl<'h> PairedDedup<'h> {
             }
         }
 
-        let flags = fields.flags;
+        let flags = fields.flags();
 
         if flags & FLAG_PAIRED == 0
             || flags & (FLAG_UNMAPPED | FLAG_MATE_UNMAPPED) != 0
-            || (fields.mate_reference_sequence_id >= 0
-                && fields.reference_sequence_id != fields.mate_reference_sequence_id)
+            || (fields.mate_reference_sequence_id() >= 0
+                && fields.reference_sequence_id() != fields.mate_reference_sequence_id())
         {
             write(record)?;
-        } else if fields.template_length > 0 {
+        } else if fields.template_length() > 0 {
             let library = self.libraries.check(record)?;
 
-            match self.best_index.entry((library, fields.template_length)) {
+            match self.best_index.entry((library, fields.template_length())) {
                 Entry::Occupied(entry) => {
                     self.libraries.remove(library);
                     let best = &mut self.best[*entry.get()];
 
-                    let removed_name = if quality_sum(best) < quality_sum(record) {
-                        let removed_name = name(best).to_vec();
+                    let removed_name = if quality_sum(&Record::new(best)?) < quality_sum(&fields) {
+                        let removed_name = Record::new(best)?.name().to_vec();
                         best.clear();
                         best.extend_from_slice(record);
                         removed_name
                     } else {
-                        name(record).to_vec()
+                        fields.name().to_vec()
                     };
 
                     if !self.removed.insert(removed_name) {
                         eprintln!(
                             "[bam_rmdup_core] inconsistent BAM file for pair '{}'. Continue anyway.",
-                            String::from_utf8_lossy(name(record))
+                            String::from_utf8_lossy(fields.name())
                         );
                     }
                 }
@@ -424,11 +363,11 @@ impl<'h> PairedDedup<'h> {
                     self.best.push(record.to_vec());
                 }
             }
-        } else if !self.removed.remove(name(record)) {
+        } else if !self.removed.remove(fields.name()) {
             write(record)?;
         }
 
-        self.last_position = fields.position;
+        self.last_position = fields.position();
 
         Ok(())
     }
@@ -513,25 +452,25 @@ impl SingleEndDedup {
     where
         W: FnMut(&[u8]) -> std::io::Result<()>,
     {
-        let fields = Fields::new(record);
+        let fields = Record::new(record)?;
 
-        if self.last_reference_sequence_id != Some(fields.reference_sequence_id) {
+        if self.last_reference_sequence_id != Some(fields.reference_sequence_id()) {
             self.flush(None, write)?;
             self.best.clear();
-            self.last_reference_sequence_id = Some(fields.reference_sequence_id);
+            self.last_reference_sequence_id = Some(fields.reference_sequence_id());
         } else {
-            self.flush(Some(fields.position), write)?;
+            self.flush(Some(fields.position()), write)?;
         }
 
-        let flags = fields.flags;
-        let end = end_position(record, flags, fields.position, &mut self.cigar)?;
-        let score = quality_sum(record);
+        let flags = fields.flags();
+        let end = end_position(&fields, &mut self.cigar)?;
+        let score = quality_sum(&fields);
 
         let candidate =
             flags & FLAG_UNMAPPED == 0 && (flags & FLAG_PAIRED == 0 || self.mode == SingleEnd::All);
 
         if !candidate {
-            self.enqueue(record, Pending::Fixed, None, fields.position, end, score);
+            self.enqueue(record, Pending::Fixed, None, fields.position(), end, score);
             return Ok(());
         }
 
@@ -543,7 +482,7 @@ impl SingleEndDedup {
             if reverse {
                 end
             } else {
-                i64::from(fields.position)
+                i64::from(fields.position())
             },
         );
 
@@ -553,7 +492,7 @@ impl SingleEndDedup {
             } else {
                 Pending::Forward
             };
-            let seq = self.enqueue(record, pending, Some(key), fields.position, end, score);
+            let seq = self.enqueue(record, pending, Some(key), fields.position(), end, score);
             self.best.insert(key, seq);
             return Ok(());
         };
@@ -570,7 +509,7 @@ impl SingleEndDedup {
                     record,
                     Pending::Reverse,
                     Some(key),
-                    fields.position,
+                    fields.position(),
                     end,
                     score,
                 );
@@ -654,6 +593,9 @@ impl SingleEndDedup {
 
 #[cfg(test)]
 mod tests {
+    use noodles_bam as bam;
+    use noodles_sam::alignment::io::Write as _;
+
     use super::*;
 
     const HEADER: &str = "@SQ\tSN:chr\tLN:1000\n@RG\tID:a\tLB:x\n@RG\tID:b\tLB:y\n";
@@ -676,7 +618,7 @@ mod tests {
 
         let mut out = Vec::new();
         let mut write = |record: &[u8]| {
-            out.push(String::from_utf8_lossy(name(record)).into_owned());
+            out.push(String::from_utf8_lossy(Record::new(record)?.name()).into_owned());
             Ok(())
         };
 
