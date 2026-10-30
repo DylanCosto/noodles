@@ -11,7 +11,7 @@
 
 use anyhow::bail;
 
-use crate::bam_raw::{le_u16, le_u32};
+use crate::bam_raw::{self, le_u16, le_u32};
 
 /// BAM CIGAR operation codes.
 pub const CMATCH: i32 = 0;
@@ -48,6 +48,9 @@ pub struct Entry {
     pub l_qseq: i32,
     n_cigar: u32,
     cigar_off: usize,
+    /// The CIGAR of a record that stores it in a `CG` field (more than 65,535 operations), as
+    /// HTSlib reads it; empty otherwise.
+    long_cigar: Vec<u32>,
     seq_off: usize,
     pub qual_off: usize,
 
@@ -110,6 +113,22 @@ impl Entry {
             bail!("truncated BAM record");
         }
 
+        self.long_cigar.clear();
+
+        // A `kSmN` placeholder stands for the CIGAR in a `CG` field.
+        if self.n_cigar == 2
+            && let Some(range) = bam_raw::Record::new(raw)?.long_cigar_field()?
+        {
+            self.long_cigar.extend(
+                raw[range.start + 8..range.end]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b)),
+            );
+            self.n_cigar = u32::try_from(self.long_cigar.len())?;
+        }
+
         Ok(())
     }
 
@@ -139,10 +158,14 @@ impl Entry {
         &self.buf[..self.len]
     }
 
-    /// The `i`th raw CIGAR operation.
+    /// The `i`th raw CIGAR operation (from the `CG` field for a long CIGAR).
     pub fn cigar(&self, i: u32) -> u32 {
-        let off = self.cigar_off + 4 * i as usize;
-        le_u32(&self.buf[off..off + 4])
+        if self.long_cigar.is_empty() {
+            let off = self.cigar_off + 4 * i as usize;
+            le_u32(&self.buf[off..off + 4])
+        } else {
+            self.long_cigar[i as usize]
+        }
     }
 
     /// The number of CIGAR operations.

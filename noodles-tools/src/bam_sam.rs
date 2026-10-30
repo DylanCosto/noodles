@@ -238,21 +238,8 @@ fn write_i64(dst: &mut Vec<u8>, n: i64) {
 }
 
 fn write_f32(dst: &mut Vec<u8>, n: f32) -> Option<()> {
-    // The same options as the noodles SAM writer.
-    const FORMAT: u128 = lexical_core::format::STANDARD;
-    const OPTIONS: lexical_core::WriteFloatOptions = lexical_core::WriteFloatOptionsBuilder::new()
-        .trim_floats(true)
-        .build_strict();
-
-    if !n.is_finite() {
-        return None;
-    }
-
-    let mut buf = [0; 64];
-    dst.extend_from_slice(lexical_core::write_with_options::<_, FORMAT>(
-        n, &mut buf, &OPTIONS,
-    ));
-    Some(())
+    // The same format as the noodles SAM writer, which is HTSlib's.
+    noodles_sam::io::writer::write_f32(dst, n).ok()
 }
 
 fn write_data(dst: &mut Vec<u8>, mut src: &[u8]) -> Option<()> {

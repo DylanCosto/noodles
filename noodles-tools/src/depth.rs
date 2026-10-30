@@ -205,10 +205,19 @@ impl DepthWindow {
             ..
         } = self.options;
 
-        // Size the window once for the record's whole reference span.
-        let needed = start + span - self.start;
+        // Size the window once for the record's whole reference span (at least one position, as
+        // `bam_endpos` gives a read without reference bases).
+        let needed = start + span.max(1) - self.start;
         if needed > self.cells.len() {
             self.cells.resize(needed, Cell::default());
+        }
+
+        // HTSlib's pileup still visits a read that covers no reference bases (say `4I`) at its
+        // position, so that position is reported, with no depth from it.
+        if span == 0
+            && let Some(cell) = self.cells.get_mut(start - self.start)
+        {
+            cell.touched = true;
         }
 
         // The reusable buffers are moved out while cells are updated, then put back.

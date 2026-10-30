@@ -219,7 +219,9 @@ impl Stats {
 
                     mpc[idx] += 1;
                 } else if cref != 0 && cread != 0 && cref != cread {
-                    let qual = usize::from(bam.qual[iread]) + 1;
+                    // samtools adds 1 in 8 bits, so a missing quality (0xff, from `*`) lands in
+                    // bin 0.
+                    let qual = usize::from(bam.qual[iread].wrapping_add(1));
                     let idx = cycle_index(icycle);
 
                     if idx > max_len {

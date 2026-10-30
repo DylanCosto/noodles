@@ -215,7 +215,8 @@ pub struct Args {
     #[arg(short = 'M', long = "output-mods")]
     output_mods: bool,
 
-    /// Reference FASTA (indexed) for CRAM input [default: -f].
+    /// Reference FASTA (indexed) for CRAM input [default: -f]; also used as `-f` when that is
+    /// not given, as in samtools.
     #[arg(long = "reference")]
     reference: Option<PathBuf>,
 
@@ -264,9 +265,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let exclude_rg = args.exclude_rg.as_deref().map(read_excluded_read_groups);
 
+    // As in samtools, `--reference` is also the FASTA reference when `-f` is not given.
     let fasta = args
         .fasta_ref
         .as_deref()
+        .or(args.reference.as_deref())
         .map(IndexedFasta::open)
         .transpose()?;
     let cram_reference = args.reference.clone().or_else(|| args.fasta_ref.clone());

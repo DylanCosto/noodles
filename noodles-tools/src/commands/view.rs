@@ -594,13 +594,15 @@ fn plan(
         None => None,
     };
 
+    let regions = known_regions(header, &args.regions);
+
     let region_set = || -> anyhow::Result<RegionSet> {
-        if args.regions.iter().any(|r| r == UNMAPPED_REGION) {
+        if regions.iter().any(|r| r == UNMAPPED_REGION) {
             bail!("-M and -P cannot be combined with the unmapped region *");
         }
 
         let mut set = RegionSet::new(header);
-        for region in &args.regions {
+        for region in &regions {
             set.add_region(header, region)?;
         }
         set.merge();
@@ -622,7 +624,7 @@ fn plan(
         let traversal = if args.merge_regions {
             Traversal::Set(region_set()?)
         } else {
-            Traversal::Regions(args.regions.clone())
+            Traversal::Regions(regions)
         };
 
         filter.regions = bed;
@@ -643,6 +645,31 @@ fn plan(
         filter.regions = Some(bed);
         Ok((Traversal::All, filter))
     }
+}
+
+/// Returns the regions that name a reference sequence of the header (or are `*`). Like samtools,
+/// warns about the others and skips them, so that a list of only unknown regions selects no
+/// records.
+fn known_regions(header: &sam::Header, regions: &[String]) -> Vec<String> {
+    let reference_sequences = header.reference_sequences();
+    let getid = |name: &[u8]| reference_sequences.get_index_of(name);
+
+    regions
+        .iter()
+        .filter(|region| {
+            let known = region.as_str() == UNMAPPED_REGION
+                || crate::hts_region::parse_region(region, getid).is_some();
+
+            if !known {
+                eprintln!(
+                    "[main_samview] region \"{region}\" specifies an invalid region or unknown reference. Continue anyway."
+                );
+            }
+
+            known
+        })
+        .cloned()
+        .collect()
 }
 
 fn has_index(path: &Path) -> bool {

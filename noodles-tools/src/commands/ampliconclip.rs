@@ -10,6 +10,7 @@
 //! them), and clipped records get a recalculated BAM bin.
 
 use std::{
+    borrow::Cow,
     fs::File,
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -626,13 +627,17 @@ fn matching_clip_site(
 }
 
 /// The parts of an encoded BAM record that clipping changes.
+///
+/// A long CIGAR stored in a `CG` field (behind a `kSmN` placeholder) is read from it, as HTSlib
+/// does when it reads a record, and the `CG` field is left out of the tags; [`Parts::encode`]
+/// stores CIGARs of more than 65,535 operations that way again.
 struct Parts<'a> {
     raw: &'a [u8],
     cigar: Vec<u32>,
     l_seq: usize,
     seq: &'a [u8],
     qual: &'a [u8],
-    aux: &'a [u8],
+    aux: Cow<'a, [u8]>,
 }
 
 impl<'a> Parts<'a> {
@@ -645,9 +650,26 @@ impl<'a> Parts<'a> {
         let qual_start = seq_start + l_seq.div_ceil(2);
         let aux_start = qual_start + l_seq;
 
+        let long_cigar = bam_raw::Record::new(raw)
+            .and_then(|record| record.long_cigar_field())
+            .ok()
+            .flatten();
+
+        let (cigar_src, aux) = match long_cigar {
+            Some(range) => {
+                let mut aux = raw[aux_start..range.start].to_vec();
+                aux.extend_from_slice(&raw[range.end..]);
+                (&raw[range.start + 8..range.end], Cow::Owned(aux))
+            }
+            None => (
+                &raw[cigar_start..seq_start],
+                Cow::Borrowed(&raw[aux_start..]),
+            ),
+        };
+
         Self {
             raw,
-            cigar: raw[cigar_start..seq_start]
+            cigar: cigar_src
                 .as_chunks::<4>()
                 .0
                 .iter()
@@ -656,28 +678,48 @@ impl<'a> Parts<'a> {
             l_seq,
             seq: &raw[seq_start..qual_start],
             qual: &raw[qual_start..aux_start],
-            aux: &raw[aux_start..],
+            aux,
         }
     }
 
     /// Encodes a record with this one's name and tags, and a new position, CIGAR, sequence (as
     /// packed bases), and qualities.
     fn encode(&self, pos: i64, cigar: &[u32], l_seq: usize, seq: &[u8], qual: &[u8]) -> Vec<u8> {
+        const MAX_CIGAR_OPS: usize = 0xffff;
+        const SKIP: u32 = 3;
+
+        let long_cigar = cigar.len() > MAX_CIGAR_OPS;
+        let placeholder = [
+            cigar_op(l_seq as u32, CIGAR_SOFT_CLIP),
+            cigar_op(reference_len(cigar) as u32, SKIP),
+        ];
+        let stored_cigar = if long_cigar { &placeholder[..] } else { cigar };
+
         let l_name = usize::from(self.raw[8]);
         let mut dst = Vec::with_capacity(self.raw.len());
         dst.extend_from_slice(&self.raw[..32]);
         dst[4..8].copy_from_slice(&(pos as i32).to_le_bytes());
-        dst[12..14].copy_from_slice(&(cigar.len() as u16).to_le_bytes());
+        dst[12..14].copy_from_slice(&(stored_cigar.len() as u16).to_le_bytes());
         dst[16..20].copy_from_slice(&(l_seq as u32).to_le_bytes());
         dst.extend_from_slice(&self.raw[32..32 + l_name]);
 
-        for op in cigar {
+        for op in stored_cigar {
             dst.extend_from_slice(&op.to_le_bytes());
         }
 
         dst.extend_from_slice(seq);
         dst.extend_from_slice(qual);
-        dst.extend_from_slice(self.aux);
+        dst.extend_from_slice(&self.aux);
+
+        if long_cigar {
+            dst.extend_from_slice(b"CGBI");
+            dst.extend_from_slice(&(cigar.len() as u32).to_le_bytes());
+
+            for op in cigar {
+                dst.extend_from_slice(&op.to_le_bytes());
+            }
+        }
+
         set_bin(&mut dst);
         dst
     }
@@ -1261,6 +1303,31 @@ mod tests {
         raw.extend(std::iter::repeat_n(30, len));
         raw.extend(b"NMC\x03");
         raw
+    }
+
+    #[test]
+    fn test_parts_with_a_long_cigar() {
+        // 35,000 × 1M1I: 70,000 operations, stored as a 70000S35000N placeholder and a CG field.
+        let cigar: Vec<u32> = (0..35_000)
+            .flat_map(|_| [cigar_op(1, 0), cigar_op(1, 1)])
+            .collect();
+        let len = 70_000;
+
+        let short = record(&[cigar_op(len as u32, 0)], len);
+        let parts = Parts::new(&short);
+        let long = parts.encode(99, &cigar, len, parts.seq, parts.qual);
+
+        assert_eq!(le_u16(&long[12..14]), 2);
+        assert_eq!(active_query_len(&long), 70_000);
+        assert_eq!(end_position(&long), 99 + 35_000);
+
+        let parts = Parts::new(&long);
+        assert_eq!(parts.cigar, cigar);
+        assert_eq!(&parts.aux[..], b"NMC\x03");
+
+        // Clipping it keeps the long CIGAR.
+        let clipped = trim_left(&long, 2, Clipping::Soft);
+        assert_eq!(Parts::new(&clipped).cigar.len(), 69_997);
     }
 
     #[test]

@@ -953,7 +953,12 @@ impl Formatter {
         }
 
         if !matches!(self.aux, AuxTags::None) {
-            self.write_tags(r.data(), dst)?;
+            // HTSlib moves a long CIGAR's `CG` field into the CIGAR when it reads a record, so
+            // that field is not a tag.
+            let data = r.data();
+            let data_start = r.as_bytes().len() - data.len();
+            let long_cigar = r.long_cigar_field()?.map(|range| range.start - data_start);
+            self.write_tags(data, long_cigar, dst)?;
         }
 
         dst.push(b'\n');
@@ -1045,13 +1050,21 @@ impl Formatter {
         Ok(())
     }
 
-    /// Appends the selected tags, in record order, as `\tTAG:TYPE:VALUE`.
-    fn write_tags(&self, mut data: &[u8], dst: &mut Vec<u8>) -> io::Result<()> {
+    /// Appends the selected tags, in record order, as `\tTAG:TYPE:VALUE`, leaving out the field
+    /// at offset `skip` in `data`.
+    fn write_tags(
+        &self,
+        mut data: &[u8],
+        skip: Option<usize>,
+        dst: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        let mut offset = 0;
+
         // As HTSlib, stop when a field cannot fit.
         while data.len() >= 4 {
             let tag = [data[0], data[1]];
 
-            let len = if self.aux.includes(tag) {
+            let len = if self.aux.includes(tag) && skip != Some(offset) {
                 dst.push(b'\t');
                 write_field(data, dst)?
             } else {
@@ -1062,6 +1075,7 @@ impl Formatter {
             };
 
             data = &data[len..];
+            offset += len;
         }
 
         Ok(())
@@ -1137,7 +1151,8 @@ fn write_field(data: &[u8], dst: &mut Vec<u8>) -> io::Result<usize> {
         b'f' => {
             let n = f32::from_le_bytes(value.try_into().map_err(|_| invalid())?);
             dst.extend_from_slice(b"f:");
-            dst.extend_from_slice(crate::depth::format_g(f64::from(n), 6).as_bytes());
+            // HTSlib's `kputd`, which keeps the sign of -0.
+            noodles_sam::io::writer::write_f32(dst, n)?;
         }
         b'd' => {
             let n = f64::from_le_bytes(value.try_into().map_err(|_| invalid())?);

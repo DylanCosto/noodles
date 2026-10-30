@@ -548,32 +548,41 @@ fn trim(record: &mut RecordBuf, end: i64) {
     }
 
     let mut kept: Vec<Op> = ops[..i].to_vec();
-    let mut trailing: Vec<Op> = Vec::new();
 
     let to_len = |n: i64| usize::try_from(n).unwrap_or(0);
 
-    if position - len < end {
+    // The soft clip counts only read bases. HTSlib also adds the lengths of deletions and
+    // reference skips, which gives a CIGAR longer than the sequence (`3M10D2M` 3 bases from the
+    // end becomes `3M3D9S` for 5 bases).
+    let read_len = |kind: Kind, len: usize| if kind.consumes_read() { len } else { 0 };
+
+    let mut clip = if position - len < end {
         // The operation straddles the end: split it.
         kept.push(Op::new(kind, to_len(end - (position - len))));
-        trailing.push(Op::new(Kind::SoftClip, to_len(position - end)));
+        read_len(kind, to_len(position - end))
     } else if position > end {
         *record.flags_mut() |= Flags::UNMAPPED;
         *record.flags_mut() &= !Flags::PROPERLY_SEGMENTED;
+        return;
     } else {
-        trailing.push(Op::new(Kind::SoftClip, ops[i].len()));
-    }
+        read_len(kind, ops[i].len())
+    };
+
+    let mut hard_clips = Vec::new();
 
     for op in &ops[i + 1..] {
         if op.kind() == Kind::HardClip {
-            trailing.push(*op);
-        } else if let Some(last) = trailing.last_mut() {
-            *last = Op::new(Kind::SoftClip, last.len() + op.len());
+            hard_clips.push(*op);
         } else {
-            trailing.push(Op::new(Kind::SoftClip, op.len()));
+            clip += read_len(op.kind(), op.len());
         }
     }
 
-    kept.extend(trailing);
+    if clip > 0 {
+        kept.push(Op::new(Kind::SoftClip, clip));
+    }
+
+    kept.extend(hard_clips);
     *record.cigar_mut() = kept.into_iter().collect();
 }
 
@@ -1336,6 +1345,50 @@ mod tests {
                 Op::new(Kind::Match, 8),
                 Op::new(Kind::Deletion, 2),
                 Op::new(Kind::Match, 4)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_trim() {
+        use noodles_core::Position;
+
+        let record = |start: usize, ops: &[Op]| {
+            RecordBuf::builder()
+                .set_alignment_start(Position::new(start).unwrap())
+                .set_cigar(ops.iter().copied().collect())
+                .build()
+        };
+
+        // 3M10D2M at 115 on a 120-base reference: the deletion crosses the end, and the soft
+        // clip holds only the 2 remaining read bases.
+        let mut r = record(
+            115,
+            &[
+                Op::new(Kind::Match, 3),
+                Op::new(Kind::Deletion, 10),
+                Op::new(Kind::Match, 2),
+            ],
+        );
+        trim(&mut r, 120);
+        assert_eq!(
+            r.cigar().as_ref(),
+            [
+                Op::new(Kind::Match, 3),
+                Op::new(Kind::Deletion, 3),
+                Op::new(Kind::SoftClip, 2),
+            ]
+        );
+
+        // 10M at 195, then a hard clip.
+        let mut r = record(195, &[Op::new(Kind::Match, 10), Op::new(Kind::HardClip, 4)]);
+        trim(&mut r, 200);
+        assert_eq!(
+            r.cigar().as_ref(),
+            [
+                Op::new(Kind::Match, 6),
+                Op::new(Kind::SoftClip, 4),
+                Op::new(Kind::HardClip, 4),
             ]
         );
     }
