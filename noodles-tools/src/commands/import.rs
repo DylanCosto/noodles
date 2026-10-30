@@ -19,6 +19,7 @@ use noodles_pileup::baq::SEQ_NT16_TABLE;
 use noodles_sam as sam;
 use regex::bytes::Regex;
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, OutputFormatOptions, Verbosity};
 use crate::{
     bam_raw::{self, BASES},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
@@ -131,6 +132,18 @@ pub struct Args {
     /// Do not add an @PG line to the header.
     #[arg(long = "no-PG")]
     no_pg: bool,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// The input files, in the order samtools reads them (index reads before the reads they
@@ -157,6 +170,8 @@ struct ParseOptions {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
+    args.input_format_options.validate()?;
+
     let files = input_files(&args);
 
     if files.is_empty() {
@@ -190,7 +205,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let write_options = WriteOptions {
         format,
-        level: output::parse_level(if args.uncompressed { 0 } else { 6 })?,
+        level: output::parse_level(if args.uncompressed {
+            0
+        } else {
+            args.output_format_options.level(6)?
+        })?,
         threads: args.threads,
         reference: args.reference.clone(),
     };

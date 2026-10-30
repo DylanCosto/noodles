@@ -207,8 +207,14 @@ impl AlignmentReader {
     /// Stops CRAM decoding from adding the MD and NM tags the file left out, as samtools
     /// commands that set `CRAM_OPT_DECODE_MD` to 0 do. Other formats are unaffected.
     pub fn keep_stored_md_nm(&mut self) {
+        self.set_md_nm(MdNm::AsStored);
+    }
+
+    /// Sets whether CRAM decoding adds the MD and NM tags the file left out (`decode_md`).
+    /// Other formats are unaffected.
+    pub fn set_md_nm(&mut self, md_nm: MdNm) {
         if let Self::Cram(reader, _, _) = self {
-            reader.set_md_nm(MdNm::AsStored);
+            reader.set_md_nm(md_nm);
         }
     }
 

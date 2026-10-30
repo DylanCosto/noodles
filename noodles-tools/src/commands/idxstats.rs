@@ -9,6 +9,7 @@ use anyhow::Context;
 use noodles_csi::BinningIndex;
 use noodles_sam as sam;
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentIndex, AlignmentReader, ReadOptions},
     source::Format,
@@ -34,6 +35,15 @@ pub struct Args {
     /// Additional threads for BGZF decompression when scanning.
     #[arg(short = '@', long = "threads", default_value_t = 0)]
     threads: usize,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// Per-reference counts, plus records with no reference.
@@ -43,12 +53,14 @@ struct Stats {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let options = ReadOptions {
+    let mut options = ReadOptions {
         threads: args.threads,
         reference: args.reference,
     };
+    args.input_format_options.configure(&mut options)?;
 
     let (mut reader, path) = AlignmentReader::open(&args.input, &options)?;
+    args.input_format_options.apply(&mut reader)?;
     let header = reader.read_header()?;
 
     // samtools reads counts from the index for BAM only.

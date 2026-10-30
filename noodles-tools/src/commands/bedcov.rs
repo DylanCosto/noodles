@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context, bail};
 use noodles_sam::alignment::record::Flags;
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentIndex, AlignmentReader, Queries, ReadOptions},
     depth::{CountOptions, DEFAULT_EXCLUDE_FLAGS, DepthWindow},
@@ -34,7 +35,12 @@ pub struct Args {
     customized_index: bool,
 
     /// Exclude reads with mapping quality below this value.
-    #[arg(short = 'Q', long = "min-MQ", default_value_t = 0)]
+    #[arg(
+        short = 'Q',
+        long = "min-MQ",
+        visible_alias = "min-mq",
+        default_value_t = 0
+    )]
     min_mapping_quality: u8,
 
     /// Remove these flags from the default exclusion list (UNMAP,SECONDARY,QCFAIL,DUP).
@@ -77,6 +83,15 @@ pub struct Args {
     /// Print help.
     #[arg(long, action = clap::ArgAction::Help)]
     help: Option<bool>,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// Per-input results for one region.
@@ -88,10 +103,11 @@ struct RegionCounts {
 }
 
 pub fn run(args: Args) -> anyhow::Result<ExitCode> {
-    let options = ReadOptions {
+    let mut options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    args.input_format_options.configure(&mut options)?;
 
     let (sources, indexes) = if args.customized_index {
         if !args.inputs.len().is_multiple_of(2) {
@@ -108,6 +124,7 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
 
     for (i, src) in sources.iter().enumerate() {
         let (mut reader, path) = AlignmentReader::open(src, &options)?;
+        args.input_format_options.apply(&mut reader)?;
         let header = reader.read_header()?;
         let path = path.with_context(|| format!("{src}: bedcov needs indexed files, not stdin"))?;
         let explicit = indexes.map(|indexes| Path::new(&indexes[i]));
@@ -124,12 +141,6 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         ..Filter::default()
     };
 
-    let count_options = CountOptions {
-        include_deletions: !args.no_deletions,
-        include_skips: !args.no_deletions,
-        ..CountOptions::default()
-    };
-
     let text =
         fs::read_to_string(&args.bed).with_context(|| format!("reading {}", args.bed.display()))?;
 
@@ -139,11 +150,20 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         write_header(&mut out, &args, sources)?;
     }
 
-    // samtools raises the limit to the -d threshold; a negative one acts as 0.
-    let max_count = args.max_depth.map(|max_depth| {
-        let threshold = args.depth_threshold.map_or(-1, i64::from);
-        usize::try_from(max_depth.max(threshold)).unwrap_or(0)
-    });
+    let scan = Scan {
+        filter,
+        count_options: CountOptions {
+            include_deletions: !args.no_deletions,
+            include_skips: !args.no_deletions,
+            ..CountOptions::default()
+        },
+        depth_threshold: args.depth_threshold,
+        // samtools raises the limit to the -d threshold; a negative one acts as 0.
+        max_count: args.max_depth.map(|max_depth| {
+            let threshold = args.depth_threshold.map_or(-1, i64::from);
+            usize::try_from(max_depth.max(threshold)).unwrap_or(0)
+        }),
+    };
 
     let mut counts = vec![RegionCounts::default(); inputs.len()];
 
@@ -167,16 +187,7 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         };
 
         for ((reader, index, header), counts) in inputs.iter_mut().zip(counts.iter_mut()) {
-            *counts = count_region(
-                reader,
-                index,
-                header,
-                &filter,
-                count_options,
-                args.depth_threshold,
-                max_count,
-                (name, start, end),
-            )?;
+            *counts = count_region(reader, index, header, &scan, (name, start, end))?;
         }
 
         out.write_all(line.as_bytes())?;
@@ -244,17 +255,32 @@ fn scan_integer(s: &str) -> Option<(i64, &str)> {
     Some((n, rest))
 }
 
+/// How every region is counted.
+struct Scan {
+    filter: Filter,
+    count_options: CountOptions,
+    /// `-d`.
+    depth_threshold: Option<u32>,
+    /// HTSlib's pileup `maxcnt` (`--max-depth`).
+    max_count: Option<usize>,
+}
+
 /// Sums depth over the 0-based half-open region `[start, end)` of one input.
 fn count_region(
     reader: &mut AlignmentReader,
     index: &AlignmentIndex,
     header: &noodles_sam::Header,
-    filter: &Filter,
-    count_options: CountOptions,
-    depth_threshold: Option<u32>,
-    max_count: Option<usize>,
+    scan: &Scan,
     (name, start, end): (&str, usize, usize),
 ) -> anyhow::Result<RegionCounts> {
+    let Scan {
+        filter,
+        count_options,
+        depth_threshold,
+        max_count,
+    } = scan;
+    let (count_options, depth_threshold) = (*count_options, *depth_threshold);
+
     let mut counts = RegionCounts::default();
 
     let Some(id) = header.reference_sequences().get_index_of(name.as_bytes()) else {
@@ -269,7 +295,7 @@ fn count_region(
     let region = format!("{name}:{first}-{last}");
     let regions = [region];
 
-    let mut window = match max_count {
+    let mut window = match *max_count {
         Some(max_count) => DepthWindow::with_max_count(count_options, max_count),
         None => DepthWindow::new(count_options),
     };

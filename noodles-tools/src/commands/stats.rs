@@ -35,6 +35,7 @@ use self::{
     record::Bam,
     report::read_groups_for,
 };
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, Verbosity};
 
 /// The shortest read BWA trims (`BWA_MIN_RDLEN`).
 const BWA_MIN_READ_LENGTH: usize = 35;
@@ -163,6 +164,15 @@ pub struct Args {
     /// Print help.
     #[arg(short = 'h', long, action = clap::ArgAction::Help)]
     help: Option<bool>,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// `stats_info_t`: options shared by every set of statistics.
@@ -483,12 +493,14 @@ pub fn run(mut args: Args) -> anyhow::Result<()> {
         None
     };
 
-    let read_options = ReadOptions {
+    let mut read_options = ReadOptions {
         threads: args.threads,
         reference: args.cram_reference.clone(),
     };
+    args.input_format_options.configure(&mut read_options)?;
 
     let (mut reader, path) = AlignmentReader::open(&args.input, &read_options)?;
+    args.input_format_options.apply(&mut reader)?;
     let header = reader.read_header()?;
 
     let mut info = Info::from_args(&args, &header)?;

@@ -12,6 +12,7 @@ use noodles_pileup::{
     md::{self, FillMdOptions},
 };
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, OutputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentReader, RawEncoder, ReadOptions},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
@@ -39,6 +40,10 @@ pub struct Args {
     /// Output compressed BAM.
     #[arg(short = 'b')]
     bam: bool,
+
+    /// Output format [default: BAM with -b or -u, else SAM].
+    #[arg(long = "output-fmt", ignore_case = true)]
+    output_format: Option<OutputFormat>,
 
     /// Ignored (the input format is detected).
     #[arg(short = 'S')]
@@ -99,6 +104,18 @@ pub struct Args {
     /// Print help.
     #[arg(long, action = clap::ArgAction::Help)]
     help: Option<bool>,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -110,12 +127,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         bail!("Usage: ntools calmd [-eubrAESQ] <aln.bam> <ref.fasta>");
     };
 
-    let read_options = ReadOptions {
+    let mut read_options = ReadOptions {
         threads: args.threads,
         reference: Some(reference_path.clone()),
     };
+    args.input_format_options.configure(&mut read_options)?;
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &read_options)?;
+    args.input_format_options.apply(&mut reader)?;
     let mut header = reader.read_header()?;
     let input_header = header.clone();
 
@@ -135,14 +154,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     })?;
 
     let write_options = WriteOptions {
-        format: if args.bam || args.uncompressed {
-            OutputFormat::Bam
+        format: args
+            .output_format
+            .unwrap_or(if args.bam || args.uncompressed {
+                OutputFormat::Bam
+            } else {
+                OutputFormat::Sam
+            }),
+        level: output::parse_level(if args.uncompressed {
+            0
         } else {
-            OutputFormat::Sam
-        },
-        level: output::parse_level(if args.uncompressed { 0 } else { 6 })?,
+            args.output_format_options.level(6)?
+        })?,
         threads: args.threads,
-        reference: None,
+        reference: Some(reference_path.clone()),
     };
 
     let mut writer = AlignmentWriter::create(None, &write_options, &header)?;

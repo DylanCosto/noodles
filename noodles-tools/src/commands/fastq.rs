@@ -17,6 +17,7 @@ use noodles_bgzf::io::writer::CompressionLevel;
 use noodles_pileup::baq::SEQ_NT16_TABLE;
 use noodles_sam::alignment::record::Flags;
 
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, Verbosity};
 use crate::{
     alignment::{AlignmentReader, RawEncoder, ReadOptions},
     bam_raw::{self, BASES, Record, field, le_u16, le_u32},
@@ -222,17 +223,28 @@ pub struct Args {
     /// Additional threads for decompression and compression.
     #[arg(short = '@', long = "threads", default_value_t = 0)]
     threads: usize,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 pub fn run(args: Args, format: ReadFormat) -> anyhow::Result<()> {
     let config = Config::new(&args, format)?;
 
-    let options = ReadOptions {
+    let mut options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    args.input_format_options.configure(&mut options)?;
 
     let (mut reader, _) = AlignmentReader::open(&args.input, &options)?;
+    args.input_format_options.apply(&mut reader)?;
     // samtools fastq sets CRAM_OPT_DECODE_MD to 0, so -T copies stored MD and NM tags only.
     reader.keep_stored_md_nm();
     let header = reader.read_header()?;

@@ -35,6 +35,8 @@ pub struct Filter {
     pub require: Flags,
     pub exclude: Flags,
     pub exclude_all: Option<Flags>,
+    /// Keep only records with any of these flags (`--rf`).
+    pub require_any: Option<Flags>,
     pub min_mapping_quality: u8,
     /// Keep only records whose `RG` is one of these read groups (`-l`).
     pub read_groups: Option<HashSet<BString>>,
@@ -92,6 +94,12 @@ impl Filter {
 
         if let Some(all) = self.exclude_all
             && flags.contains(all)
+        {
+            return Ok(false);
+        }
+
+        if let Some(any) = self.require_any
+            && !flags.intersects(any)
         {
             return Ok(false);
         }
@@ -423,42 +431,12 @@ pub struct Subsample {
 }
 
 impl Subsample {
-    /// Parses samtools' `INT.FRAC` form: the integer part seeds, the rest is the fraction kept.
-    pub fn parse(s: &str) -> anyhow::Result<Self> {
-        let (raw_seed, raw_fraction) = match s.find('.') {
-            Some(i) => (&s[..i], &s[i..]),
-            None => (s, ""),
-        };
+    /// A subsample keeping `fraction` of templates. As samtools does, a nonzero seed (which
+    /// may be a small number like 1 or 2) is mixed with `srand`/`rand`.
+    pub fn new(seed: u32, fraction: f64) -> Self {
+        let seed = if seed == 0 { 0 } else { glibc_first_rand(seed) };
 
-        let seed: i64 = if raw_seed.is_empty() {
-            0
-        } else {
-            raw_seed
-                .parse()
-                .with_context(|| format!("invalid subsampling seed: {s}"))?
-        };
-
-        let fraction: f64 = if raw_fraction.is_empty() {
-            1.0
-        } else {
-            raw_fraction
-                .parse()
-                .with_context(|| format!("invalid subsampling fraction: {s}"))?
-        };
-
-        // samtools turns small seeds (0, 1, 2, ...) into well-mixed ones with srand/rand.
-        let seed = if seed == 0 {
-            0
-        } else {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "srand takes an unsigned int, so samtools truncates the seed the same way"
-            )]
-            let seed = seed as u32;
-            glibc_first_rand(seed)
-        };
-
-        Ok(Self { seed, fraction })
+        Self { seed, fraction }
     }
 
     pub fn keeps(&self, name: &[u8]) -> bool {
@@ -532,15 +510,12 @@ mod tests {
     }
 
     #[test]
-    fn test_subsample_parse() -> anyhow::Result<()> {
-        let s = Subsample::parse("0.25")?;
+    fn test_subsample_new() {
+        let s = Subsample::new(0, 0.25);
         assert_eq!(s.seed, 0);
         assert!((s.fraction - 0.25).abs() < f64::EPSILON);
 
-        let s = Subsample::parse("42.5")?;
+        let s = Subsample::new(42, 0.5);
         assert_eq!(s.seed, glibc_first_rand(42));
-        assert!((s.fraction - 0.5).abs() < f64::EPSILON);
-
-        Ok(())
     }
 }

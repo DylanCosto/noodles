@@ -17,7 +17,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 
 | Command | samtools equivalent | Notes |
 |---|---|---|
-| `view` | `view` | SAM/BAM/CRAM conversion; `-c`, `-f/-F/-G`, `-q`, `-m`, `-e` (filter expressions), `-L`, `-M`, `-P`, `-s`, `-N`, `-r/-R/-n`, `-d/-D`, `-x`, `-U`, `-p`, `-B`, `-t`, `-X`, `-l` (library), `-h/-H`, `-b/-C/-u/-1`, `--output-fmt-option level=N`, `--write-index`, `-?`, `-S`, regions and `*` |
+| `view` | `view` | SAM/BAM/CRAM conversion; `-c`, `-f/-F/-G`, `--rf`, `-q`, `-m`, `-e` (filter expressions), `-L`, `--region-file`, `-M`, `-P`, `-s`, `--subsample/--subsample-seed` (with samtools' `@CO` line and header-derived `auto` seed), `-N`, `-r/-R/-n`, `-d/-D`, `-x` (and `^TAGS`), `--keep-tag`, `--add-flags/--remove-flags`, `-U`, `-p`, `-B`, `-t`, `-X` (index after the input), `-l` (library), `-h/-H`, `--no-header`, `--save-counts`, `-b/-C/-u/-1`, `--write-index`, `-?`, `-S`, regions and `*` |
 | `sort` | `sort` | coordinate, `-n` (natural), `-N` (bytewise), `-t TAG` (then by position, or by name with `-n`/`-N`); `-m`, `-T`, `-@`; stable, like samtools. No minimiser order (`-M`, `-I`, `-K`, `-w`); `-H` and `-R`, which only modify it, are accepted and ignored |
 | `merge` | `merge` | SAM, BAM, and CRAM inputs; headers merged as samtools does, renaming colliding `@RG`/`@PG` IDs (`-s` seed) or combining them (`-c`, `-p`), with `RG`/`PG` tags translated; `-n/-N`, `-t`, `-r`, `-R`/`-L` (indexed inputs, `-X` index files), `-b`, `-h`, `-1/-l/-u`, `-f`, `-o` |
 | `index` | `index` | BAI (default) or CSI (`-c`, `-m` minimum shift, with HTSlib's level count) for BAM; CRAI for CRAM; `-M` (several inputs), `-o` or a second argument naming the index |
@@ -30,16 +30,16 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `quickcheck` | `quickcheck` | `-v`, `-q`, `-u` |
 | `reheader` | `reheader` | BAM and CRAM; `-P`, `-c CMD`, `-i` (CRAM in place); copies compressed blocks and containers |
 | `cat` | `cat` | BAM and CRAM; `-b`, `-h`, `-o`, later inputs' `@RG` lines added; CRAM `-r` (region, `*`, or `#:start-end` containers), `-p N/M`, `-f`, `-q`; copies compressed blocks and containers, re-encoding only CRAM containers that must be filtered or get new read group numbers |
-| `split` | `split` | by read group or `-d` tag; `-f`, `-p`, `-u`, `-M` |
+| `split` | `split` | by read group or `-d` tag; `-f`, `-p/--zero-pad`, `-u`, `-M`, `--write-index` |
 | `collate` | `collate` | groups templates by name; `-f`, `-O/-o`, `-u`, `-l`, `-m`, `-T`; `-n` and `-r` are accepted and ignored (they size samtools' temporary files) |
 | `fixmate` | `fixmate` | `-m`, `-c`, `-r`, `-p`, `-z`, `-M` (base modification tags); parallel with `-@` |
 | `dict` | `dict` | `-a`, `-s`, `-u`, `-H`, `-o`, `-A` (`AN` aliases), `-l` (`AH` for alternate loci) |
 | `bedcov` | `bedcov` | `-c`, `-d`, `-j`, `-Q`, `-g/-G`, `-H`, `--max-depth` (the pileup's limit, applied as HTSlib does); several inputs; `-X` (index files after the inputs) |
-| `addreplacerg` | `addreplacerg` | `-r` (repeatable, `\t` escapes), `-R`, `-m overwrite_all\|orphan_only`, `-w` |
-| `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-S`, `-t`, `-d` (optical duplicates), `-T`, `-s/-f`, `--json`, `--no-multi-dup`, `--include-fails`, `--use-read-groups`, `--duplicate-count`, `--read-coords`/`--coords-order`, `--barcode-tag`/`-name`/`-rgx`, `--move-umi-to-tag`, `--umi-separator` |
+| `addreplacerg` | `addreplacerg` | `-r` (repeatable, `\t` escapes), `-R`, `-m overwrite_all\|orphan_only`, `-w`, `--write-index`, `--input-fmt` |
+| `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-S`, `-t`, `-d` (optical duplicates), `-T`, `-s/-f`, `--json`, `--no-multi-dup`, `--include-fails`, `--use-read-groups`, `--duplicate-count`, `--read-coords`/`--coords-order`, `--barcode-tag`/`-name`/`-rgx`, `--move-umi-to-tag`, `--umi-separator`, `--write-index` |
 | `stats` | `stats` | all sections; `-r`, `-t`, regions, `-f/-F/-d`, `-c`, `-i`, `-m`, `-q`, `-l`, `-I`, `-S/-P`, `-p`, `-g`, `-x`, `--GC-depth`, `--ref-stats`; per-cycle counts use `-@` threads |
-| `mpileup` | `mpileup` | text pileup with BAQ (`-B`, `-E`), overlap removal (`-x`), `-f`, `-r`, `-l`, `-a/-aa`, `-q/-Q`, `-d`, `-A`, `-C`, `-G`, `-R`, `-6`, `--rf/--ff`, `-b`, `-X`, `-s`, `-O`, `--output-BP-5`, `--output-QNAME`, `--output-extra`, `--output-sep/-empty`, `--reverse-del`, `--no-output-ins/-del/-ends`, `-M` (base modifications from MM/ML, also in insertions unless `--no-output-ins-mods`); reads and BAQ use `-@` threads, and indexed inputs with several sequences pile up one chromosome per thread |
-| `calmd` | `calmd` | `-e`, `-r` (BAQ), `-A`, `-E`, `-n`, `-C`, `-d`, `-q`, `-N`, `-Q`, `-b/-u`; records are processed on `-@` threads |
+| `mpileup` | `mpileup` | text pileup with BAQ (`-B`, `-E`), overlap removal (`-x`), `-f` (or `--reference`), `-r`, `-l`, `-a/-aa`, `-q/-Q`, `-d`, `-A`, `-C`, `-G`, `-R`, `-6`, `--rf/--ff`, `-b`, `-X`, `-s`, `-O`, `--output-BP-5`, `--output-QNAME`, `--output-extra`, `--output-sep/-empty`, `--reverse-del`, `--no-output-ins/-del/-ends`, `-M` (base modifications from MM/ML, also in insertions unless `--no-output-ins-mods`); reads and BAQ use `-@` threads, and indexed inputs with several sequences pile up one chromosome per thread |
+| `calmd` | `calmd` | `-e`, `-r` (BAQ), `-A`, `-E`, `-n`, `-C`, `-d`, `-q`, `-N`, `-Q`, `-b/-u`, `--output-fmt`; records are processed on `-@` threads |
 | `ampliconclip` | `ampliconclip` | soft or `--hard-clip`, `--both-ends`, `--strand`, `--tolerance`, `--original`, `--keep-tag`, `--clipped`, `--fail`, `--filter-len/--fail-len/--unmap-len`, `--no-excluded`, `--rejects-file`, `--primer-counts`, `-f` |
 | `import` | `import` | FASTQ/FASTA (plain or gzipped) to unaligned SAM/BAM/CRAM; `-0/-1/-2/-s`, `--i1/--i2` (index reads to `BC`/`QT`), `-b`, `-i` (CASAVA), `-U` (UMIs), `-N` (SRA names), `-T` (tags from comments, such as `MM`/`ML`), `-r/-R`, `--order`, `-O`, `-u`, `-o` |
 | `reset` | `reset` | `-x`/`--keep-tag` (including `^` lists), `--reject-PG`, `--no-RG`, `--dupflag`, `-O`, `-o` |
@@ -54,6 +54,12 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 
 CRAM input without `--reference` uses the FASTA file named by the `@SQ` `UR` fields when it exists
 locally with a `.fai` index, as HTSlib does.
+
+Commands take samtools' shared long options where samtools does: `--input-fmt-option`
+(`decode_md=0|1`, `reference=FILE`; `nthreads` is ignored), `--output-fmt-option` (`level=N`;
+`nthreads` is ignored), and `--write-index` (on `view`, `split`, `addreplacerg`, `markdup`, and
+`faidx`; accepted and ignored elsewhere, as in samtools). Other format options are errors rather
+than silently ignored. `--verbosity` is accepted and ignored.
 
 `-@ N` adds worker threads throughout. Beyond BGZF compression and decompression, which is what
 samtools mostly uses its threads for, ntools also formats SAM text, decodes CRAM containers,
@@ -162,6 +168,11 @@ Intentional differences:
 - `depth -X` with an odd number of files is an error (samtools' check never fires, and it
   pairs the files up wrongly), and `-H` labels the columns with the input names; samtools
   prints the index file names.
+- `view` applies `--add-flags`/`--remove-flags` with `-P` too; samtools skips them there. An
+  out-of-range `--subsample` is an error with a nonzero exit status (samtools prints the error but
+  exits 0).
+- With a compression level in `--output-fmt-option`, samtools writes SAM output BGZF-compressed;
+  ntools writes plain SAM (the same text).
 - `bedcov -d` adds its column without changing the depth sum, which counts deletions and
   reference skips unless `-j`, as documented; samtools also drops them from the sum when `-d`
   is given. The `-d` column counts aligned bases, as in samtools.

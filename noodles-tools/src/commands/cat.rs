@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, bail};
 use noodles_sam as sam;
 
+use crate::global_args::{IgnoredWriteIndex, OutputFormatOptions, Verbosity};
 use crate::{
     bam_blocks,
     commands::reheader::read_sam_header,
@@ -68,9 +69,21 @@ pub struct Args {
     /// Print help.
     #[arg(long, action = clap::ArgAction::Help)]
     help: Option<bool>,
+
+    #[command(flatten)]
+    output_format_options: OutputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
+    // samtools cat accepts output format options but copies compressed data as it is.
+    args.output_format_options.level(0)?;
+
     let mut inputs = Vec::new();
 
     for list in &args.lists {

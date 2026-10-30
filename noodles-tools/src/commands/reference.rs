@@ -16,6 +16,7 @@ use anyhow::{Context, bail};
 use noodles_cram as cram;
 use noodles_sam as sam;
 
+use crate::global_args::{IgnoredWriteIndex, Verbosity};
 use crate::{
     alignment::{AlignmentIndex, AlignmentReader, RawEncoder, ReadOptions, Rec},
     bam_raw::{BASES, Record},
@@ -51,6 +52,12 @@ pub struct Args {
     /// FASTA reference for decoding CRAM input.
     #[arg(long = "reference")]
     reference: Option<PathBuf>,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// The FASTA line width.

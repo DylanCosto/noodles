@@ -13,6 +13,7 @@ mod expr;
 mod file_list;
 mod filter;
 mod flags;
+mod global_args;
 mod hts_region;
 mod khash;
 mod output;

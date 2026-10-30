@@ -20,6 +20,7 @@ use crate::{
 };
 
 use self::histogram::{Blocks, Plot};
+use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, Verbosity};
 
 /// samtools' default `-d`.
 const DEFAULT_MAX_DEPTH: i64 = 1_000_000;
@@ -127,6 +128,15 @@ pub struct Args {
     /// Print help.
     #[arg(short = 'h', long, action = clap::ArgAction::Help)]
     help: Option<bool>,
+
+    #[command(flatten)]
+    input_format_options: InputFormatOptions,
+
+    #[command(flatten)]
+    write_index: IgnoredWriteIndex,
+
+    #[command(flatten)]
+    verbosity: Verbosity,
 }
 
 /// Whether the table starts with a line of column names (`-H` omits it).
@@ -247,15 +257,17 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         None => args.inputs.clone(),
     };
 
-    let options = ReadOptions {
+    let mut options = ReadOptions {
         threads: args.threads,
         reference: args.reference.clone(),
     };
+    args.input_format_options.configure(&mut options)?;
 
     let mut inputs = Vec::with_capacity(sources.len());
 
     for src in &sources {
         let (mut reader, path) = AlignmentReader::open(src, &options)?;
+        args.input_format_options.apply(&mut reader)?;
         // As in samtools (CRAM_OPT_DECODE_MD set to 0); coverage never reads MD or NM.
         reader.keep_stored_md_nm();
         let header = reader
