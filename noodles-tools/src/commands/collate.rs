@@ -10,12 +10,15 @@ use anyhow::bail;
 use noodles_sam::{
     self as sam,
     alignment::record::Flags,
-    header::record::value::{Map, map::header::tag::GROUP_ORDER},
+    header::record::value::{
+        Map,
+        map::header::tag::{GROUP_ORDER, SORT_ORDER},
+    },
 };
 
 use crate::{
     alignment::{AlignmentReader, ReadOptions},
-    commands::sort::{SortedRecords, create_temp_dir, parse_memory, set_sort_order},
+    commands::sort::{SortedRecords, create_temp_dir, parse_memory},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     program,
     sort_order::Order,
@@ -33,7 +36,7 @@ pub struct Args {
     prefix: Option<PathBuf>,
 
     /// Write output to stdout.
-    #[arg(short = 'O')]
+    #[arg(short = 'O', conflicts_with = "output")]
     stdout: bool,
 
     /// Write output to this file.
@@ -59,6 +62,16 @@ pub struct Args {
     /// Prefix for temporary files.
     #[arg(short = 'T')]
     temp_prefix: Option<PathBuf>,
+
+    /// Number of temporary files. Accepted for compatibility and ignored: it only tunes
+    /// samtools' temporary files (ntools buffers up to -m).
+    #[arg(short = 'n', value_name = "INT", default_value_t = 64)]
+    temp_files: i32,
+
+    /// Working reads stored (with -f). Accepted for compatibility and ignored: it only tunes
+    /// samtools' temporary files (ntools buffers up to -m).
+    #[arg(short = 'r', value_name = "INT", default_value_t = 10000)]
+    reads_store: i32,
 
     /// Output format.
     #[arg(long = "output-fmt", ignore_case = true, default_value = "bam")]
@@ -120,7 +133,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         |record| Ok(!fast || !record.flags()?.intersects(not_primary)),
     )?;
 
-    set_group_order(&mut header)?;
+    set_group_order(&mut header);
 
     if !args.no_pg {
         program::add(&mut header)?;
@@ -141,12 +154,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Sets `@HD SO:unsorted GO:query`, as samtools collate does.
-fn set_group_order(header: &mut sam::Header) -> anyhow::Result<()> {
-    set_sort_order(header, Order::Collate)?;
-
+/// Sets `@HD SO:unsorted GO:query`, as samtools collate does (keeping any `SS`).
+fn set_group_order(header: &mut sam::Header) {
     let hd = header.header_mut().get_or_insert_with(Map::default);
-    hd.other_fields_mut().insert(GROUP_ORDER, "query".into());
-
-    Ok(())
+    let fields = hd.other_fields_mut();
+    fields.insert(SORT_ORDER, "unsorted".into());
+    fields.insert(GROUP_ORDER, "query".into());
 }

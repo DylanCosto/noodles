@@ -18,8 +18,8 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | Command | samtools equivalent | Notes |
 |---|---|---|
 | `view` | `view` | SAM/BAM/CRAM conversion; `-c`, `-f/-F/-G`, `-q`, `-L`, `-M`, `-s`, `-N`, `-d`, `-x`, `-U`, `-X`, `-l` (library), `-h/-H`, `-b/-C/-u/-1`, `--output-fmt-option level=N`, `--write-index`, regions and `*` |
-| `sort` | `sort` | coordinate, `-n` (natural), `-N` (bytewise); `-m`, `-T`, `-@`; stable, like samtools |
-| `merge` | `merge -c -p` | BAM inputs; reference dictionaries are merged and IDs translated |
+| `sort` | `sort` | coordinate, `-n` (natural), `-N` (bytewise), `-t TAG` (then by position, or by name with `-n`/`-N`); `-m`, `-T`, `-@`; stable, like samtools. No minimiser order (`-M`, `-I`, `-K`, `-w`); `-H` and `-R`, which only modify it, are accepted and ignored |
+| `merge` | `merge` | SAM, BAM, and CRAM inputs; headers merged as samtools does, renaming colliding `@RG`/`@PG` IDs (`-s` seed) or combining them (`-c`, `-p`), with `RG`/`PG` tags translated; `-n/-N`, `-t`, `-r`, `-R`/`-L` (indexed inputs, `-X` index files), `-b`, `-h`, `-1/-l/-u`, `-f`, `-o` |
 | `index` | `index` | BAI (default) or CSI (`-c`) for BAM; CRAI for CRAM |
 | `faidx`, `fqidx` | `faidx`, `fqidx` | FASTA and FASTQ, plain or BGZF (`.fai` and `.gzi` as HTSlib builds them); regions as HTSlib parses them (`{name}` quoting, `1,000`, `2k`), `-r`, `-o` (BGZF for `.gz`), `-n`, `-c`, `-i`, `--mark-strand`, `--fai-idx/--gzi-idx`, `--write-index`, `-f` |
 | `flagstat` | `flagstat` | default, `-O tsv`, `-O json` |
@@ -28,10 +28,10 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `coverage` | `coverage` | per reference or `-r` region; `-q/-Q`, `-l`, flag filters (no `-m` histogram) |
 | `fastq`, `fasta` | `fastq`, `fasta` | `-0/-1/-2/-s/-o`, `-n/-N`, `-t/-T`, `-F/-f/-G`, `.gz` output |
 | `quickcheck` | `quickcheck` | `-v`, `-q`, `-u` |
-| `reheader` | `reheader` | BAM; copies compressed blocks |
+| `reheader` | `reheader` | BAM and CRAM; `-P`, `-c CMD`, `-i` (CRAM in place); copies compressed blocks and containers |
 | `cat` | `cat` | BAM; copies compressed blocks |
 | `split` | `split` | by read group or `-d` tag; `-f`, `-p`, `-u`, `-M` |
-| `collate` | `collate` | groups templates by name; `-f`, `-O/-o`, `-u`, `-l`, `-m`, `-T` |
+| `collate` | `collate` | groups templates by name; `-f`, `-O/-o`, `-u`, `-l`, `-m`, `-T`; `-n` and `-r` are accepted and ignored (they size samtools' temporary files) |
 | `fixmate` | `fixmate` | `-m`, `-c`, `-r`, `-p`, `-z`; parallel with `-@` |
 | `dict` | `dict` | `-a`, `-s`, `-u`, `-H`, `-o` |
 | `bedcov` | `bedcov` | `-c`, `-d`, `-j`, `-Q`, `-g/-G`, `-H`; several inputs |
@@ -80,9 +80,8 @@ Intentional differences:
 - `@PG` lines name ntools. Use `--no-PG` (or `-P` for `reheader`) for identical headers.
 - `view` on a CRAM `*` region returns every unplaced unmapped read; samtools 1.24 returns only
   some of them from the corpus CRAM. ntools matches samtools' output for the equivalent BAM.
-- `merge` combines `@RG`/`@PG` lines with the same ID, like `samtools merge -c -p`, and keeps
-  each record's tag order. Plain `samtools merge` renames clashing IDs with random suffixes and
-  moves `RG` to the last tag.
+- `merge` renames clashing `@RG`/`@PG` IDs with the same random suffixes as samtools for a
+  given `-s` seed; without `-s`, both seed from the clock, so suffixes differ between runs.
 - BAI/CSI bins are written in insertion order, not HTSlib's hash order. samtools reads them and
   returns identical query results.
 - CRAM written by ntools keeps `MD`/`NM` tags as stored; HTSlib drops and regenerates them.

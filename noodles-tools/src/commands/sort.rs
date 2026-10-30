@@ -1,17 +1,16 @@
-//! `ntools sort`: sort alignments by coordinate or read name (samtools sort).
+//! `ntools sort`: sort alignments by coordinate, read name, or tag (samtools sort).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use noodles_bam as bam;
-use noodles_sam::{self as sam, alignment::io::Write as _};
+use noodles_sam as sam;
 
 use crate::{
-    alignment::{AlignmentReader, ReadOptions, Rec},
+    alignment::{AlignmentReader, RawEncoder, ReadOptions, Rec},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     program,
     runs::{self, Chunk, SpillFile},
-    sort_order::Order,
+    sort_order::{Order, TagTieBreak},
     source::STDIN,
 };
 
@@ -52,6 +51,21 @@ pub struct Args {
     #[arg(short = 'N')]
     name_ascii: bool,
 
+    /// Sort by the value of TAG (records without it first), then by position, or by read name
+    /// with -n/-N.
+    #[arg(short = 't', value_name = "TAG", value_parser = parse_tag)]
+    tag: Option<[u8; 2]>,
+
+    /// Do not use the reverse strand. Accepted for compatibility: in samtools it only affects
+    /// minimiser sorting (-M), which ntools does not support.
+    #[arg(short = 'R')]
+    forward_only: bool,
+
+    /// Squash homopolymers. Accepted for compatibility: in samtools it only affects minimiser
+    /// sorting (-M), which ntools does not support.
+    #[arg(short = 'H')]
+    squash_homopolymers: bool,
+
     /// Prefix for temporary files [default: next to the output, or in the current directory].
     #[arg(short = 'T')]
     temp_prefix: Option<PathBuf>,
@@ -70,13 +84,7 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let order = if args.name_natural {
-        Order::NameNatural
-    } else if args.name_ascii {
-        Order::NameAscii
-    } else {
-        Order::Coordinate
-    };
+    let order = order(&args);
 
     let format = args
         .output_format
@@ -104,7 +112,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         |_| Ok(true),
     )?;
 
-    set_sort_order(&mut header, order)?;
+    set_sort_order(&mut header, order);
 
     if !args.no_pg {
         program::add(&mut header)?;
@@ -123,6 +131,32 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     writer.finish(&header)?;
 
     Ok(())
+}
+
+/// The sort order, as samtools picks it: `-t` sorts by tag, then by name with `-n`/`-N`.
+fn order(args: &Args) -> Order {
+    let then = if args.name_natural {
+        TagTieBreak::NameNatural
+    } else if args.name_ascii {
+        TagTieBreak::NameAscii
+    } else {
+        TagTieBreak::Coordinate
+    };
+
+    match (args.tag, then) {
+        (Some(tag), then) => Order::Tag { tag, then },
+        (None, TagTieBreak::NameNatural) => Order::NameNatural,
+        (None, TagTieBreak::NameAscii) => Order::NameAscii,
+        (None, TagTieBreak::Coordinate) => Order::Coordinate,
+    }
+}
+
+/// Parses a tag name; samtools uses its first two characters.
+pub fn parse_tag(s: &str) -> anyhow::Result<[u8; 2]> {
+    match *s.as_bytes() {
+        [a, b, ..] => Ok([a, b]),
+        _ => bail!("invalid tag: {s}"),
+    }
 }
 
 /// Records read and sorted in memory, with any sorted runs spilled to temporary files.
@@ -157,22 +191,15 @@ impl<'d> SortedRecords<'d> {
             temp_dir,
         };
 
-        let mut encoder = bam::io::Writer::from(Vec::new());
+        let mut encoder = RawEncoder::new();
 
         reader.for_each(header, |record| {
             if !keep(&record)? {
                 return Ok(());
             }
 
-            match record {
-                Rec::Bam(r) => sorted.chunk.push(r.as_ref()),
-                _ => {
-                    // Non-BAM records are encoded once so sorting and spilling work on raw bytes.
-                    encoder.get_mut().clear();
-                    encoder.write_alignment_record(header, record.as_dyn())?;
-                    sorted.chunk.push(&encoder.get_ref()[size_of::<u32>()..]);
-                }
-            }
+            // Non-BAM records are encoded once so sorting and spilling work on raw bytes.
+            sorted.chunk.push(record.encode_raw(header, &mut encoder)?);
 
             if sorted.chunk.size() >= memory_limit {
                 sorted.spill()?;
@@ -231,29 +258,40 @@ impl<'d> SortedRecords<'d> {
     }
 }
 
-/// Sets `@HD SO` (and `SS` for name orders) as samtools does, creating `@HD` if needed.
-pub fn set_sort_order(header: &mut sam::Header, order: Order) -> anyhow::Result<()> {
+/// Sets `@HD SO` (and `SS`) for `order` as samtools does, creating `@HD` if needed, and removes
+/// `GO`.
+pub fn set_sort_order(header: &mut sam::Header, order: Order) {
+    let (sort_order, subsort_order) = order.header_values();
+    set_sort_fields(header, sort_order, subsort_order.as_deref(), None);
+}
+
+/// Sets `@HD SO`, `SS`, and `GO` (removing `SS` and `GO` when they are `None`), creating `@HD`
+/// if needed (`sam_hdr_update_sort` and `set_sort_order` in samtools).
+pub fn set_sort_fields(
+    header: &mut sam::Header,
+    sort_order: &str,
+    subsort_order: Option<&str>,
+    group_order: Option<&str>,
+) {
     use noodles_sam::header::record::value::{
         Map,
-        map::header::tag::{SORT_ORDER, SUBSORT_ORDER},
+        map::header::tag::{GROUP_ORDER, SORT_ORDER, SUBSORT_ORDER},
     };
-
-    let (sort_order, subsort_order) = order.header_values();
 
     let hd = header.header_mut().get_or_insert_with(Map::default);
     let fields = hd.other_fields_mut();
     fields.insert(SORT_ORDER, sort_order.into());
 
-    match subsort_order {
-        Some(ss) => {
-            fields.insert(SUBSORT_ORDER, ss.into());
-        }
-        None => {
-            fields.shift_remove(&SUBSORT_ORDER);
+    for (tag, value) in [(GROUP_ORDER, group_order), (SUBSORT_ORDER, subsort_order)] {
+        match value {
+            Some(value) => {
+                fields.insert(tag, value.into());
+            }
+            None => {
+                fields.shift_remove(&tag);
+            }
         }
     }
-
-    Ok(())
 }
 
 pub fn create_temp_dir(

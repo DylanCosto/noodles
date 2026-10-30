@@ -167,9 +167,64 @@ check "sort" "$st sort --no-PG -o - short.name.bam | $st view --no-PG -h -" "$nt
 check "sort -n" "$st sort -n --no-PG -o - $short | $st view --no-PG -h -" "$nt sort -n --no-PG -o - $short | $st view --no-PG -h -"
 check "sort -N" "$st sort -N --no-PG -o - $short | $st view --no-PG -h -" "$nt sort -N --no-PG -m 1M -o - $short | $st view --no-PG -h -"
 
+# sort options: -t (integer, float, string, and character tags), -n tie-breaks, -H/-R (minimiser
+# options, accepted and ignored)
+check "sort -n long (secondary/supplementary order)" "$st sort -n --no-PG -o - $long | $st view --no-PG -h -" "$nt sort -n --no-PG -o - $long | $st view --no-PG -h -"
+check "sort -t CB" "$st sort -t CB --no-PG -o - $tagged | $st view --no-PG -h -" "$nt sort -t CB -m 1M --no-PG -o - $tagged | $st view --no-PG -h -"
+check "sort -t NH -n" "$st sort -t NH -n --no-PG -o - $short | $st view --no-PG -h -" "$nt sort -t NH -n -@ 3 --no-PG -o - $short | $st view --no-PG -h -"
+check "sort -t AS -N" "$st sort -t AS -N --no-PG -o - $short | $st view --no-PG -h -" "$nt sort -t AS -N -m 1M --no-PG -o - $short | $st view --no-PG -h -"
+check "sort -t qs (float)" "$st sort -t qs --no-PG -o - $long | $st view --no-PG -h -" "$nt sort -t qs --no-PG -o - $long | $st view --no-PG -h -"
+{
+    printf '@HD\tVN:1.6\tSO:unsorted\tGO:query\n@SQ\tSN:c1\tLN:1000\n'
+    for t in 'XX:i:5' 'XX:f:4.5' 'XX:Z:abc' 'XX:A:b' 'XX:i:-3' '' 'XX:f:5' 'XX:Z:ab' 'XX:A:a' 'XX:B:c,1' 'XX:H:1F' 'XX:i:4'; do
+        for pos in 30 10; do
+            printf 'r%s\t0\tc1\t%s\t60\t4M\t*\t0\t0\tACGT\tIIII%s\n' "$pos" "$pos" "${t:+	$t}"
+        done
+    done
+} > sort.tags.sam
+check "sort -t (mixed types)" "$st sort -t XX --no-PG -O sam sort.tags.sam" "$nt sort -t XX --no-PG -O sam sort.tags.sam"
+check "sort -t -n (mixed types)" "$st sort -t XX -n --no-PG -O sam sort.tags.sam" "$nt sort -t XX -n --no-PG -O sam sort.tags.sam"
+check "sort -H -R" "$st sort -H -R --no-PG -o - $short | $st view --no-PG -h -" "$nt sort -H -R --no-PG -o - $short | $st view --no-PG -h -"
+
 "$st" view --no-PG -b -f 64 -o p1.bam "$short"
 "$st" view --no-PG -b -F 64 -o p2.bam "$short"
 check "merge" "$st merge -c -p --no-PG -f -o - p1.bam p2.bam | $st view --no-PG - | cut -f1-11" "$nt merge --no-PG -f -o /dev/stdout p1.bam p2.bam | $st view --no-PG - | cut -f1-11"
+
+# merge options. The corpus inputs share their @RG and @PG IDs, which plain merge renames (with
+# -s for reproducible suffixes) and rewrites in records, moving RG and PG to the end.
+"$st" index p1.bam
+"$st" index p2.bam
+cp p1.bam.bai merge.1.bai
+cp p2.bam.bai merge.2.bai
+printf 'p1.bam\n\np2.bam\n' > merge.list
+merge_region=$(head -1 "$corpus/short/queries.100.regions")
+check "merge (renamed IDs)" "$st merge -s 7 --no-PG -o - p1.bam p2.bam | $st view --no-PG -h -" "$nt merge -s 7 --no-PG -o - p1.bam p2.bam | $st view --no-PG -h -"
+check "merge -c -p" "$st merge -c -p --no-PG -o - p1.bam p2.bam | $st view --no-PG -h -" "$nt merge -c -p --no-PG -o - p1.bam p2.bam | $st view --no-PG -h -"
+check "merge -r -1 -s" "$st merge -r -1 -s 3 --no-PG -o - p1.bam p2.bam | $st view --no-PG -h -" "$nt merge -r -1 -s 3 --no-PG -o - p1.bam p2.bam | $st view --no-PG -h -"
+check "merge -b" "$st merge -b merge.list -c -p --no-PG -o - | $st view --no-PG -h -" "$nt merge -b merge.list -c -p --no-PG -o - | $st view --no-PG -h -"
+check "merge -R" "$st merge -R $merge_region -c -p --no-PG -o - p1.bam p2.bam | $st view --no-PG -h -" "$nt merge -R $merge_region -c -p --no-PG -o - p1.bam p2.bam | $st view --no-PG -h -"
+check "merge -X -R" "$st merge -X -R $merge_region -c -p --no-PG -o - p1.bam p2.bam merge.1.bai merge.2.bai | $st view --no-PG -h -" "$nt merge -X -R $merge_region -c -p --no-PG -o - p1.bam p2.bam merge.1.bai merge.2.bai | $st view --no-PG -h -"
+check "merge -L" "$st merge -L q.bed -c -p --no-PG -o - p1.bam p2.bam | $st view --no-PG -h -" "$nt merge -L q.bed -c -p --no-PG -o - p1.bam p2.bam | $st view --no-PG -h -"
+check "merge -h" "$st merge -h $tagged -s 5 --no-PG -o - p1.bam p2.bam | $st view --no-PG -h -" "$nt merge -h $tagged -s 5 --no-PG -o - p1.bam p2.bam | $st view --no-PG -h -"
+"$st" view --no-PG -b -f 64 -o merge.n1.bam short.name.bam
+"$st" view --no-PG -b -F 64 -o merge.n2.bam short.name.bam
+check "merge -n" "$st merge -n -s 1 --no-PG -o - merge.n1.bam merge.n2.bam | $st view --no-PG -h -" "$nt merge -n -s 1 --no-PG -o - merge.n1.bam merge.n2.bam | $st view --no-PG -h -"
+"$st" sort -t CB --no-PG -o merge.cb.bam "$tagged"
+"$st" view --no-PG -b -f 64 -o merge.t1.bam merge.cb.bam
+"$st" view --no-PG -b -F 64 -o merge.t2.bam merge.cb.bam
+check "merge -t CB" "$st merge -t CB -c -p --no-PG -o - merge.t1.bam merge.t2.bam | $st view --no-PG -h -" "$nt merge -t CB -c -p --no-PG -o - merge.t1.bam merge.t2.bam | $st view --no-PG -h -"
+"$st" view --no-PG -C -T "$ref" -o merge.2.cram p2.bam
+"$st" index merge.2.cram
+check "merge CRAM input -R" "$st merge -R $merge_region -c -p --reference $ref --no-PG -o - p1.bam merge.2.cram | $st view --no-PG -h -" "$nt merge -R $merge_region -c -p --reference $ref --no-PG -o - p1.bam merge.2.cram | $st view --no-PG -h -"
+# Colliding @RG/@PG IDs with PG/PP links, unknown RG/PG tags (dropped), @CO lines (all kept),
+# and a reference order that loses coordinate sorting
+printf '@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:c1\tLN:1000\n@SQ\tSN:c2\tLN:1000\n@RG\tID:g1\tSM:s1\tPG:p1\n@RG\tID:g2\tSM:s2\n@PG\tID:p1\tPN:bwa\n@PG\tID:p2\tPN:x\tPP:p1\n@CO\tone\n' > merge.a.sam
+printf 'a1\t0\tc1\t10\t60\t5M\t*\t0\t0\tACGTA\tIIIII\tRG:Z:g1\tXX:i:1\tPG:Z:p2\na2\t0\tc2\t10\t60\t5M\t*\t0\t0\tACGTA\tIIIII\tRG:Z:g9\tXX:i:2\na3\t4\t*\t0\t0\t*\t*\t0\t0\tACGTA\tIIIII\tRG:Z:g2\n' >> merge.a.sam
+printf '@HD\tVN:1.6\tSO:coordinate\tSS:coordinate:x\n@SQ\tSN:c2\tLN:1000\n@SQ\tSN:c3\tLN:500\n@RG\tID:g1\tSM:s9\tPG:p1\n@PG\tID:p1\tPN:bowtie\n@CO\tone\n@CO\ttwo\n' > merge.b.sam
+printf 'b1\t0\tc2\t5\t60\t5M\t*\t0\t0\tACGTA\tIIIII\tXY:Z:q\tRG:Z:g1\tPG:Z:p1\tXX:i:1\nb2\t0\tc3\t10\t60\t5M\t*\t0\t0\tACGTA\tIIIII\tPG:Z:zz\tRG:Z:g1\n' >> merge.b.sam
+for opts in "-s 42" "-c -s 42" "-p -s 42" "-r -s 42" "-h merge.b.sam -s 42" "-r -s 42 merge.a.sam"; do
+    check "merge $opts (header edge cases)" "$st merge $opts --no-PG -o - merge.a.sam merge.b.sam | $st view --no-PG -h -" "$nt merge $opts --no-PG -o - merge.a.sam merge.b.sam | $st view --no-PG -h -"
+done
 
 # duplicate marking pipeline
 check "fixmate" "$st fixmate --no-PG short.name.bam - | $st view --no-PG -h -" "$nt fixmate --no-PG short.name.bam /dev/stdout | $st view --no-PG -h -"
@@ -214,6 +269,20 @@ if command -v python3 >/dev/null; then
     done
 fi
 check "collate grouping" "$st view $short | cut -f1 | sort -u | wc -l" "$nt collate --no-PG -O $short | $st view - | awk -F'\\t' '\$1 != p { print \$1; p = \$1 }' | sort | uniq | wc -l"
+check "collate -n -r (accepted, ignored)" "$st view $short | cut -f1 | sort -u | wc -l" "$nt collate --no-PG -n 8 -r 100 -O $short | $st view - | awk -F'\\t' '\$1 != p { print \$1; p = \$1 }' | sort | uniq | wc -l"
+check "collate header (GO, SS kept)" "$st collate --no-PG -O short.name.bam | $st view --no-PG -H -" "$nt collate --no-PG -O short.name.bam | $st view --no-PG -H -"
+
+# reheader: -c commands and CRAM (copied, and edited in place with -i)
+"$st" view -H "$short" | sed 's/SM:synthetic/SM:renamed/' > reheader.sam
+check "reheader -c (BAM)" "$st reheader -P -c 'sed s/synthetic/xyz/g' $short | $st view --no-PG -h -" "$nt reheader -P -c 'sed s/synthetic/xyz/g' $short | $st view --no-PG -h -"
+for v in 3.0 3.1; do
+    cram=$corpus/short/input.$v.cram
+    check "reheader CRAM $v" "$st reheader -P reheader.sam $cram | $st view --no-PG -h -T $ref -" "$nt reheader -P reheader.sam $cram | $st view --no-PG -h -T $ref -"
+    check "reheader -c CRAM $v" "$st reheader -P -c 'grep -v ^@PG' $cram | $st view --no-PG -h -T $ref -" "$nt reheader -P -c 'grep -v ^@PG' $cram | $st view --no-PG -h -T $ref -"
+    check "reheader -i CRAM $v" "cp $cram st.reheader.cram && $st reheader -P -i reheader.sam st.reheader.cram && $st view --no-PG -h -T $ref st.reheader.cram" "cp $cram nt.reheader.cram && $nt reheader -P -i reheader.sam nt.reheader.cram && $st view --no-PG -h -T $ref nt.reheader.cram"
+done
+"$st" view -C -T "$ref" -O cram,version=2.1 -o reheader.21.cram p1.bam
+check "reheader -i CRAM 2.1" "cp reheader.21.cram st.reheader.21.cram && $st reheader -P -i reheader.sam st.reheader.21.cram && $st view --no-PG -h -T $ref st.reheader.21.cram" "cp reheader.21.cram nt.reheader.21.cram && $nt reheader -P -i reheader.sam nt.reheader.21.cram && $st view --no-PG -h -T $ref nt.reheader.21.cram"
 
 # reads
 check "fastq" "$st fastq short.name.bam" "$nt fastq short.name.bam"
