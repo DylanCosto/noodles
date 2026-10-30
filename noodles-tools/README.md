@@ -18,8 +18,8 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | Command | samtools equivalent | Notes |
 |---|---|---|
 | `view` | `view` | SAM/BAM/CRAM conversion; `-c`, `-f/-F/-G`, `-q`, `-m`, `-e` (filter expressions), `-L`, `-M`, `-P`, `-s`, `-N`, `-r/-R/-n`, `-d/-D`, `-x`, `-U`, `-p`, `-B`, `-t`, `-X`, `-l` (library), `-h/-H`, `-b/-C/-u/-1`, `--output-fmt-option level=N`, `--write-index`, `-?`, `-S`, regions and `*` |
-| `sort` | `sort` | coordinate, `-n` (natural), `-N` (bytewise), `-t TAG` (then by position, or by name with `-n`/`-N`); `-m`, `-T`, `-@`; stable, like samtools. No minimiser order (`-M`, `-I`, `-K`, `-w`); `-H` and `-R`, which only modify it, are accepted and ignored |
-| `merge` | `merge` | SAM, BAM, and CRAM inputs; headers merged as samtools does, renaming colliding `@RG`/`@PG` IDs (`-s` seed) or combining them (`-c`, `-p`), with `RG`/`PG` tags translated; `-n/-N`, `-t`, `-r`, `-R`/`-L` (indexed inputs, `-X` index files), `-b`, `-h`, `-1/-l/-u`, `-f`, `-o` |
+| `sort` | `sort` | coordinate, `-n` (natural), `-N` (bytewise), `-t TAG` (then by position, or by name with `-n`/`-N`), `--template-coordinate` (needs `MC` tags from `fixmate -m`; the last of `-n`/`-N`/`--template-coordinate` wins and `-t` overrides it, as in samtools); `-m`, `-T`, `-@`; `--write-index` (coordinate order only; `-o FILE##idx##INDEX`); stable, like samtools. No minimiser order (`-M`, `-I`, `-K`, `-w`); `-H` and `-R`, which only modify it, are accepted and ignored |
+| `merge` | `merge` | SAM, BAM, and CRAM inputs; headers merged as samtools does, renaming colliding `@RG`/`@PG` IDs (`-s` seed) or combining them (`-c`, `-p`), with `RG`/`PG` tags translated; `-n/-N`, `-t`, `--template-coordinate`, `-r`, `-R`/`-L` (indexed inputs, `-X` index files), `-b`, `-h`, `-1/-l/-u`, `-f`, `-o`, `--write-index` (output `FILE##idx##INDEX` names the index) |
 | `index` | `index` | BAI (default) or CSI (`-c`, `-m` minimum shift, with HTSlib's level count) for BAM; CRAI for CRAM; `-M` (several inputs), `-o` or a second argument naming the index |
 | `faidx`, `fqidx` | `faidx`, `fqidx` | FASTA and FASTQ, plain or BGZF (`.fai` and `.gzi` as HTSlib builds them); regions as HTSlib parses them (`{name}` quoting, `1,000`, `2k`), `-r`, `-o` (BGZF for `.gz`), `-n`, `-c`, `-i`, `--mark-strand`, `--fai-idx/--gzi-idx`, `--write-index`, `-f` |
 | `flagstat` | `flagstat` | default, `-O tsv`, `-O json` |
@@ -104,6 +104,16 @@ Intentional differences:
   builds it.
 - `merge` renames clashing `@RG`/`@PG` IDs with the same random suffixes as samtools for a
   given `-s` seed; without `-s`, both seed from the clock, so suffixes differ between runs.
+- `merge` refuses to overwrite an existing output given as `FILE##idx##INDEX` without `-f`;
+  samtools checks for a file with the whole name, so it overwrites.
+- `merge --write-index` indexes the output after writing it, and checks while writing that it is
+  sorted by coordinate (samtools fails the same way, from its on-the-fly indexer).
+  `--write-index` for CRAM output (here and in `sort`) cannot index CRAM written by ntools yet:
+  noodles' CRAM indexer fails on it.
+- `sort --template-coordinate` and `merge --template-coordinate` compare reference sequence IDs
+  directly; samtools subtracts them, which overflows for a record flagged as mapped without a
+  reference sequence. With `-N --template-coordinate -n`, ntools sorts by name naturally;
+  samtools sorts bytewise, since `-N` anywhere switches it to bytewise names.
 - BAI/CSI bins are written in insertion order, not HTSlib's hash order. samtools reads them and
   returns identical query results.
 - CRAM written by ntools keeps `MD`/`NM` tags as stored; HTSlib drops and regenerates them.

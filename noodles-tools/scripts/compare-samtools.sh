@@ -242,6 +242,67 @@ check "sort -t (mixed types)" "$st sort -t XX --no-PG -O sam sort.tags.sam" "$nt
 check "sort -t -n (mixed types)" "$st sort -t XX -n --no-PG -O sam sort.tags.sam" "$nt sort -t XX -n --no-PG -O sam sort.tags.sam"
 check "sort -H -R" "$st sort -H -R --no-PG -o - $short | $st view --no-PG -h -" "$nt sort -H -R --no-PG -o - $short | $st view --no-PG -h -"
 
+# sort --template-coordinate: fixmate -m adds the MC tags it needs (short reads whose mates are
+# missing from the corpus, which samtools rejects, are dropped); hand-made edge cases (soft and
+# hard clips, unmapped reads and mates, unpaired reads on both strands, other references,
+# secondary and supplementary records, same-position ties, libraries, CB, MI with /A suffixes,
+# MC of *); precedence with -n/-N/-t; tag errors. --write-index (coordinate order only), with
+# FILE##idx##INDEX names.
+"$st" fixmate -m --no-PG short.name.bam - | "$st" view -b --no-PG -e 'exists([MC]) || !flag.paired || flag.munmap' -o sort.tc.short.bam -
+"$st" sort -n --no-PG "$long" | "$st" fixmate -m --no-PG - sort.tc.long.bam
+check "sort --template-coordinate" "$st sort --template-coordinate --no-PG -o - sort.tc.short.bam | $st view --no-PG -h -" "$nt sort --template-coordinate --no-PG -m 1M -@ 3 -o - sort.tc.short.bam | $st view --no-PG -h -"
+check "sort --template-coordinate long" "$st sort --template-coordinate --no-PG -o - sort.tc.long.bam | $st view --no-PG -h -" "$nt sort --template-coordinate --no-PG -o - sort.tc.long.bam | $st view --no-PG -h -"
+{
+    s=ACGTACGTAC q=IIIIIIIIII
+    printf '@HD\tVN:1.6\tSO:queryname\n@SQ\tSN:c1\tLN:10000\n@SQ\tSN:c2\tLN:10000\n@RG\tID:g1\tSM:s\tLB:libB\n@RG\tID:g2\tSM:s\tLB:libA\n@RG\tID:g3\tSM:s\n'
+    printf "a\t99\tc1\t100\t60\t2S8M\t=\t300\t210\t$s\t$q\tRG:Z:g1\tMC:Z:10M2S\n"
+    printf "a\t147\tc1\t300\t60\t10M2S\t=\t100\t-210\t${s}AC\t${q}II\tRG:Z:g1\tMC:Z:2S8M\n"
+    printf "b\t99\tc1\t100\t60\t2S8M\t=\t300\t210\t$s\t$q\tRG:Z:g2\tMC:Z:10M2S\n"
+    printf "b\t147\tc1\t300\t60\t10M2S\t=\t100\t-210\t${s}AC\t${q}II\tRG:Z:g2\tMC:Z:2S8M\n"
+    printf "c\t73\tc1\t50\t60\t10M\t=\t50\t0\t$s\t$q\n"
+    printf "c\t133\tc1\t50\t0\t*\t=\t50\t0\t$s\t$q\tMC:Z:10M\n"
+    printf "d\t77\t*\t0\t0\t*\t*\t0\t0\t$s\t$q\n"
+    printf "d\t141\t*\t0\t0\t*\t*\t0\t0\t$s\t$q\n"
+    printf "e\t0\tc2\t20\t60\t10M\t*\t0\t0\t$s\t$q\n"
+    printf "e2\t16\tc2\t11\t60\t10M\t*\t0\t0\t$s\t$q\n"
+    printf "f\t97\tc2\t500\t60\t3S7M\tc1\t40\t0\t$s\t$q\tMC:Z:5H5M\n"
+    printf "f\t145\tc1\t40\t60\t5H5M\tc2\t500\t0\tACGTA\tIIIII\tMC:Z:3S7M\n"
+    printf "f\t353\tc1\t800\t0\t10M\tc1\t40\t0\t$s\t$q\tMC:Z:5H5M\n"
+    printf "f\t2129\tc1\t900\t0\t4S6M\tc1\t40\t0\t$s\t$q\tMC:Z:5H5M\n"
+    printf "g\t65\tc1\t100\t60\t10M\t=\t100\t0\t$s\t$q\tMC:Z:10M\tCB:Z:AAA\tMI:Z:1/A\n"
+    printf "g\t129\tc1\t100\t60\t10M\t=\t100\t0\t$s\t$q\tMC:Z:10M\tCB:Z:AAA\tMI:Z:1/B\n"
+    printf "h\t65\tc1\t100\t60\t10M\t=\t100\t0\t$s\t$q\tMC:Z:10M\tCB:Z:AAA\tMI:Z:1\n"
+    printf "h\t129\tc1\t100\t60\t10M\t=\t100\t0\t$s\t$q\tMC:Z:10M\tCB:H:AA\tMI:Z:10\n"
+    printf "i\t115\tc1\t100\t60\t10M\t=\t100\t0\t$s\t$q\tMC:Z:10M\tRG:Z:g3\n"
+    printf "i\t179\tc1\t100\t60\t10M\t=\t100\t0\t$s\t$q\tMC:Z:10M\tRG:Z:gX\n"
+    printf "j\t97\tc1\t200\t60\t3M2I3M2D2M\t=\t250\t0\t$s\t$q\tMC:Z:2H3S4M1D2N3M2S4H\n"
+    printf "j\t145\tc1\t250\t60\t3S5M2S\t=\t200\t0\t$s\t$q\tMC:Z:*\n"
+    printf "k\t69\tc1\t250\t0\t*\t=\t250\t0\t$s\t$q\tMC:Z:3S5M2S\n"
+    printf "k\t137\tc1\t250\t60\t3S5M2S\t=\t250\t0\t$s\t$q\n"
+    printf "l\t355\tc2\t70\t0\t10M\t=\t90\t0\t$s\t$q\tMC:Z:10M\n"
+    printf "l\t2147\tc2\t70\t0\t10M\t=\t90\t0\t$s\t$q\tMC:Z:10M\n"
+    printf "l\t99\tc2\t70\t0\t10M\t=\t90\t0\t$s\t$q\tMC:Z:10M\n"
+    printf "l\t147\tc2\t90\t0\t10M\t=\t70\t0\t$s\t$q\tMC:Z:10M\n"
+} > sort.tc.sam
+check "sort --template-coordinate (edge cases)" "$st sort --template-coordinate --no-PG -O sam sort.tc.sam" "$nt sort --template-coordinate --no-PG -O sam sort.tc.sam"
+check "sort --template-coordinate (edge cases, spilled)" "$st sort --template-coordinate --no-PG -O sam sort.tc.sam" "$nt sort --template-coordinate -m 1K --no-PG -O sam sort.tc.sam"
+for opts in "-n --template-coordinate" "--template-coordinate -n" "--template-coordinate -N" "-t XX --template-coordinate" "--template-coordinate -n -t XX" "-n -N"; do
+    check "sort $opts (precedence)" "$st sort $opts --no-PG -O sam sort.tc.sam" "$nt sort $opts --no-PG -O sam sort.tc.sam"
+done
+for tag in MC CB MI none; do
+    case $tag in
+        MC) fields='\tMC:i:5' ;;
+        none) fields='' ;;
+        *) fields="\\tMC:Z:10M\\t$tag:i:5" ;;
+    esac
+    printf "@SQ\tSN:c1\tLN:1000\nx\t65\tc1\t100\t60\t10M\t=\t100\t0\tACGTACGTAC\tIIIIIIIIII$fields\n" > "sort.tc.bad.$tag.sam"
+    check "sort --template-coordinate bad $tag (exit status)" "$st sort --template-coordinate --no-PG -O sam sort.tc.bad.$tag.sam; echo \$?" "$nt sort --template-coordinate --no-PG -O sam sort.tc.bad.$tag.sam 2>/dev/null; echo \$?"
+done
+sort_region=$(head -1 "$corpus/short/queries.100.regions")
+check "sort --write-index (##idx## BAI)" "$st sort --write-index --no-PG -o 'st.sort.wi.bam##idx##st.sort.wi.bai' short.name.bam && head -c 4 st.sort.wi.bai | od -c && $st view -X st.sort.wi.bam st.sort.wi.bai $sort_region | md5sum" "$nt sort --write-index --no-PG -o 'nt.sort.wi.bam##idx##nt.sort.wi.bai' short.name.bam && head -c 4 nt.sort.wi.bai | od -c && $st view -X nt.sort.wi.bam nt.sort.wi.bai $sort_region | md5sum"
+check "sort --write-index (CSI)" "$st sort --write-index --no-PG -o st.sort.wi2.bam short.name.bam && head -c 4 st.sort.wi2.bam.csi | od -c && $st idxstats st.sort.wi2.bam && $st view st.sort.wi2.bam $sort_region | md5sum" "$nt sort --write-index --no-PG -o nt.sort.wi2.bam short.name.bam && head -c 4 nt.sort.wi2.bam.csi | od -c && $st idxstats nt.sort.wi2.bam && $st view nt.sort.wi2.bam $sort_region | md5sum"
+check "sort --template-coordinate --write-index (ignored)" "$st sort --template-coordinate --write-index --no-PG -o st.sort.wi3.bam sort.tc.sam; ls st.sort.wi3.bam*" "$nt sort --template-coordinate --write-index --no-PG -o nt.sort.wi3.bam sort.tc.sam 2>/dev/null; ls nt.sort.wi3.bam* | sed s/^nt/st/"
+
 "$st" view --no-PG -b -f 64 -o p1.bam "$short"
 "$st" view --no-PG -b -F 64 -o p2.bam "$short"
 check "merge" "$st merge -c -p --no-PG -f -o - p1.bam p2.bam | $st view --no-PG - | cut -f1-11" "$nt merge --no-PG -f -o /dev/stdout p1.bam p2.bam | $st view --no-PG - | cut -f1-11"
@@ -281,6 +342,52 @@ printf 'b1\t0\tc2\t5\t60\t5M\t*\t0\t0\tACGTA\tIIIII\tXY:Z:q\tRG:Z:g1\tPG:Z:p1\tX
 for opts in "-s 42" "-c -s 42" "-p -s 42" "-r -s 42" "-h merge.b.sam -s 42" "-r -s 42 merge.a.sam"; do
     check "merge $opts (header edge cases)" "$st merge $opts --no-PG -o - merge.a.sam merge.b.sam | $st view --no-PG -h -" "$nt merge $opts --no-PG -o - merge.a.sam merge.b.sam | $st view --no-PG -h -"
 done
+
+# merge --template-coordinate: corpus halves, the sort edge cases, colliding read group IDs whose
+# libraries differ (so -c and -r change the order; samtools keys records by their translated
+# read group before -r replaces it, and accepts H-typed RG values), precedence with -n/-N/-t, and
+# a missing MC. --write-index: CSI, BAI or CSI named with FILE##idx##INDEX, a positional output,
+# and the errors for SAM, stdout, and output that is not coordinate-sorted.
+"$st" sort --template-coordinate --no-PG -o merge.tc.bam sort.tc.short.bam
+"$st" view --no-PG -b -f 64 -o merge.tc1.bam merge.tc.bam
+"$st" view --no-PG -b -F 64 -o merge.tc2.bam merge.tc.bam
+check "merge --template-coordinate" "$st merge --template-coordinate -s 1 --no-PG -o - merge.tc1.bam merge.tc2.bam | $st view --no-PG -h -" "$nt merge --template-coordinate -s 1 --no-PG -o - merge.tc1.bam merge.tc2.bam | $st view --no-PG -h -"
+check "merge --template-coordinate -c -p -r" "$st merge --template-coordinate -c -p -r --no-PG -o - merge.tc1.bam merge.tc2.bam | $st view --no-PG -h -" "$nt merge --template-coordinate -c -p -r --no-PG -o - merge.tc1.bam merge.tc2.bam | $st view --no-PG -h -"
+"$st" sort --template-coordinate --no-PG -O sam -o merge.tc.edge.sam sort.tc.sam
+check "merge --template-coordinate (edge cases)" "$st merge --template-coordinate --no-PG -o - merge.tc.edge.sam merge.tc.edge.sam | $st view --no-PG -h -" "$nt merge --template-coordinate --no-PG -o - merge.tc.edge.sam merge.tc.edge.sam | $st view --no-PG -h -"
+{
+    s=ACGTACGTAC q=IIIIIIIIII
+    printf '@HD\tVN:1.6\tSO:unsorted\tGO:query\tSS:unsorted:template-coordinate\n@SQ\tSN:c1\tLN:1000\n@RG\tID:g1\tSM:s\tLB:libZ\n'
+    printf "a1\t99\tc1\t100\t60\t10M\t=\t200\t110\t$s\t$q\tMC:Z:10M\tRG:Z:g1\n"
+    printf "a1\t147\tc1\t200\t60\t10M\t=\t100\t-110\t$s\t$q\tMC:Z:10M\tRG:Z:g1\n"
+    printf "a2\t0\tc1\t300\t60\t10M\t*\t0\t0\t$s\t$q\tRG:Z:g9\n"
+} > merge.tc.a.sam
+{
+    s=ACGTACGTAC q=IIIIIIIIII
+    printf '@HD\tVN:1.6\tSO:unsorted\tGO:query\tSS:unsorted:template-coordinate\n@SQ\tSN:c1\tLN:1000\n@RG\tID:g1\tSM:s\tLB:libA\n@RG\tID:AB\tSM:s\tLB:libC\n'
+    printf "b1\t99\tc1\t100\t60\t10M\t=\t200\t110\t$s\t$q\tMC:Z:10M\tRG:Z:g1\n"
+    printf "b1\t147\tc1\t200\t60\t10M\t=\t100\t-110\t$s\t$q\tMC:Z:10M\tRG:Z:g1\n"
+    printf "b0\t0\tc1\t300\t60\t10M\t*\t0\t0\t$s\t$q\tRG:H:AB\n"
+} > merge.tc.b.sam
+for opts in "-s 3" "-c -s 3" "-r -s 3" "-c -r" "-h merge.tc.b.sam -s 3"; do
+    check "merge --template-coordinate $opts (libraries)" "$st merge --template-coordinate $opts --no-PG -o - merge.tc.a.sam merge.tc.b.sam | $st view --no-PG -h -" "$nt merge --template-coordinate $opts --no-PG -o - merge.tc.a.sam merge.tc.b.sam | $st view --no-PG -h -"
+done
+for opts in "-n --template-coordinate" "--template-coordinate -n" "--template-coordinate -N" "-t XX --template-coordinate"; do
+    check "merge $opts (precedence)" "$st merge $opts --no-PG -o - merge.tc.edge.sam merge.tc.edge.sam | $st view --no-PG -h -" "$nt merge $opts --no-PG -o - merge.tc.edge.sam merge.tc.edge.sam | $st view --no-PG -h -"
+done
+check "merge --template-coordinate missing MC (exit status)" "$st merge --template-coordinate --no-PG -o - sort.tc.bad.none.sam > /dev/null; echo \$?" "$nt merge --template-coordinate --no-PG -o - sort.tc.bad.none.sam 2>/dev/null > /dev/null; echo \$?"
+for idx in '' merge.wi1.bai merge.wi2.csi merge.wi3.idx; do
+    if [ -z "$idx" ]; then
+        st_out=st.merge.wi0.bam nt_out=nt.merge.wi0.bam st_idx=st.merge.wi0.bam.csi nt_idx=nt.merge.wi0.bam.csi
+    else
+        st_out="st.$idx.bam##idx##st.$idx" nt_out="nt.$idx.bam##idx##nt.$idx" st_idx=st.$idx nt_idx=nt.$idx
+    fi
+    check "merge --write-index (${idx:-CSI})" "$st merge --write-index -c -p --no-PG -o '$st_out' p1.bam p2.bam && head -c 4 $st_idx | od -c && $st view -X ${st_out%%#*} $st_idx $merge_region | md5sum" "$nt merge --write-index -c -p --no-PG -o '$nt_out' p1.bam p2.bam && head -c 4 $nt_idx | od -c && $st view -X ${nt_out%%#*} $nt_idx $merge_region | md5sum"
+done
+check "merge --write-index (positional output)" "$st merge --write-index -c -p --no-PG 'st.merge.wi4.bam##idx##st.merge.wi4.bai' p1.bam p2.bam && $st idxstats st.merge.wi4.bam && $st view -X st.merge.wi4.bam st.merge.wi4.bai $merge_region | md5sum" "$nt merge --write-index -c -p --no-PG 'nt.merge.wi4.bam##idx##nt.merge.wi4.bai' p1.bam p2.bam && $st idxstats nt.merge.wi4.bam && $st view -X nt.merge.wi4.bam nt.merge.wi4.bai $merge_region | md5sum"
+check "merge --write-index SAM (exit status)" "$st merge --write-index --no-PG -o st.merge.wi5.sam p1.bam p2.bam; echo \$?" "$nt merge --write-index --no-PG -o nt.merge.wi5.sam p1.bam p2.bam 2>/dev/null; echo \$?"
+check "merge --write-index stdout (exit status)" "$st merge --write-index --no-PG -o - p1.bam p2.bam > /dev/null; echo \$?" "$nt merge --write-index --no-PG -o - p1.bam p2.bam 2>/dev/null > /dev/null; echo \$?"
+check "merge -n --write-index (exit status)" "$st merge -n --write-index --no-PG -o st.merge.wi6.bam merge.n1.bam merge.n2.bam; echo \$?" "$nt merge -n --write-index --no-PG -o nt.merge.wi6.bam merge.n1.bam merge.n2.bam 2>/dev/null; echo \$?"
 
 # duplicate marking pipeline
 check "fixmate" "$st fixmate --no-PG short.name.bam - | $st view --no-PG -h -" "$nt fixmate --no-PG short.name.bam /dev/stdout | $st view --no-PG -h -"

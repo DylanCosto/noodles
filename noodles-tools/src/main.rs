@@ -26,6 +26,7 @@ mod sanitize;
 mod sequence;
 mod sort_order;
 mod source;
+mod template_coordinate;
 
 use std::{io, process::ExitCode};
 

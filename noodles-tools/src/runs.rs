@@ -67,7 +67,7 @@ fn integer_key(order: Order, record: &[u8]) -> u64 {
         Order::Tag { tag, .. } => tag_offset(record, tag)
             .and_then(|offset| u64::try_from(offset).ok())
             .unwrap_or(NO_TAG),
-        Order::NameNatural | Order::NameAscii => 0,
+        Order::NameNatural | Order::NameAscii | Order::TemplateCoordinate => 0,
     }
 }
 
