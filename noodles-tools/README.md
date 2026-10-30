@@ -17,7 +17,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 
 | Command | samtools equivalent | Notes |
 |---|---|---|
-| `view` | `view` | SAM/BAM/CRAM conversion; `-c`, `-f/-F/-G`, `-q`, `-L`, `-M`, `-s`, `-N`, `-d`, `-x`, `-U`, `-X`, `-l` (library), `-h/-H`, `-b/-C/-u/-1`, `--output-fmt-option level=N`, `--write-index`, regions and `*` |
+| `view` | `view` | SAM/BAM/CRAM conversion; `-c`, `-f/-F/-G`, `-q`, `-m`, `-e` (filter expressions), `-L`, `-M`, `-P`, `-s`, `-N`, `-r/-R/-n`, `-d/-D`, `-x`, `-U`, `-p`, `-B`, `-t`, `-X`, `-l` (library), `-h/-H`, `-b/-C/-u/-1`, `--output-fmt-option level=N`, `--write-index`, `-?`, `-S`, regions and `*` |
 | `sort` | `sort` | coordinate, `-n` (natural), `-N` (bytewise); `-m`, `-T`, `-@`; stable, like samtools |
 | `merge` | `merge -c -p` | BAM inputs; reference dictionaries are merged and IDs translated |
 | `index` | `index` | BAI (default) or CSI (`-c`) for BAM; CRAI for CRAM |
@@ -80,6 +80,28 @@ Intentional differences:
 - `@PG` lines name ntools. Use `--no-PG` (or `-P` for `reheader`) for identical headers.
 - `view` on a CRAM `*` region returns every unplaced unmapped read; samtools 1.24 returns only
   some of them from the corpus CRAM. ntools matches samtools' output for the equivalent BAM.
+- `view -e` evaluates HTSlib's filter expression language with HTSlib's semantics (undefined
+  values, tag presence as truth, no short-circuiting), with these fixes: an undefined value
+  `%` a number stays undefined (HTSlib turns `[XX] % 2` into 0 when `XX` is absent, so
+  `[XX] % 2 == 0` selects every record without the tag), and `%` by a value between -1 and 1 is
+  undefined (HTSlib crashes). A syntax error is reported before any record is read; samtools
+  reports it at the first record, and not at all for an empty input. A regular expression
+  computed from record fields is compiled for each record; HTSlib reuses the first pattern it
+  saw.
+- `view -e` regular expressions are POSIX extended expressions run by the Rust `regex` crate on
+  bytes (matching for `=~`/`!~` only needs a yes or no, so leftmost-longest rules do not
+  matter). Back-references (`\1`) are not supported. As in glibc, `\w`, `\W`, `\s`, `\S`,
+  `\b`, `\B`, `\<`, `\>` keep their GNU meaning, a backslash is literal inside brackets, and a
+  backslash before another letter or digit is that character (`\d` is `d`, not a digit).
+- `view -R ^FILE` removes the `@RG` lines of the excluded read groups. samtools instead keeps
+  only those lines and removes the lines of the read groups whose records it outputs.
+- `view -P` applies `-p` and `-U` to the records it fetches (the reads in the regions and their
+  mates); samtools ignores both options with `-P`.
+- `view -B` on a record without base qualities leaves them all missing. HTSlib marks only the
+  first one missing and keeps merged values in the others (SAM output shows `*` either way).
+  noodles cannot parse `B` operations in SAM text, so `-B` needs BAM input.
+- `view -T ref.fa` on SAM without `@SQ` lines uses `ref.fa.fai` only if it exists; HTSlib
+  builds it.
 - `merge` combines `@RG`/`@PG` lines with the same ID, like `samtools merge -c -p`, and keeps
   each record's tag order. Plain `samtools merge` renames clashing IDs with random suffixes and
   moves `RG` to the last tag.

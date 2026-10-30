@@ -417,6 +417,188 @@ pub fn update_string_field(record: &mut Vec<u8>, tag: [u8; 2], value: &[u8]) -> 
     Ok(())
 }
 
+/// Unmaps a record as `samtools view -p` does for records that fail the filters: sets the
+/// unmapped flag, and clears the mapping quality, template length, and CIGAR (a long CIGAR's `CG`
+/// field too, which HTSlib would have moved into the CIGAR on reading).
+///
+/// # Errors
+///
+/// Returns an error if the record is malformed.
+pub fn unmap(record: &mut Vec<u8>) -> io::Result<()> {
+    const FLAG_UNMAPPED: u16 = 0x4;
+
+    if let Some(range) = Record::new(record)?.long_cigar_field()? {
+        record.drain(range);
+    }
+
+    let flags = le_u16(&record[field::FLAGS]) | FLAG_UNMAPPED;
+    record[field::FLAGS].copy_from_slice(&flags.to_le_bytes());
+    record[field::MAPPING_QUALITY] = 0;
+    record[field::TEMPLATE_LENGTH].copy_from_slice(&0i32.to_le_bytes());
+
+    let name_end = field::NAME + usize::from(record[field::NAME_LENGTH]);
+    let cigar_len = 4 * usize::from(le_u16(&record[field::CIGAR_OP_COUNT]));
+    record.drain(name_end..name_end + cigar_len);
+    record[field::CIGAR_OP_COUNT].copy_from_slice(&0u16.to_le_bytes());
+
+    Ok(())
+}
+
+/// `bam_remove_B` (samtools' `bam.c`, 1.24): collapses backward (`B`) CIGAR operations, merging
+/// the overlapping bases into a consensus. A `B` that cannot be removed (first in the CIGAR, or
+/// longer than the query before it) marks the record unmapped instead.
+///
+/// Records with a long CIGAR (in a `CG` field) are left as they are.
+///
+/// # Errors
+///
+/// Returns an error if the record is malformed.
+pub fn remove_backward_ops(record: &mut Vec<u8>) -> io::Result<()> {
+    const FLAG_UNMAPPED: u16 = 0x4;
+    const BACK: u32 = 9;
+
+    let view = Record::new(record)?;
+
+    if view.flags() & FLAG_UNMAPPED != 0 || view.long_cigar_field()?.is_some() {
+        return Ok(());
+    }
+
+    let mut cigar = Vec::new();
+    view.read_cigar(&mut cigar)?;
+
+    if !cigar.iter().any(|&op| op & 0xf == BACK) {
+        return Ok(());
+    }
+
+    let set_unmapped = |record: &mut Vec<u8>| {
+        let flags = le_u16(&record[field::FLAGS]) | FLAG_UNMAPPED;
+        record[field::FLAGS].copy_from_slice(&flags.to_le_bytes());
+    };
+
+    if cigar[0] & 0xf == BACK {
+        set_unmapped(record);
+        return Ok(());
+    }
+
+    let consumes_query = |op: u32| (0x3c1a7 >> ((op & 0xf) << 1)) & 1 != 0;
+
+    let mut seq: Vec<u8> = (0..view.sequence_len()).map(|i| view.base(i)).collect();
+    let mut qual = view.quality_scores().to_vec();
+    let no_qual = qual.first() == Some(&0xff);
+
+    let mut new_cigar: Vec<u32> = Vec::with_capacity(cigar.len());
+    let (mut i, mut j, mut end_j) = (0usize, 0usize, None::<usize>);
+
+    for (k, &op) in cigar.iter().enumerate() {
+        let len = (op >> 4) as usize;
+
+        if op & 0xf == BACK {
+            // A trailing `B` is ignored.
+            if k == cigar.len() - 1 {
+                break;
+            }
+
+            if len > j {
+                set_unmapped(record);
+                return Ok(());
+            }
+
+            // Look back through the query-consuming operations, shortening the one the `B`
+            // ends in and dropping those after it.
+            let mut u = 0;
+            let mut t = new_cigar.len();
+
+            while t > 0 {
+                let prev = new_cigar[t - 1];
+                let prev_len = (prev >> 4) as usize;
+
+                if consumes_query(prev) {
+                    if u + prev_len >= len {
+                        new_cigar[t - 1] -= ((len - u) as u32) << 4;
+                        break;
+                    }
+
+                    u += prev_len;
+                }
+
+                t -= 1;
+            }
+
+            // Squeeze out an operation shortened to nothing.
+            if t > 0 && new_cigar[t - 1] >> 4 == 0 {
+                t -= 1;
+            }
+
+            new_cigar.truncate(t);
+            end_j = Some(j);
+            j -= len;
+        } else {
+            new_cigar.push(op);
+
+            if consumes_query(op) {
+                if i != j {
+                    for u in 0..len {
+                        let c = seq[i + u];
+
+                        if end_j.is_some_and(|end| j + u < end) {
+                            // In the overlap: keep the better base.
+                            if c == seq[j + u] {
+                                qual[j + u] = qual[j + u].max(qual[i + u]);
+                            } else if qual[j + u] < qual[i + u] {
+                                seq[j + u] = c;
+                                qual[j + u] = qual[i + u] - qual[j + u];
+                            } else {
+                                qual[j + u] -= qual[i + u];
+                            }
+                        } else {
+                            seq[j + u] = c;
+                            qual[j + u] = qual[i + u];
+                        }
+                    }
+                }
+
+                i += len;
+                j += len;
+            }
+        }
+    }
+
+    // A record without qualities stays without them. HTSlib resets only the first byte (which
+    // marks them missing), leaving the merged values of the others.
+    if no_qual {
+        qual.fill(0xff);
+    }
+
+    // Merge adjacent operations of the same kind, then drop empty ones.
+    for k in 1..new_cigar.len() {
+        if new_cigar[k] & 0xf == new_cigar[k - 1] & 0xf {
+            new_cigar[k] += new_cigar[k - 1] & !0xf;
+            new_cigar[k - 1] &= 0xf;
+        }
+    }
+
+    new_cigar.retain(|op| op >> 4 != 0);
+
+    let name_end = field::NAME + usize::from(record[field::NAME_LENGTH]);
+    let data = record[view.data_start..].to_vec();
+
+    record.truncate(name_end);
+    record.extend(new_cigar.iter().flat_map(|op| op.to_le_bytes()));
+    record.extend(seq[..j].chunks(2).map(|pair| {
+        let (hi, lo) = (pair[0], pair.get(1).copied().unwrap_or(0));
+        (hi << 4) | lo
+    }));
+    record.extend_from_slice(&qual[..j]);
+    record.extend_from_slice(&data);
+
+    let n_cigar = u16::try_from(new_cigar.len()).map_err(|_| invalid("CIGAR too long"))?;
+    record[field::CIGAR_OP_COUNT].copy_from_slice(&n_cigar.to_le_bytes());
+    let l_seq = u32::try_from(j).map_err(|_| invalid("sequence too long"))?;
+    record[field::SEQUENCE_LENGTH].copy_from_slice(&l_seq.to_le_bytes());
+
+    Ok(())
+}
+
 fn truncated() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, "truncated BAM record")
 }
@@ -444,6 +626,63 @@ mod tests {
         let mut writer = bam::io::Writer::from(Vec::new());
         writer.write_alignment_record(&sam::Header::default(), record)?;
         Ok(writer.get_ref()[4..].to_vec())
+    }
+
+    fn sam_record(line: &str) -> io::Result<Vec<u8>> {
+        let header: sam::Header = "@SQ\tSN:c\tLN:100\n".parse().map_err(io::Error::other)?;
+        let record = sam::Record::try_from(line.as_bytes())?;
+        let mut writer = bam::io::Writer::from(Vec::new());
+        writer.write_alignment_record(&header, &record)?;
+        Ok(writer.get_ref()[4..].to_vec())
+    }
+
+    #[test]
+    fn test_remove_backward_ops() -> io::Result<()> {
+        // noodles cannot parse `B` in SAM, so it is written as `D` and patched.
+        let with_back = |line: &str| -> io::Result<Vec<u8>> {
+            const DELETION: u8 = 2;
+            const BACK: u8 = 9;
+
+            let mut buf = sam_record(line)?;
+            let start = field::NAME + usize::from(buf[field::NAME_LENGTH]);
+            let n = usize::from(le_u16(&buf[field::CIGAR_OP_COUNT]));
+
+            for op in buf[start..start + 4 * n].chunks_mut(4) {
+                if op[0] & 0xf == DELETION {
+                    op[0] = (op[0] & !0xf) | BACK;
+                }
+            }
+
+            Ok(buf)
+        };
+
+        // `samtools view -B` collapses 5M2B5M to 8M, merging the two overlapping bases.
+        let mut buf = with_back("r\t0\tc\t1\t60\t5M2D5M\t*\t0\t0\tACGTAGTCCA\t(((((5((((")?;
+        remove_backward_ops(&mut buf)?;
+        assert_eq!(
+            buf,
+            sam_record("r\t0\tc\t1\t60\t8M\t*\t0\t0\tACGGACCA\t(((.!(((")?
+        );
+
+        // A leading `B` cannot be removed; the record is unmapped instead.
+        let mut buf = with_back("r\t0\tc\t1\t60\t2D5M\t*\t0\t0\tACGTA\t*")?;
+        remove_backward_ops(&mut buf)?;
+        let mut expected = with_back("r\t0\tc\t1\t60\t2D5M\t*\t0\t0\tACGTA\t*")?;
+        expected[field::FLAGS.start] |= 0x4;
+        assert_eq!(buf, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unmap() -> io::Result<()> {
+        let mut buf = sam_record("r\t99\tc\t5\t60\t2S3M\t=\t9\t20\tACGTA\t*\tNM:i:0")?;
+        unmap(&mut buf)?;
+        assert_eq!(
+            buf,
+            sam_record("r\t103\tc\t5\t0\t*\t=\t9\t0\tACGTA\t*\tNM:i:0")?
+        );
+        Ok(())
     }
 
     #[test]

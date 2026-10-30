@@ -146,6 +146,56 @@ check "view -l -U" "$st view --no-PG -l x -U /dev/stdout -o /dev/null lib.sam" "
 check "view --output-fmt-option level=1" "$st view --no-PG -b --output-fmt-option level=1 $short | $st view --no-PG -" "$nt view --no-PG -b --output-fmt-option level=1 $short | $st view --no-PG -"
 check "view BAM->BAM" "$st view --no-PG -h $short" "$nt view --no-PG -b -@ 4 $short | $st view --no-PG -h -"
 
+# view: filter expressions, read groups, tag files, -m, -p, -P, -B, -t
+for e in 'mapq >= 30 && flag.proper_pair && !flag.reverse' 'rname == "chrS" && pos > 100000 && endpos < 200000' \
+    'qname =~ "1$" || cigar =~ "S"' 'sclen > 5 || hclen > 0 || ncigar > 1' 'tlen < -300 || mpos - pos > 200' \
+    'avg(qual) > 30 && min(qual) < 10' 'seq =~ "^A+C" || length(seq) != qlen' '[NM] > 2 || ![MD]' \
+    'default([XS], -1) < 0 && exists([AS])' '(flag & 0x50) == 0x50 && ~flag & 16' 'sqrt(mapq) > 5 && pow(2, 3) == 8' \
+    '[XX] || mapq > 50' '-tlen > 0' 'rlen % 7 == 3' '"a" < "b" && library == ""'; do
+    check "view -e '$e'" "$st view --no-PG -e '$e' $short" "$nt view --no-PG -e '$e' $short"
+done
+check "view -c -e" "$st view -c -e 'mapq > 30 && [NM] > 1' $short" "$nt view -c -e 'mapq > 30 && [NM] > 1' $short"
+check "view -e tagged" "$st view --no-PG -e '[NH] > 1 && [HI] == 1' $tagged" "$nt view --no-PG -e '[NH] > 1 && [HI] == 1' $tagged"
+check "view -e long" "$st view --no-PG -e 'qlen > 10000 && sclen > 100' $long" "$nt view --no-PG -e 'qlen > 10000 && sclen > 100' $long"
+check "view -e CRAM -@4" "$st view --no-PG -e 'mapq > 30 && [NM] > 1' -T $ref $corpus/short/input.3.1.cram" "$nt view --no-PG -@ 4 -e 'mapq > 30 && [NM] > 1' -T $ref $corpus/short/input.3.1.cram"
+check "view -c -e CRAM -@4" "$st view -c -e 'mapq > 30' -T $ref $corpus/short/input.3.1.cram" "$nt view -c -@ 4 -e 'mapq > 30' -T $ref $corpus/short/input.3.1.cram"
+check "view -e -U" "$st view --no-PG -e 'mapq > 30' -U /dev/stdout -o /dev/null $short" "$nt view --no-PG -e 'mapq > 30' -U /dev/stdout -o /dev/null $short"
+for m in 1 150 151; do
+    check "view -c -m $m" "$st view -c -m $m $short" "$nt view -c -m $m $short"
+done
+check "view -m long" "$st view --no-PG -m 5000 $long" "$nt view --no-PG -m 5000 $long"
+printf 'a\n' > rg.a.txt
+printf 'a c\n zz\n' > rg.ac.txt
+: > rg.empty.txt
+for opts in "-r a" "-r a -r c -r zz" "-R rg.a.txt" "-R rg.ac.txt" "-R rg.empty.txt" "-n" "-n -r a" "-c -r a" "-l x -r a"; do
+    check "view -h $opts" "$st view --no-PG -h $opts lib.sam" "$nt view --no-PG -h $opts lib.sam"
+done
+# samtools keeps the @RG lines of the dropped read groups with -R ^FILE; compare records only.
+check "view -R ^FILE" "$st view --no-PG -R ^rg.ac.txt lib.sam" "$nt view --no-PG -R ^rg.ac.txt lib.sam"
+printf '2\n3\n' > nh.txt
+for opts in "-D NH:nh.txt" "-d NH:1 -D NH:nh.txt" "-D NH:rg.empty.txt" "-d NH -d NH:2" "-c -D NH:nh.txt"; do
+    check "view $opts" "$st view --no-PG $opts $tagged" "$nt view --no-PG $opts $tagged"
+done
+check "view -p" "$st view --no-PG -p -q 30 $short" "$nt view --no-PG -p -q 30 $short"
+check "view -p -x region" "$st view --no-PG -p -f 2 -x NM $short chrS:100000-200000" "$nt view --no-PG -p -f 2 -x NM $short chrS:100000-200000"
+check "view -p -b" "$st view --no-PG -p -e 'mapq < 20' $short" "$nt view --no-PG -b -p -e 'mapq < 20' $short | $st view --no-PG -"
+check "view -c -p" "$st view -c -p -q 30 $short" "$nt view -c -p -q 30 $short"
+head -5 "$corpus/short/queries.100.bed" > pairs.bed
+for opts in "chrS:100000-110000" "chrS:100000-110000 chrS:500000-505000" "-L pairs.bed" "-L pairs.bed chrS:1-3000000" "-q 30 chrS:100000-110000" "-f 64 chrS:100000-110000"; do
+    check "view -P $opts" "$st view --no-PG -P $short $opts" "$nt view --no-PG -P $short $opts"
+done
+check "view -P long" "$st view --no-PG -P $long $(head -1 "$corpus/long/queries.100.regions")" "$nt view --no-PG -P $long $(head -1 "$corpus/long/queries.100.regions")"
+printf '@SQ\tSN:c\tLN:100\nr\t0\tc\t1\t60\t5M2B5M\t*\t0\t0\tACGTAGTCCA\t(((((5((((\nr2\t0\tc\t1\t60\t2B5M\t*\t0\t0\tACGTA\t*\nr3\t0\tc\t1\t60\t3M1B2M\t*\t0\t0\tACGTA\t*\nr4\t0\tc\t1\t60\t3M1I2M\t*\t0\t0\tACGTAC\t*\n' > back.sam
+"$st" view -b -o back.bam back.sam
+for opts in "-B" "-B -m 5" "-B -F 4" "-B -e 'qlen > 5' -U /dev/stdout -o /dev/null"; do
+    check "view $opts" "$st view --no-PG $opts back.bam" "$nt view --no-PG $opts back.bam"
+done
+"$st" view "$short" chrS:1-20000 > nosq.sam
+# ntools writes the @SQ lines from -t first; HTSlib appends them after the others.
+check "view -t" "$st view --no-PG -h -t $ref.fai nosq.sam | sort" "$nt view --no-PG -h -t $ref.fai nosq.sam | sort"
+check "view -T (fai for SAM)" "$st view --no-PG -b -T $ref nosq.sam | $st view --no-PG -h -" "$nt view --no-PG -b -T $ref nosq.sam | $st view --no-PG -h -"
+check "view -S" "$st view -S -c $short" "$nt view -S -c $short"
+
 # statistics
 for set in short tagged long; do
     for fmt in default tsv json; do

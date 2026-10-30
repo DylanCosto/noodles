@@ -85,6 +85,41 @@ impl RegionSet {
         Ok(())
     }
 
+    /// Adds a 1-based closed interval of a reference sequence (by header index); call
+    /// [`Self::merge`] afterwards.
+    pub fn add_interval(&mut self, reference_sequence_id: usize, start: usize, end: usize) {
+        if let Some(intervals) = self.by_reference.get_mut(reference_sequence_id) {
+            intervals.push((start, end));
+        }
+    }
+
+    /// The overlaps of this set's intervals with `other`'s, as samtools intersects `-L` with
+    /// regions under `-M` (`bed_filter`).
+    pub fn intersection(&self, other: &Self) -> Self {
+        let by_reference = self
+            .by_reference
+            .iter()
+            .zip(&other.by_reference)
+            .map(|(a, b)| {
+                let mut overlaps = Vec::new();
+
+                for &(start, end) in a {
+                    for &(s, e) in b {
+                        if s <= end && e >= start {
+                            overlaps.push((start.max(s), end.min(e)));
+                        }
+                    }
+                }
+
+                overlaps
+            })
+            .collect();
+
+        let mut set = Self { by_reference };
+        set.merge();
+        set
+    }
+
     /// Sorts and merges overlapping or adjacent intervals.
     pub fn merge(&mut self) {
         for intervals in &mut self.by_reference {
