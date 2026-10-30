@@ -36,13 +36,20 @@ pub(super) fn build_slice(
     record_counter: u64,
     compression_header: &CompressionHeader,
     records: &mut [Record],
+    embedded_reference_sequence: Option<&[u8]>,
 ) -> io::Result<Slice> {
+    use super::embedded_reference;
+
     let reference_sequence_context = get_reference_sequence_context(records);
 
     set_mates(records);
 
-    let (core_data_buf, external_data_bufs) =
+    let (core_data_buf, mut external_data_bufs) =
         write_records(compression_header, reference_sequence_context, records)?;
+
+    if let Some(sequence) = embedded_reference_sequence {
+        external_data_bufs.push((embedded_reference::BLOCK_CONTENT_ID, sequence.to_vec()));
+    }
 
     let (core_data_block, external_data_blocks) = build_blocks(
         &ctx.block_content_encoder_map,
@@ -54,8 +61,8 @@ pub(super) fn build_slice(
     let mut block_content_ids = vec![core_data_block.content_id];
     block_content_ids.extend(external_data_blocks.iter().map(|block| block.content_id));
 
-    // Without a reference (records whose sequence the reference lacks), there is nothing to
-    // checksum.
+    // Without the external reference (records whose sequence the reference lacks), the checksum
+    // is of the embedded reference, if any.
     let (reference_sequence_context, reference_md5) = if compression_header
         .preservation_map()
         .external_reference_sequence_is_required()
@@ -66,7 +73,10 @@ pub(super) fn build_slice(
             reference_sequence_context,
         )?
     } else {
-        (reference_sequence_context, None)
+        (
+            reference_sequence_context,
+            embedded_reference_sequence.map(calculate_normalized_sequence_digest),
+        )
     };
 
     let header = Header {
@@ -75,7 +85,8 @@ pub(super) fn build_slice(
         record_counter,
         block_count: block_content_ids.len(),
         block_content_ids,
-        embedded_reference_bases_block_content_id: None,
+        embedded_reference_bases_block_content_id: embedded_reference_sequence
+            .map(|_| embedded_reference::BLOCK_CONTENT_ID),
         reference_md5,
         optional_tags: Vec::new(),
     };
@@ -87,7 +98,7 @@ pub(super) fn build_slice(
     })
 }
 
-fn get_reference_sequence_context(records: &[Record]) -> ReferenceSequenceContext {
+pub(super) fn get_reference_sequence_context(records: &[Record]) -> ReferenceSequenceContext {
     assert!(!records.is_empty());
 
     let record = &records[0];

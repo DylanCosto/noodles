@@ -11,6 +11,7 @@ use noodles_sam::{
     },
 };
 
+pub(crate) use self::convert::push_mismatches;
 pub use self::feature::Feature;
 use crate::record::{Flags, MateFlags};
 

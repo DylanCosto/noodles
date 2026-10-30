@@ -269,7 +269,7 @@ fn push_scores(
 /// at `read_offset` in the read and `reference_offset` in the reference.
 ///
 /// As in HTSlib, bases past the end of the reference are stored verbatim.
-fn push_mismatches(
+pub(crate) fn push_mismatches(
     features: &mut Vec<Feature>,
     reference_bases: &[u8],
     reference_offset: usize,

@@ -1,5 +1,6 @@
 mod block;
 pub(crate) mod compression_header;
+pub(crate) mod embedded_reference;
 mod header;
 pub(crate) mod slice;
 
@@ -57,7 +58,10 @@ fn build_container(
 
     // A container either requires the external reference or not. With records on sequences the
     // reference lacks, every record stores its aligned bases verbatim, as in HTSlib's
-    // non-reference mode.
+    // non-reference mode, and slices on one reference sequence embed a consensus of their records
+    // to store the bases against, as HTSlib's `embed_ref=2` does.
+    let mut embedded_reference_sequences = Vec::new();
+
     if records
         .iter()
         .any(|record| record.reference_bases == ReferenceBases::Verbatim)
@@ -65,17 +69,30 @@ fn build_container(
         for record in records.iter_mut() {
             record.store_bases_verbatim();
         }
+
+        for chunk in records.chunks_mut(ctx.records_per_slice) {
+            let reference_sequence_context = slice::get_reference_sequence_context(chunk);
+            embedded_reference_sequences.push(embedded_reference::embed(
+                reference_sequence_context,
+                chunk,
+            )?);
+        }
     }
 
     let compression_header = build_compression_header(ctx, records);
 
-    for chunk in records.chunks_mut(ctx.records_per_slice) {
+    for (i, chunk) in records.chunks_mut(ctx.records_per_slice).enumerate() {
+        let embedded_reference_sequence = embedded_reference_sequences
+            .get(i)
+            .and_then(|sequence| sequence.as_deref());
+
         let slice = build_slice(
             ctx,
             header,
             slice_record_counter,
             &compression_header,
             chunk,
+            embedded_reference_sequence,
         )?;
 
         slices.push(slice);

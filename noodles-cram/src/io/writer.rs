@@ -523,6 +523,71 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_write_records_with_an_embedded_consensus_reference() -> io::Result<()> {
+        use noodles_sam::alignment::RecordBuf;
+
+        use crate::io::reader::Container;
+
+        // The repository lacks sq0, so the slice embeds a consensus of its records.
+        let header: sam::Header = "@SQ\tSN:sq0\tLN:16\n".parse().unwrap();
+
+        let records: Vec<_> = [(1, "ACGTAC"), (3, "GTTCGG"), (3, "GTACGG"), (5, "ACGGNA")]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (start, bases))| {
+                RecordBuf::builder()
+                    .set_name(format!("r{i}"))
+                    .set_flags(Flags::empty())
+                    .set_reference_sequence_id(0)
+                    .set_alignment_start(Position::new(start).unwrap())
+                    .set_cigar([Op::new(Kind::Match, bases.len())].into_iter().collect())
+                    .set_sequence(bases.as_bytes().to_vec().into())
+                    .set_quality_scores(vec![30; bases.len()].into())
+                    .build()
+            })
+            .collect();
+
+        let mut writer = Builder::default().build_from_writer(Vec::new());
+        writer.write_header(&header)?;
+
+        for record in &records {
+            writer.write_alignment_record(&header, record)?;
+        }
+
+        writer.try_finish(&header)?;
+        let src = writer.into_inner();
+
+        let mut reader = crate::io::Reader::new(Cursor::new(&src));
+        let actual_header = reader.read_header()?;
+        let mut container = Container::default();
+        reader.read_container(&mut container)?;
+        let slice = container.slices().next().expect("a slice")?;
+        assert!(
+            slice
+                .header()
+                .embedded_reference_bases_block_content_id()
+                .is_some()
+        );
+
+        let mut reader = crate::io::Reader::new(Cursor::new(&src));
+        reader.read_header()?;
+        let actual = reader
+            .records(&actual_header)
+            .collect::<io::Result<Vec<_>>>()?;
+
+        assert_eq!(actual.len(), records.len());
+
+        for (actual, expected) in actual.iter().zip(&records) {
+            assert_eq!(actual.alignment_start(), expected.alignment_start());
+            assert_eq!(actual.sequence(), expected.sequence());
+            // No MD or NM from the consensus, and no `cF` tag.
+            assert!(actual.data().is_empty());
+        }
+
+        Ok(())
+    }
+
     #[cfg(feature = "async")]
     #[tokio::test]
     async fn test_async_query_does_not_repeat_records_from_other_slices() -> io::Result<()> {

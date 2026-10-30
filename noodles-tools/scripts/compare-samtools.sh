@@ -383,7 +383,9 @@ done
 check "merge --template-coordinate" "$st merge --template-coordinate -s 1 --no-PG -o - merge.tc1.bam merge.tc2.bam | $st view --no-PG -h -" "$nt merge --template-coordinate -s 1 --no-PG -o - merge.tc1.bam merge.tc2.bam | $st view --no-PG -h -"
 check "merge --template-coordinate -c -p -r" "$st merge --template-coordinate -c -p -r --no-PG -o - merge.tc1.bam merge.tc2.bam | $st view --no-PG -h -" "$nt merge --template-coordinate -c -p -r --no-PG -o - merge.tc1.bam merge.tc2.bam | $st view --no-PG -h -"
 "$st" sort --template-coordinate --no-PG -O sam -o merge.tc.edge.sam sort.tc.sam
-check "merge --template-coordinate (edge cases)" "$st merge --template-coordinate --no-PG -o - merge.tc.edge.sam merge.tc.edge.sam | $st view --no-PG -h -" "$nt merge --template-coordinate --no-PG -o - merge.tc.edge.sam merge.tc.edge.sam | $st view --no-PG -h -"
+# Merging a file with itself renames colliding @RG/@PG IDs with random suffixes; samtools seeds
+# them from the time, so these checks fix the seed (-s) to keep cached results valid.
+check "merge --template-coordinate (edge cases)" "$st merge --template-coordinate -s 1 --no-PG -o - merge.tc.edge.sam merge.tc.edge.sam | $st view --no-PG -h -" "$nt merge --template-coordinate -s 1 --no-PG -o - merge.tc.edge.sam merge.tc.edge.sam | $st view --no-PG -h -"
 {
     s=ACGTACGTAC q=IIIIIIIIII
     printf '@HD\tVN:1.6\tSO:unsorted\tGO:query\tSS:unsorted:template-coordinate\n@SQ\tSN:c1\tLN:1000\n@RG\tID:g1\tSM:s\tLB:libZ\n'
@@ -402,7 +404,7 @@ for opts in "-s 3" "-c -s 3" "-r -s 3" "-c -r" "-h merge.tc.b.sam -s 3"; do
     check "merge --template-coordinate $opts (libraries)" "$st merge --template-coordinate $opts --no-PG -o - merge.tc.a.sam merge.tc.b.sam | $st view --no-PG -h -" "$nt merge --template-coordinate $opts --no-PG -o - merge.tc.a.sam merge.tc.b.sam | $st view --no-PG -h -"
 done
 for opts in "-n --template-coordinate" "--template-coordinate -n" "--template-coordinate -N" "-t XX --template-coordinate"; do
-    check "merge $opts (precedence)" "$st merge $opts --no-PG -o - merge.tc.edge.sam merge.tc.edge.sam | $st view --no-PG -h -" "$nt merge $opts --no-PG -o - merge.tc.edge.sam merge.tc.edge.sam | $st view --no-PG -h -"
+    check "merge $opts (precedence)" "$st merge $opts -s 1 --no-PG -o - merge.tc.edge.sam merge.tc.edge.sam | $st view --no-PG -h -" "$nt merge $opts -s 1 --no-PG -o - merge.tc.edge.sam merge.tc.edge.sam | $st view --no-PG -h -"
 done
 check "merge --template-coordinate missing MC (exit status)" "$st merge --template-coordinate --no-PG -o - sort.tc.bad.none.sam > /dev/null; echo \$?" "$nt merge --template-coordinate --no-PG -o - sort.tc.bad.none.sam 2>/dev/null > /dev/null; echo \$?"
 for idx in '' merge.wi1.bai merge.wi2.csi merge.wi3.idx; do
