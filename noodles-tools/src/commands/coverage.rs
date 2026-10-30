@@ -129,6 +129,13 @@ pub struct Args {
     help: Option<bool>,
 }
 
+/// Whether the table starts with a line of column names (`-H` omits it).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColumnNames {
+    Print,
+    Omit,
+}
+
 /// What is written.
 #[derive(Clone, Copy, Debug)]
 enum Mode {
@@ -323,7 +330,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut out = BufWriter::new(sink);
 
     match mode {
-        Mode::Table => summary.write_table(&mut out, &header, !args.no_header)?,
+        Mode::Table => {
+            let column_names = if args.no_header {
+                ColumnNames::Omit
+            } else {
+                ColumnNames::Print
+            };
+            summary.write_table(&mut out, &header, column_names)?;
+        }
         Mode::Histogram { plot, blocks, .. } => {
             summary.write_histograms(&mut out, &header, plot, blocks)?;
         }
@@ -730,10 +744,11 @@ impl Summary {
         &self,
         out: &mut W,
         header: &sam::Header,
-        print_header: bool,
+        column_names: ColumnNames,
     ) -> io::Result<()> {
         let names: Vec<_> = header.reference_sequences().keys().collect();
-        let mut print_header = print_header;
+        // As in samtools, the column names are written before the first row only.
+        let mut print_header = column_names == ColumnNames::Print;
 
         for id in self.reported() {
             let tally = &self.tallies[id];

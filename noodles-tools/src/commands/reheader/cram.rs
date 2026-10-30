@@ -11,7 +11,7 @@ use noodles_sam as sam;
 
 use crate::{
     cram_file::{
-        ContainerHeader, FILE_DEFINITION_LEN, FileDefinition, GZIP, RAW, encode_block,
+        Checksums, ContainerHeader, FILE_DEFINITION_LEN, FileDefinition, GZIP, RAW, encode_block,
         encode_container_header, encode_header_container, header_data,
     },
     cram_raw::{read_itf8, read_len, take},
@@ -122,14 +122,14 @@ fn reheader_in_place_3(file: &mut File, start: &FileStart, data: &[u8]) -> anyho
 
     // One block, and one landmark (at 0) if there were any.
     let landmarks: &[i32] = if old.landmark_count > 0 { &[0] } else { &[] };
-    let header_len = encode_container_header(&old.fields, 1, landmarks, 0, true)?.len();
+    let header_len = encode_container_header(&old.fields, 1, landmarks, 0, Checksums::Crc32)?.len();
 
     let Some(data_len) = total_len.checked_sub(header_len) else {
         bail!("Quirk of fate makes this troublesome! Please use non-inplace version.");
     };
 
-    let container = encode_container_header(&old.fields, 1, landmarks, data_len, true)?;
-    let block = encode_block(data, GZIP, true)?;
+    let container = encode_container_header(&old.fields, 1, landmarks, data_len, Checksums::Crc32)?;
+    let block = encode_block(data, GZIP, Checksums::Crc32)?;
 
     if block.len() > data_len {
         bail!(

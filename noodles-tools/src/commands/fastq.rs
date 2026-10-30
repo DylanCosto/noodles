@@ -457,7 +457,10 @@ impl Config {
             } else {
                 Vec::new()
             },
-            aux: AuxTags::new(args.copy_default_tags, args.copy_tags.as_deref()),
+            aux: AuxTags::new(
+                args.copy_default_tags.then_some(DEFAULT_COPIED_TAGS),
+                args.copy_tags.as_deref(),
+            ),
         };
 
         let mut flags = FlagFilter {
@@ -521,7 +524,9 @@ impl FlagFilter {
 }
 
 /// `-d TAG[:VALUE]` and `-D TAG:FILE`: keep records with the tag, and with one of the values if
-/// any are given.
+/// any are given. This is not `view`'s [`crate::filter::TagFilter`]: samtools fastq reads whole
+/// lines from `-D` files and matches floats as `%f` prints them, where samtools view reads
+/// whitespace-separated words and never matches floats.
 #[derive(Debug)]
 struct TagFilter {
     tag: [u8; 2],
@@ -790,19 +795,15 @@ enum AuxTags {
 
 impl AuxTags {
     /// As samtools sets HTSlib's `FASTQ_OPT_AUX`: `*` or an empty `-T` copies every tag;
-    /// otherwise `-t`'s tags and then `-T`'s.
-    fn new(copy_default_tags: bool, copy_tags: Option<&str>) -> Self {
+    /// otherwise `-t`'s tags (`default_tags`) and then `-T`'s.
+    fn new(default_tags: Option<&str>, copy_tags: Option<&str>) -> Self {
         if let Some(tags) = copy_tags
             && (tags.is_empty() || tags.starts_with('*'))
         {
             return Self::All;
         }
 
-        let mut list = String::new();
-
-        if copy_default_tags {
-            list.push_str(DEFAULT_COPIED_TAGS);
-        }
+        let mut list = String::from(default_tags.unwrap_or_default());
 
         if let Some(tags) = copy_tags {
             if !list.is_empty() {
@@ -1571,12 +1572,15 @@ mod tests {
 
     #[test]
     fn test_aux_tags() {
-        assert!(matches!(AuxTags::new(false, None), AuxTags::None));
-        assert!(matches!(AuxTags::new(true, Some("*")), AuxTags::All));
-        assert!(matches!(AuxTags::new(false, Some("")), AuxTags::All));
-        assert!(matches!(AuxTags::new(false, Some("1")), AuxTags::All));
+        assert!(matches!(AuxTags::new(None, None), AuxTags::None));
+        assert!(matches!(
+            AuxTags::new(Some(DEFAULT_COPIED_TAGS), Some("*")),
+            AuxTags::All
+        ));
+        assert!(matches!(AuxTags::new(None, Some("")), AuxTags::All));
+        assert!(matches!(AuxTags::new(None, Some("1")), AuxTags::All));
 
-        let AuxTags::Only(tags) = AuxTags::new(true, Some("XA,XB")) else {
+        let AuxTags::Only(tags) = AuxTags::new(Some(DEFAULT_COPIED_TAGS), Some("XA,XB")) else {
             panic!("expected a tag list");
         };
         assert_eq!(tags, [*b"RG", *b"BC", *b"QT", *b"XA", *b"XB"]);

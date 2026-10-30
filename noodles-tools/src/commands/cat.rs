@@ -13,8 +13,8 @@ use noodles_sam as sam;
 
 use crate::{
     bam_blocks,
-    commands::{merge::read_file_list, reheader::read_sam_header},
-    output, program,
+    commands::reheader::read_sam_header,
+    file_list, output, program,
     source::{Format, Input},
 };
 
@@ -74,7 +74,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut inputs = Vec::new();
 
     for list in &args.lists {
-        inputs.extend(read_file_list(list)?);
+        inputs.extend(file_list::read_lines(list)?);
     }
 
     inputs.extend(args.inputs.iter().cloned());
@@ -109,6 +109,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     };
 
     let mut dst = BufWriter::new(sink);
+    let add_program = |header: &mut sam::Header| {
+        if args.no_pg {
+            Ok(())
+        } else {
+            program::add(header)
+        }
+    };
 
     match format {
         Format::Cram => {
@@ -123,12 +130,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 reference: args.reference.as_deref(),
             };
 
-            let no_pg = args.no_pg;
-            cram::cat(&inputs, header, &options, &mut dst, |header| {
-                if no_pg { Ok(()) } else { program::add(header) }
-            })?;
+            cram::cat(&inputs, header, &options, &mut dst, add_program)?;
         }
-        _ => cat_bam(&inputs, header, args.no_pg, &mut dst)?,
+        _ => cat_bam(&inputs, header, &mut dst, add_program)?,
     }
 
     dst.flush()?;
@@ -141,12 +145,16 @@ fn input_format(path: &Path) -> anyhow::Result<Format> {
     Ok(Input::open(src)?.format)
 }
 
-fn cat_bam<W: Write>(
+fn cat_bam<W, F>(
     inputs: &[PathBuf],
     header: Option<sam::Header>,
-    no_pg: bool,
     dst: &mut W,
-) -> anyhow::Result<()> {
+    add_program: F,
+) -> anyhow::Result<()>
+where
+    W: Write,
+    F: FnOnce(&mut sam::Header) -> anyhow::Result<()>,
+{
     let mut merged = header;
     let mut bodies = Vec::with_capacity(inputs.len());
 
@@ -158,10 +166,7 @@ fn cat_bam<W: Write>(
 
     let mut header = merged.context("no input headers")?;
 
-    if !no_pg {
-        program::add(&mut header)?;
-    }
-
+    add_program(&mut header)?;
     bam_blocks::write_header(dst, &header)?;
 
     for body in bodies {

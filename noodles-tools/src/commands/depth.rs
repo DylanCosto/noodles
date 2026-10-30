@@ -185,7 +185,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
 
     let region_queries = domain.queries();
-    let remove_overlaps = args.remove_overlaps;
+    let overlaps = if args.remove_overlaps {
+        Overlaps::Remove
+    } else {
+        Overlaps::Count
+    };
 
     thread::scope(|scope| -> anyhow::Result<()> {
         let mut streams = Vec::with_capacity(inputs.len());
@@ -205,7 +209,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     region_queries.as_ref(),
                     selection,
                     count_options,
-                    remove_overlaps,
+                    overlaps,
                     &tx,
                 )
             }));
@@ -232,6 +236,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether bases of a read that overlap its mate are counted (`-s` removes them).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Overlaps {
+    Count,
+    Remove,
+}
+
 /// Computes nonzero depths of one input and sends them in order.
 #[expect(
     clippy::too_many_arguments,
@@ -245,7 +256,7 @@ fn read_depths(
     queries: Option<&RegionSet>,
     selection: &Selection,
     count_options: CountOptions,
-    overlaps: bool,
+    overlaps: Overlaps,
     tx: &Sender<Vec<Point>>,
 ) -> anyhow::Result<()> {
     let mut window = DepthWindow::new(count_options);
@@ -263,7 +274,7 @@ fn read_depths(
         Ok(())
     };
 
-    let mut mates = overlaps.then(MateEnds::default);
+    let mut mates = (overlaps == Overlaps::Remove).then(MateEnds::default);
     let mut encoder = RawEncoder::new();
     let mut cigar = Vec::new();
 

@@ -174,17 +174,20 @@ impl HeaderMerger {
         (ids, lost_order)
     }
 
-    /// Returns the merged header. With `reset_order`, `@HD` is marked unsorted, without `SS` or
-    /// `GO`, as samtools does when an input's reference sequences are out of order.
-    pub fn finish(mut self, reset_order: bool) -> sam::Header {
-        if reset_order && let Some(hd) = self.header.header_mut() {
-            let fields = hd.other_fields_mut();
-            fields.shift_remove(&SUBSORT_ORDER);
-            fields.shift_remove(&GROUP_ORDER);
-            fields.insert(SORT_ORDER, "unsorted".into());
-        }
-
+    /// Returns the merged header.
+    pub fn finish(self) -> sam::Header {
         self.header
+    }
+}
+
+/// Marks `@HD` unsorted, without `SS` or `GO`, as samtools does when an input's reference
+/// sequences are out of order.
+pub fn mark_unsorted(header: &mut sam::Header) {
+    if let Some(hd) = header.header_mut() {
+        let fields = hd.other_fields_mut();
+        fields.shift_remove(&SUBSORT_ORDER);
+        fields.shift_remove(&GROUP_ORDER);
+        fields.insert(SORT_ORDER, "unsorted".into());
     }
 }
 

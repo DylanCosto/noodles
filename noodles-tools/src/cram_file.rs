@@ -54,9 +54,22 @@ impl FileDefinition {
     }
 
     /// Whether containers and blocks carry CRC32 checksums (CRAM 3).
-    pub fn has_checksums(&self) -> bool {
-        self.major_version() >= 3
+    pub fn checksums(&self) -> Checksums {
+        if self.major_version() >= 3 {
+            Checksums::Crc32
+        } else {
+            Checksums::None
+        }
     }
+}
+
+/// Whether CRAM containers and blocks end with a checksum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Checksums {
+    /// CRAM 3: a CRC32 of the preceding bytes.
+    Crc32,
+    /// CRAM 2.
+    None,
 }
 
 /// A container header.
@@ -117,7 +130,7 @@ impl ContainerHeader {
             read_varint(reader, &mut raw, Varint::Itf8)?;
         }
 
-        if definition.has_checksums() {
+        if definition.checksums() == Checksums::Crc32 {
             let mut crc = [0; 4];
             reader.read_exact(&mut crc)?;
             raw.extend_from_slice(&crc);
@@ -201,9 +214,9 @@ pub fn encode_header_container(
     // Reference sequence ID, start, span, record count, record counter, and base count: all 0.
     const FIELDS: [u8; 6] = [0; 6];
 
-    let block = encode_block(&header_data(header)?, GZIP, definition.has_checksums())?;
+    let block = encode_block(&header_data(header)?, GZIP, definition.checksums())?;
     let mut container =
-        encode_container_header(&FIELDS, 1, &[], block.len(), definition.has_checksums())?;
+        encode_container_header(&FIELDS, 1, &[], block.len(), definition.checksums())?;
     container.extend_from_slice(&block);
 
     Ok(container)
@@ -222,7 +235,7 @@ pub fn header_data(header: &sam::Header) -> io::Result<Vec<u8>> {
 }
 
 /// Encodes a file header block, with a CRC32 for CRAM 3.
-pub fn encode_block(data: &[u8], method: u8, with_checksum: bool) -> io::Result<Vec<u8>> {
+pub fn encode_block(data: &[u8], method: u8, checksums: Checksums) -> io::Result<Vec<u8>> {
     let compressed = match method {
         GZIP => {
             let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
@@ -238,7 +251,7 @@ pub fn encode_block(data: &[u8], method: u8, with_checksum: bool) -> io::Result<
     write_itf8(&mut block, to_i32(data.len())?);
     block.extend_from_slice(&compressed);
 
-    if with_checksum {
+    if checksums == Checksums::Crc32 {
         let crc = crc32fast::hash(&block);
         block.extend_from_slice(&crc.to_le_bytes());
     }
@@ -252,7 +265,7 @@ pub fn encode_container_header(
     block_count: i32,
     landmarks: &[i32],
     data_len: usize,
-    with_checksum: bool,
+    checksums: Checksums,
 ) -> io::Result<Vec<u8>> {
     let mut buf = to_i32(data_len)?.to_le_bytes().to_vec();
     buf.extend_from_slice(fields);
@@ -263,7 +276,7 @@ pub fn encode_container_header(
         write_itf8(&mut buf, landmark);
     }
 
-    if with_checksum {
+    if checksums == Checksums::Crc32 {
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
     }
@@ -328,8 +341,13 @@ mod tests {
     #[test]
     fn test_read_container_header() -> io::Result<()> {
         let definition = FileDefinition(*b"CRAM\x03\x00xxxxxxxxxxxxxxxxxxxx");
-        let raw =
-            encode_container_header(&[0x81, 0x00, 5, 7, 3, 0, 0x80, 0x80], 2, &[0, 300], 9, true)?;
+        let raw = encode_container_header(
+            &[0x81, 0x00, 5, 7, 3, 0, 0x80, 0x80],
+            2,
+            &[0, 300],
+            9,
+            Checksums::Crc32,
+        )?;
 
         let mut src = raw.as_slice();
         let header = ContainerHeader::read(&mut src, &definition)?.expect("header");

@@ -3,9 +3,10 @@
 mod header;
 
 use std::{
+    cmp::Reverse,
     collections::HashMap,
-    fs::File,
-    io::{self, BufRead, BufReader, Read},
+    io::{self, BufReader},
+    ops::Range,
     path::{Path, PathBuf},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -14,7 +15,6 @@ use std::{
 use anyhow::{Context, bail};
 use bstr::{BStr, BString, ByteSlice};
 use crossbeam_channel::{Receiver, Sender};
-use flate2::read::MultiGzDecoder;
 use noodles_sam as sam;
 
 use crate::{
@@ -22,6 +22,7 @@ use crate::{
     bam_raw,
     bgzf_stream::BgzfReader,
     commands::sort::parse_tag,
+    file_list,
     hts_region::{self, POS_MAX},
     output::{self, AlignmentWriter, OutputFormat, WriteOptions},
     program,
@@ -31,7 +32,7 @@ use crate::{
     source::{Format, Stream},
 };
 
-use self::header::{Collisions, HeaderMerger, Translation};
+use self::header::{Collisions, HeaderMerger, Translation, mark_unsorted};
 
 /// Raw records are sent from reading threads in batches of about this many bytes.
 const BATCH_SIZE: usize = 1 << 18;
@@ -150,71 +151,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         );
     }
 
-    let seed = args.seed.unwrap_or_else(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
-    });
-
-    let collisions = |combine| {
-        if combine {
-            Collisions::Combine
-        } else {
-            Collisions::Rename
-        }
-    };
-
-    let mut merger = HeaderMerger::new(
-        collisions(args.combine_read_groups),
-        collisions(args.combine_programs),
-        seed,
-    );
-
     let read_options = ReadOptions {
         threads: args.threads / inputs.len(),
         reference: args.reference.clone(),
     };
-
-    if let Some(path) = &args.header {
-        let src = path.to_str().context("header path is not valid UTF-8")?;
-        let (mut reader, _) = AlignmentReader::open(src, &read_options)?;
-        let header = reader
-            .read_header()
-            .with_context(|| format!("couldn't read headers from \"{src}\""))?;
-        merger.add(&header, None);
-    }
-
-    let mut opened = Vec::with_capacity(inputs.len());
-    let mut reset_order = false;
-
-    for input in &inputs {
-        let src = input
-            .path
-            .to_str()
-            .context("input path is not valid UTF-8")?;
-        let (mut reader, _) = AlignmentReader::open(src, &read_options)
-            .with_context(|| format!("fail to open \"{src}\""))?;
-        let header = reader
-            .read_header()
-            .with_context(|| format!("failed to read header from \"{src}\""))?;
-
-        let read_group = args
-            .attach_read_groups
-            .then(|| read_group_name(&input.path));
-
-        let translation = merger.add(&header, read_group.as_ref().map(|s| s.as_bstr()));
-
-        if translation.lost_coordinate_order && order == Order::Coordinate {
-            eprintln!(
-                "[bam_merge_core] Order of targets in file {src} caused coordinate sort to be lost"
-            );
-            reset_order = true;
-        }
-
-        opened.push((reader, header, translation, read_group));
-    }
-
-    let mut header = merger.finish(reset_order);
+    let (mut header, opened) = merge_headers(&args, &inputs, order, &read_options)?;
 
     if header.header().is_none() {
         eprintln!("[W::bam_merge_core2] No @HD tag found.");
@@ -222,25 +163,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let selection = Selection::new(&args, &header)?;
 
-    let format = args
-        .output_format
-        .or_else(|| OutputFormat::from_path(&output))
-        .unwrap_or(OutputFormat::Bam);
-
-    let level = if args.uncompressed {
-        0
-    } else if args.fast {
-        1
-    } else {
-        args.level
-    };
-
-    let write_options = WriteOptions {
-        format,
-        level: output::parse_level(level)?,
-        threads: args.threads,
-        reference: args.reference.clone(),
-    };
+    let write_options = write_options(&args, &output)?;
 
     if !args.no_pg {
         program::add(&mut header)?;
@@ -250,9 +173,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         let mut sources = Vec::with_capacity(opened.len());
         let mut readers = Vec::new();
 
-        for ((reader, input_header, translation, read_group), input) in
-            opened.into_iter().zip(&inputs)
-        {
+        for (opened, input) in opened.into_iter().zip(&inputs) {
+            let OpenedInput {
+                reader,
+                header: input_header,
+                translation,
+                read_group,
+            } = opened;
+
             let records = match (&selection, reader) {
                 (Selection::All, AlignmentReader::Bam(reader)) => Records::Bam(reader.into_inner()),
                 (selection, reader) => {
@@ -295,6 +223,118 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     })
 }
 
+/// An opened input, with its header already merged.
+struct OpenedInput {
+    reader: AlignmentReader,
+    header: sam::Header,
+    translation: Translation,
+    /// The read group `-r` attaches to its records.
+    read_group: Option<BString>,
+}
+
+/// Opens the inputs and merges their headers (and `-h`'s) as samtools does.
+fn merge_headers(
+    args: &Args,
+    inputs: &[InputFile],
+    order: Order,
+    read_options: &ReadOptions,
+) -> anyhow::Result<(sam::Header, Vec<OpenedInput>)> {
+    let seed = args.seed.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
+    });
+
+    let collisions = |combine| {
+        if combine {
+            Collisions::Combine
+        } else {
+            Collisions::Rename
+        }
+    };
+
+    let mut merger = HeaderMerger::new(
+        collisions(args.combine_read_groups),
+        collisions(args.combine_programs),
+        seed,
+    );
+
+    if let Some(path) = &args.header {
+        let src = path.to_str().context("header path is not valid UTF-8")?;
+        let (mut reader, _) = AlignmentReader::open(src, read_options)?;
+        let header = reader
+            .read_header()
+            .with_context(|| format!("couldn't read headers from \"{src}\""))?;
+        merger.add(&header, None);
+    }
+
+    let mut opened = Vec::with_capacity(inputs.len());
+    let mut reset_order = false;
+
+    for input in inputs {
+        let src = input
+            .path
+            .to_str()
+            .context("input path is not valid UTF-8")?;
+        let (mut reader, _) = AlignmentReader::open(src, read_options)
+            .with_context(|| format!("fail to open \"{src}\""))?;
+        let header = reader
+            .read_header()
+            .with_context(|| format!("failed to read header from \"{src}\""))?;
+
+        let read_group = args
+            .attach_read_groups
+            .then(|| read_group_name(&input.path));
+
+        let translation = merger.add(&header, read_group.as_ref().map(|s| s.as_bstr()));
+
+        if translation.lost_coordinate_order && order == Order::Coordinate {
+            eprintln!(
+                "[bam_merge_core] Order of targets in file {src} caused coordinate sort to be lost"
+            );
+            reset_order = true;
+        }
+
+        opened.push(OpenedInput {
+            reader,
+            header,
+            translation,
+            read_group,
+        });
+    }
+
+    let mut header = merger.finish();
+
+    if reset_order {
+        mark_unsorted(&mut header);
+    }
+
+    Ok((header, opened))
+}
+
+/// The output options, with the compression level from `-u`, `-1`, or `-l`.
+fn write_options(args: &Args, output: &Path) -> anyhow::Result<WriteOptions> {
+    let format = args
+        .output_format
+        .or_else(|| OutputFormat::from_path(output))
+        .unwrap_or(OutputFormat::Bam);
+
+    let level = if args.uncompressed {
+        0
+    } else if args.fast {
+        1
+    } else {
+        args.level
+    };
+
+    Ok(WriteOptions {
+        format,
+        level: output::parse_level(level)?,
+        threads: args.threads,
+        reference: args.reference.clone(),
+    })
+}
+
 /// The merge order, as samtools picks it.
 fn order(args: &Args) -> Order {
     let name_order = if args.name_natural {
@@ -332,7 +372,7 @@ fn files(args: &Args) -> anyhow::Result<(PathBuf, Vec<InputFile>)> {
     let mut inputs = Vec::new();
 
     for list in &args.lists {
-        for path in read_file_list(list)? {
+        for path in file_list::read_lines(list)? {
             inputs.push(InputFile { path, index: None });
         }
     }
@@ -361,42 +401,6 @@ fn files(args: &Args) -> anyhow::Result<(PathBuf, Vec<InputFile>)> {
     }
 
     Ok((output, inputs))
-}
-
-/// Reads a list of file names, one per line, skipping empty lines (`hts_readlines`). A gzipped
-/// list is decompressed; a name that is not a file but starts with `:` is a comma-separated
-/// list.
-pub fn read_file_list(src: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let file = match File::open(src) {
-        Ok(file) => file,
-        Err(e) => {
-            if let Some(list) = src.to_str().and_then(|s| s.strip_prefix(':')) {
-                return Ok(list.split(',').map(PathBuf::from).collect());
-            }
-
-            return Err(e).with_context(|| format!("Invalid file list \"{}\"", src.display()));
-        }
-    };
-
-    let mut reader = BufReader::new(file);
-    let is_gzipped = reader.fill_buf()?.starts_with(&[0x1f, 0x8b]);
-
-    let mut text = Vec::new();
-
-    if is_gzipped {
-        MultiGzDecoder::new(reader).read_to_end(&mut text)?;
-    } else {
-        reader.read_to_end(&mut text)?;
-    }
-
-    // Lines end at `\n`, with any `\r` before it removed.
-    let paths = ByteSlice::lines(text.as_slice())
-        .filter(|line| !line.is_empty())
-        .map(|line| line.to_path().map(Path::to_path_buf))
-        .collect::<Result<_, _>>()
-        .with_context(|| format!("Invalid file list \"{}\"", src.display()))?;
-
-    Ok(paths)
 }
 
 /// The read group name `-r` gives an input: its file name without the directory and without a
@@ -621,9 +625,8 @@ impl RecordSource for MergeInput {
 /// How an input's records change in the merged output (`bam_translate`).
 struct RecordTranslation {
     reference_sequence_ids: Option<Vec<i32>>,
-    /// Merged read group IDs by input ID; `None` for IDs not in the header (already reported).
-    read_groups: HashMap<BString, Option<BString>>,
-    programs: HashMap<BString, Option<BString>>,
+    read_groups: IdMap,
+    programs: IdMap,
     /// The `-r` read group of every record.
     read_group: Option<BString>,
     tail: Vec<u8>,
@@ -643,13 +646,10 @@ impl RecordTranslation {
             .enumerate()
             .all(|(i, &id)| usize::try_from(id).is_ok_and(|id| id == i));
 
-        let to_options =
-            |map: HashMap<BString, BString>| map.into_iter().map(|(k, v)| (k, Some(v))).collect();
-
         Self {
             reference_sequence_ids: (!is_identity).then_some(reference_sequence_ids),
-            read_groups: to_options(read_groups),
-            programs: to_options(programs),
+            read_groups: IdMap::new(read_groups, "RG"),
+            programs: IdMap::new(programs, "PG"),
             read_group,
             tail: Vec::new(),
         }
@@ -671,31 +671,30 @@ impl RecordTranslation {
         self.tail.clear();
 
         if let Some(range) = &rg {
-            let id = translate_tag(&mut self.read_groups, record, range, "RG");
+            let id = self.read_groups.translate(record, range);
 
             if self.read_group.is_none()
                 && let Some(id) = id
             {
-                push_string_field(&mut self.tail, *b"RG", &id);
+                push_string_field(&mut self.tail, *b"RG", id);
             }
         }
 
-        if let Some(range) = &pg {
-            let id = translate_tag(&mut self.programs, record, range, "PG");
-
-            if let Some(id) = id {
-                push_string_field(&mut self.tail, *b"PG", &id);
-            }
+        if let Some(range) = &pg
+            && let Some(id) = self.programs.translate(record, range)
+        {
+            push_string_field(&mut self.tail, *b"PG", id);
         }
 
         if let Some(id) = &self.read_group {
             push_string_field(&mut self.tail, *b"RG", id);
         }
 
-        let mut ranges: Vec<_> = [rg, pg].into_iter().flatten().collect();
-        ranges.sort_by_key(|range| std::cmp::Reverse(range.start));
+        // The later field first, so the earlier one's range stays valid.
+        let mut ranges = [rg, pg];
+        ranges.sort_unstable_by_key(|range| Reverse(range.as_ref().map(|r| r.start)));
 
-        for range in ranges {
+        for range in ranges.into_iter().flatten() {
             record.drain(range);
         }
 
@@ -705,34 +704,57 @@ impl RecordTranslation {
     }
 }
 
-/// Looks up a record's `RG` or `PG` value, warning once per ID that the header lacks.
-fn translate_tag(
-    map: &mut HashMap<BString, Option<BString>>,
-    record: &[u8],
-    range: &std::ops::Range<usize>,
-    tag: &str,
-) -> Option<BString> {
-    let field = &record[range.clone()];
+/// Merged `RG` or `PG` IDs by input ID.
+struct IdMap {
+    /// `None` for IDs not in the header (already reported).
+    ids: HashMap<BString, Option<BString>>,
+    /// The last lookup, since consecutive records usually share their IDs.
+    last: Option<(BString, Option<BString>)>,
+    tag: &'static str,
+}
 
-    let value: &BStr = match field[2] {
-        b'Z' | b'H' => field[3..field.len() - 1].as_bstr(),
-        _ => b"".as_bstr(),
-    };
-
-    if let Some(id) = map.get(value) {
-        return id.clone();
+impl IdMap {
+    fn new(ids: HashMap<BString, BString>, tag: &'static str) -> Self {
+        Self {
+            ids: ids.into_iter().map(|(k, v)| (k, Some(v))).collect(),
+            last: None,
+            tag,
+        }
     }
 
-    eprintln!(
-        "[bam_translate] {tag} tag \"{value}\" on read \"{}\" encountered with no \
-         corresponding entry in header, tag lost. Unknown tags are only reported once per \
-         input file for each tag ID.",
-        crate::sort_order::name(record).as_bstr()
-    );
+    /// Looks up a record's tag value, warning once per ID that the header lacks.
+    fn translate(&mut self, record: &[u8], range: &Range<usize>) -> Option<&BStr> {
+        let field = &record[range.clone()];
 
-    map.insert(value.into(), None);
+        let value: &BStr = match field[2] {
+            b'Z' | b'H' => field[3..field.len() - 1].as_bstr(),
+            _ => b"".as_bstr(),
+        };
 
-    None
+        if self.last.as_ref().is_none_or(|(last, _)| last != value) {
+            let id = match self.ids.get(value) {
+                Some(id) => id.clone(),
+                None => {
+                    eprintln!(
+                        "[bam_translate] {} tag \"{value}\" on read \"{}\" encountered with no \
+                         corresponding entry in header, tag lost. Unknown tags are only reported \
+                         once per input file for each tag ID.",
+                        self.tag,
+                        crate::sort_order::name(record).as_bstr()
+                    );
+                    self.ids.insert(value.into(), None);
+                    None
+                }
+            };
+
+            self.last = Some((value.into(), id));
+        }
+
+        self.last
+            .as_ref()
+            .and_then(|(_, id)| id.as_ref())
+            .map(|id| id.as_bstr())
+    }
 }
 
 fn push_string_field(dst: &mut Vec<u8>, tag: [u8; 2], value: &[u8]) {

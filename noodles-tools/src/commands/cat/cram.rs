@@ -218,32 +218,9 @@ fn cat_input<W: Write>(
     options: &Options<'_>,
     dst: &mut W,
 ) -> anyhow::Result<Progress> {
-    let index = if options.region.is_some() || options.part.is_some() {
-        Some(ContainerIndex::read(&input.path)?)
-    } else {
-        None
+    let Some(Scope { bounds, selection }) = scope(input, options)? else {
+        return Ok(Progress::Stop);
     };
-
-    let mut bounds: Option<(u64, u64)> = None;
-    let mut selection = None;
-
-    if let (Some(region), Some(index)) = (options.region, &index) {
-        if let Some(range) = region.strip_prefix("#:") {
-            bounds = Some(index.container_number_range(range)?);
-            selection = Some(Selection::Containers);
-        } else {
-            let (id, start, end) = parse_region(region, &input.header)?;
-            bounds = Some(index.extents(id, start, end)?);
-            selection = Some(Selection::Region { id, start, end });
-        }
-    }
-
-    if let (Some(part), Some(index)) = (options.part, &index) {
-        match index.part(part, bounds)? {
-            Some(range) => bounds = Some(range),
-            None => return Ok(Progress::Stop),
-        }
-    }
 
     if let Some((start, _)) = bounds {
         input.file.seek(SeekFrom::Start(start))?;
@@ -286,37 +263,15 @@ fn cat_input<W: Write>(
             continue;
         }
 
-        let mut filter = ContainerFilter::Copy;
-
-        if let Some(Selection::Region { id, start, end }) = selection {
-            let container_id = match i64::from(container.reference_sequence_id) {
-                -1 => UNPLACED,
-                n => n,
-            };
-
-            let container_start = i64::from(container.start);
-            let container_end = container_start + i64::from(container.span);
-
-            if container_id > id || container_start > end {
-                break;
-            } else if container.reference_sequence_id == MULTI_REFERENCE {
-                filter = ContainerFilter::Decode;
-            } else if container_id < id || container_end < start {
-                filter = ContainerFilter::Skip;
-            } else if container_start < start || container_end > end {
-                filter = match options.filtering {
-                    Filtering::Exact => ContainerFilter::Decode,
-                    Filtering::Fast => ContainerFilter::Copy,
-                };
-            }
-
-            if filter != ContainerFilter::Copy && last_reference_sequence_id == -1 && id == UNPLACED
-            {
-                filter = ContainerFilter::Copy;
-            }
-        }
+        let filter = container_filter(
+            &container,
+            selection.as_ref(),
+            options.filtering,
+            last_reference_sequence_id,
+        );
 
         match (filter, selection.as_ref()) {
+            (ContainerFilter::End, _) => break,
             (
                 ContainerFilter::Skip | ContainerFilter::Decode,
                 Some(&Selection::Region { id, start, end }),
@@ -365,11 +320,94 @@ fn cat_input<W: Write>(
     Ok(Progress::Continue)
 }
 
+/// The part of an input `-r` and `-p` select: the byte range of its containers and what `-r`
+/// selects in them.
+struct Scope {
+    bounds: Option<(u64, u64)>,
+    selection: Option<Selection>,
+}
+
+/// Finds an input's [`Scope`], or `None` when `-p` selects nothing.
+fn scope(input: &CramInput, options: &Options<'_>) -> anyhow::Result<Option<Scope>> {
+    let index = if options.region.is_some() || options.part.is_some() {
+        Some(ContainerIndex::read(&input.path)?)
+    } else {
+        None
+    };
+
+    let mut bounds: Option<(u64, u64)> = None;
+    let mut selection = None;
+
+    if let (Some(region), Some(index)) = (options.region, &index) {
+        if let Some(range) = region.strip_prefix("#:") {
+            bounds = Some(index.container_number_range(range)?);
+            selection = Some(Selection::Containers);
+        } else {
+            let (id, start, end) = parse_region(region, &input.header)?;
+            bounds = Some(index.extents(id, start, end)?);
+            selection = Some(Selection::Region { id, start, end });
+        }
+    }
+
+    if let (Some(part), Some(index)) = (options.part, &index) {
+        match index.part(part, bounds)? {
+            Some(range) => bounds = Some(range),
+            None => return Ok(None),
+        }
+    }
+
+    Ok(Some(Scope { bounds, selection }))
+}
+
+/// How a container is handled for a `-r` region: copied as is, skipped, or decoded and filtered
+/// record by record.
+fn container_filter(
+    container: &ContainerHeader,
+    selection: Option<&Selection>,
+    filtering: Filtering,
+    last_reference_sequence_id: i64,
+) -> ContainerFilter {
+    let Some(&Selection::Region { id, start, end }) = selection else {
+        return ContainerFilter::Copy;
+    };
+
+    let container_id = match i64::from(container.reference_sequence_id) {
+        -1 => UNPLACED,
+        n => n,
+    };
+
+    let container_start = i64::from(container.start);
+    let container_end = container_start + i64::from(container.span);
+
+    let filter = if container_id > id || container_start > end {
+        return ContainerFilter::End;
+    } else if container.reference_sequence_id == MULTI_REFERENCE {
+        ContainerFilter::Decode
+    } else if container_id < id || container_end < start {
+        ContainerFilter::Skip
+    } else if container_start < start || container_end > end {
+        match filtering {
+            Filtering::Exact => ContainerFilter::Decode,
+            Filtering::Fast => ContainerFilter::Copy,
+        }
+    } else {
+        ContainerFilter::Copy
+    };
+
+    if last_reference_sequence_id == -1 && id == UNPLACED {
+        ContainerFilter::Copy
+    } else {
+        filter
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContainerFilter {
     Copy,
     Skip,
     Decode,
+    /// The region ends before this container, so the input is done.
+    End,
 }
 
 /// Parses a region against an input's header (`sam_itr_querys`): `*` is the unplaced records.
