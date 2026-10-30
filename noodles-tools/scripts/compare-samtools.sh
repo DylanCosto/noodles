@@ -760,6 +760,25 @@ check "bedcov -j -d" "$st bedcov -j -d 5 dcov.bed $tagged" "$nt bedcov -j -d 5 d
 ln -sf "$short" bedcov.bam
 check "bedcov -X" "$st bedcov -H -c -X q.bed bedcov.bam $tagged $corpus/short/input.bam.csi $corpus/tagged/input.bam.bai" "$nt bedcov -H -c -X q.bed bedcov.bam $tagged $corpus/short/input.bam.csi $corpus/tagged/input.bam.bai"
 
+# bedcov --max-depth: HTSlib's pileup limit, on reads that start together, an empty read, deletions,
+# and skips (the read count -c counts only the reads the pileup keeps); at least the -d threshold
+printf "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:a\tLN:40\n@SQ\tSN:b\tLN:30\n" > bedcov.cap.sam
+for r in "5 5S AAAAA" "5 3M AAA" "5 3M AAA" "5 2M1D1M AAA" "5 4I AAAA" "6 1M A" "6 6M AAAAAA" \
+    "6 2M3N2M AAAA" "8 3M AAA" "8 3M AAA" "8 1M2D1M AA" "8 3M AAA" "9 2S2M AAAA"; do
+    read -r pos cigar seq <<<"$r"
+    printf "r\t0\ta\t%s\t30\t%s\t*\t0\t0\t%s\t%s\n" "$pos" "$cigar" "$seq" "$(echo "$seq" | tr A I)" >> bedcov.cap.sam
+done
+printf "s\t0\tb\t3\t30\t2M\t*\t0\t0\tAA\tII\n" >> bedcov.cap.sam
+"$st" view -b -o bedcov.cap.bam bedcov.cap.sam && "$st" index bedcov.cap.bam
+printf "a\t0\t40\nb\t0\t30\na\t5\t9\n" > bedcov.cap.bed
+for d in -1 0 1 2 3 100; do
+    check "bedcov -c --max-depth $d" "$st bedcov -c --max-depth $d bedcov.cap.bed bedcov.cap.bam" "$nt bedcov -c --max-depth $d bedcov.cap.bed bedcov.cap.bam"
+done
+check "bedcov -c -j -d 3 --max-depth 1" "$st bedcov -c -j -d 3 --max-depth 1 bedcov.cap.bed bedcov.cap.bam" "$nt bedcov -c -j -d 3 --max-depth 1 bedcov.cap.bed bedcov.cap.bam"
+check "bedcov -c --max-depth 2 two inputs" "$st bedcov -c --max-depth 2 q.bed $short $tagged" "$nt bedcov -c --max-depth 2 q.bed $short $tagged"
+check "bedcov long -c -j --max-depth 2" "$st bedcov -c -j --max-depth 2 lq.bed $long" "$nt bedcov -c -j --max-depth 2 lq.bed $long"
+check "bedcov CRAM -c --max-depth 1" "$st bedcov -c --max-depth 1 --reference $ref q.bed $corpus/short/input.3.1.cram" "$nt bedcov -c --max-depth 1 --reference $ref q.bed $corpus/short/input.3.1.cram"
+
 # depth: -s (overlapping mates), -l (soft clips excluded), deletions' qualities with -J -q, and
 # spliced reads' skips
 for opts in "-s" "-s -J -q 30 -Q 20" "-l 100" "-J -q 30 -Q 20"; do

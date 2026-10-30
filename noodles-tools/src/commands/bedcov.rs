@@ -53,6 +53,11 @@ pub struct Args {
     #[arg(short = 'd')]
     depth_threshold: Option<u32>,
 
+    /// Leave out reads that start where the previous one did once this many are in the pileup
+    /// (HTSlib's pileup depth limit; at least the `-d` threshold).
+    #[arg(long = "max-depth", value_name = "INT", allow_negative_numbers = true)]
+    max_depth: Option<i64>,
+
     /// Also report read counts.
     #[arg(short = 'c')]
     read_counts: bool,
@@ -134,6 +139,12 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
         write_header(&mut out, &args, sources)?;
     }
 
+    // samtools raises the limit to the -d threshold; a negative one acts as 0.
+    let max_count = args.max_depth.map(|max_depth| {
+        let threshold = args.depth_threshold.map_or(-1, i64::from);
+        usize::try_from(max_depth.max(threshold)).unwrap_or(0)
+    });
+
     let mut counts = vec![RegionCounts::default(); inputs.len()];
 
     let mut status = ExitCode::SUCCESS;
@@ -163,6 +174,7 @@ pub fn run(args: Args) -> anyhow::Result<ExitCode> {
                 &filter,
                 count_options,
                 args.depth_threshold,
+                max_count,
                 (name, start, end),
             )?;
         }
@@ -240,6 +252,7 @@ fn count_region(
     filter: &Filter,
     count_options: CountOptions,
     depth_threshold: Option<u32>,
+    max_count: Option<usize>,
     (name, start, end): (&str, usize, usize),
 ) -> anyhow::Result<RegionCounts> {
     let mut counts = RegionCounts::default();
@@ -256,7 +269,10 @@ fn count_region(
     let region = format!("{name}:{first}-{last}");
     let regions = [region];
 
-    let mut window = DepthWindow::new(count_options);
+    let mut window = match max_count {
+        Some(max_count) => DepthWindow::with_max_count(count_options, max_count),
+        None => DepthWindow::new(count_options),
+    };
 
     let mut emit = |rid: usize, position: usize, cell: crate::depth::Cell| -> io::Result<()> {
         if rid == id && (first..=last).contains(&position) {
@@ -285,7 +301,9 @@ fn count_region(
             return Ok(());
         }
 
-        if let Some((rid, s, e)) = record_interval(record.as_dyn(), header)?
+        // samtools counts reads as its pileup buffers them.
+        if window.add(&record, header, &mut emit)?
+            && let Some((rid, s, e)) = record_interval(record.as_dyn(), header)?
             && rid == id
             && s <= last
             && e >= first
@@ -293,7 +311,6 @@ fn count_region(
             reads += 1;
         }
 
-        window.add(&record, header, &mut emit)?;
         Ok(())
     })?;
 

@@ -34,7 +34,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `collate` | `collate` | groups templates by name; `-f`, `-O/-o`, `-u`, `-l`, `-m`, `-T`; `-n` and `-r` are accepted and ignored (they size samtools' temporary files) |
 | `fixmate` | `fixmate` | `-m`, `-c`, `-r`, `-p`, `-z`, `-M` (base modification tags); parallel with `-@` |
 | `dict` | `dict` | `-a`, `-s`, `-u`, `-H`, `-o`, `-A` (`AN` aliases), `-l` (`AH` for alternate loci) |
-| `bedcov` | `bedcov` | `-c`, `-d`, `-j`, `-Q`, `-g/-G`, `-H`; several inputs; `-X` (index files after the inputs) |
+| `bedcov` | `bedcov` | `-c`, `-d`, `-j`, `-Q`, `-g/-G`, `-H`, `--max-depth` (the pileup's limit, applied as HTSlib does); several inputs; `-X` (index files after the inputs) |
 | `addreplacerg` | `addreplacerg` | `-r` (repeatable, `\t` escapes), `-R`, `-m overwrite_all\|orphan_only`, `-w` |
 | `markdup` | `markdup` | `-r`, `-l`, `-m t\|s`, `-c`, `-S`, `-t`, `-d` (optical duplicates), `-T`, `-s/-f`, `--json`, `--no-multi-dup`, `--include-fails`, `--use-read-groups`, `--duplicate-count`, `--read-coords`/`--coords-order`, `--barcode-tag`/`-name`/`-rgx`, `--move-umi-to-tag`, `--umi-separator` |
 | `stats` | `stats` | all sections; `-r`, `-t`, regions, `-f/-F/-d`, `-c`, `-i`, `-m`, `-q`, `-l`, `-I`, `-S/-P`, `-p`, `-g`, `-x`, `--GC-depth`, `--ref-stats`; per-cycle counts use `-@` threads |
@@ -109,7 +109,9 @@ Intentional differences:
 - CRAM written by ntools keeps `MD`/`NM` tags as stored; HTSlib drops and regenerates them.
   Decoded records are the same apart from tag order. Reading CRAM, ntools regenerates `MD`/`NM`
   as HTSlib does: for mapped records with a reference, missing tags are added after the stored
-  ones (a `cF` tag can turn this off, and is removed).
+  ones, `MD` before `NM` (a `cF` tag can turn this off, and is removed). Like samtools, `fastq`,
+  `mpileup`, `depth`, and `coverage` do not regenerate them, so `fastq -T` and
+  `mpileup --output-extra` show only stored tags.
 - Reading CRAM records that overhang the end of the reference, ntools fills the bases past the
   end with `N`, as HTSlib does when it can decode them; HTSlib fails on such slices when it
   must regenerate `MD`.
@@ -255,7 +257,8 @@ ntools relies on these changes to the noodles crates, which downstream tools get
   `From<Record> for Vec<u8>`) for copying records without re-encoding.
 - SAM: integer arrays are formatted through a buffer, which speeds up long-read tags (`MM`/`ML`).
 - CRAM: decoding regenerates `MD`/`NM` tags that HTSlib's writer drops (as HTSlib's reader
-  does), and fills bases past the end of the reference with `N` instead of panicking.
+  does, unless turned off with `io::reader::MdNm::AsStored`, HTSlib's `decode_md=0`), and fills
+  bases past the end of the reference with `N` instead of panicking.
 - CRAM: a missing reference sequence is an error rather than a panic, and
   `Reader::set_reference_sequence_repository` lets a reference be chosen after reading the
   header.
