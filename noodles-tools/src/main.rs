@@ -8,6 +8,7 @@ mod bgzf_stream;
 mod commands;
 mod cram_raw;
 mod depth;
+mod file_list;
 mod filter;
 mod flags;
 mod hts_region;

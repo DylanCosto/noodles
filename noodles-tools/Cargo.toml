@@ -23,6 +23,7 @@ crc32fast = "1.4.0"
 crossbeam-channel = "0.5.6"
 flate2.workspace = true
 lexical-core.workspace = true
+libc = "0.2.150"
 md-5 = "0.11.0"
 memchr.workspace = true
 noodles-bam = { path = "../noodles-bam" }

@@ -154,6 +154,12 @@ for set in short tagged long; do
     check "idxstats $set" "$st idxstats $corpus/$set/input.bam" "$nt idxstats $corpus/$set/input.bam"
 done
 
+# idxstats -X: the index file follows the input
+ln -sf "$short" idxstats.bam
+for index in "$corpus/short/input.bam.bai" "$corpus/short/input.bam.csi"; do
+    check "idxstats -X ${index##*.}" "$st idxstats -X idxstats.bam $index" "$nt idxstats -X idxstats.bam $index"
+done
+
 check "depth" "$st depth $short" "$nt depth $short"
 check "depth -a" "$st depth -a $short" "$nt depth -a $short"
 check "depth -J -q 30 -Q 20" "$st depth -J -q 30 -Q 20 $short" "$nt depth -J -q 30 -Q 20 $short"
@@ -248,6 +254,19 @@ for f in fq.fq fqml.fq; do
 done
 "$nt" index -o ntools.bai "$short"
 check "index BAI queries" "$st view --no-PG -X $short $corpus/short/input.bam.bai $regions" "$st view --no-PG -X $short ntools.bai $regions"
+
+# index: -m (CSI with a minimum shift; 0 means BAI), -M (several inputs), and the legacy
+# `index in.bam out.index`, compared through idxstats and region queries with each index
+ln -sf "$short" index.a.bam
+ln -sf "$tagged" index.b.bam
+for opts in "-m 12" "-m 17" "-c" "-m 0" "-m 12 -b" "-b -m 13"; do
+    check "index $opts" "$st index $opts -o st.index.idx index.a.bam && head -c 3 st.index.idx | od -An -c && $st idxstats -X index.a.bam st.index.idx && $st view --no-PG -X index.a.bam st.index.idx $regions" "$nt index $opts -o nt.index.idx index.a.bam && head -c 3 nt.index.idx | od -An -c && $st idxstats -X index.a.bam nt.index.idx && $st view --no-PG -X index.a.bam nt.index.idx $regions"
+done
+cp "$short" st.index.a.bam && cp "$tagged" st.index.b.bam
+cp "$short" nt.index.a.bam && cp "$tagged" nt.index.b.bam
+check "index -M" "$st index -M -m 13 st.index.a.bam st.index.b.bam && $st idxstats -X st.index.b.bam st.index.b.bam.csi && $st view --no-PG -X st.index.a.bam st.index.a.bam.csi $regions" "$nt index -M -m 13 nt.index.a.bam nt.index.b.bam && $st idxstats -X nt.index.b.bam nt.index.b.bam.csi && $st view --no-PG -X nt.index.a.bam nt.index.a.bam.csi $regions"
+check "index without -M" "$st index index.a.bam index.b.bam; echo \$?" "$nt index index.a.bam index.b.bam 2>/dev/null; echo \$?"
+check "index in.bam out.index" "$st index index.a.bam st.index.legacy && $st idxstats -X index.a.bam st.index.legacy" "$nt index index.a.bam nt.index.legacy && $st idxstats -X index.a.bam nt.index.legacy"
 
 # split
 mkdir -p split-s split-n
@@ -494,6 +513,10 @@ printf "chrS\t0\t300000\nchrS\t5000\t9000\n" > dcov.bed
 check "bedcov -d (threshold column)" "$st bedcov -d 5 dcov.bed $tagged | cut -f5" "$nt bedcov -d 5 dcov.bed $tagged | cut -f5"
 check "bedcov -j -d" "$st bedcov -j -d 5 dcov.bed $tagged" "$nt bedcov -j -d 5 dcov.bed $tagged"
 
+# bedcov -X: index files follow the inputs
+ln -sf "$short" bedcov.bam
+check "bedcov -X" "$st bedcov -H -c -X q.bed bedcov.bam $tagged $corpus/short/input.bam.csi $corpus/tagged/input.bam.bai" "$nt bedcov -H -c -X q.bed bedcov.bam $tagged $corpus/short/input.bam.csi $corpus/tagged/input.bam.bai"
+
 # depth: -s (overlapping mates), -l (soft clips excluded), deletions' qualities with -J -q, and
 # spliced reads' skips
 for opts in "-s" "-s -J -q 30 -Q 20" "-l 100" "-J -q 30 -Q 20"; do
@@ -502,9 +525,51 @@ for opts in "-s" "-s -J -q 30 -Q 20" "-l 100" "-J -q 30 -Q 20"; do
     done
 done
 
+# depth: input lists (-f), index files after the inputs (-X, used with -r), --incl-flags, and
+# the ignored -d/-m. With -X, samtools labels the -H columns with the index names; ntools uses
+# the inputs'.
+printf "%s\n%s\n" "$short" "$tagged" > depth.list
+ln -sf "$short" depth.bam
+check "depth -f" "$st depth -H -f depth.list" "$nt depth -H -f depth.list"
+check "depth -f -r" "$st depth -a -f depth.list -r chrS:100000-110000" "$nt depth -a -f depth.list -r chrS:100000-110000"
+check "depth -X" "$st depth -X -r chrS:100000-200000 depth.bam $corpus/short/input.bam.csi" "$nt depth -X -r chrS:100000-200000 depth.bam $corpus/short/input.bam.csi"
+check "depth -X two inputs" "$st depth -a -X -r chrS:5000-60000 depth.bam $tagged $corpus/short/input.bam.bai $corpus/tagged/input.bam.bai" "$nt depth -a -X -r chrS:5000-60000 depth.bam $tagged $corpus/short/input.bam.bai $corpus/tagged/input.bam.bai"
+check "depth --incl-flags" "$st depth --incl-flags READ1,REVERSE $tagged" "$nt depth --incl-flags READ1,REVERSE $tagged"
+check "depth -d -m (ignored)" "$st depth -d 5 -m 10 $short" "$nt depth -d 5 -m 10 $short"
+
 # coverage -q is the minimum mapping quality, -Q the minimum base quality
 check "coverage -q 20 -Q 10" "$st coverage -q 20 -Q 10 $short" "$nt coverage -q 20 -Q 10 $short"
 check "coverage -l 120 -q 10 long" "$st coverage -l 120 -q 10 $long" "$nt coverage -l 120 -q 10 $long"
+
+# coverage: histograms (-m, -D, -A, -w; the bin count follows the terminal unless -w or -o
+# is given), the pileup's depth limit (-d), --min-depth, input lists (-b), several inputs, and
+# the long-only options. samtools reads CRAM base qualities as 255 unless -Q needs them, so that
+# column is left out for CRAM.
+for opts in "-m" "-m -o /dev/stdout" "-D -w 70" "-A -w 25" "-A -D" "-m -r chrS:100000-300000" \
+    "-w 3 -r chrS:100-101" "-d 5" "-d 2 -D -w 30" "-d 0" "-d -1" "--min-depth 20" \
+    "--min-depth 15 -m -w 30" "--incl-flags READ2 --excl-flags DUP,SECONDARY" "--rf 0x40 --ff 0" \
+    "-H -r chrS:1000-9000" "-r chrS:7999000-8000500" "--min-mq 30 --min-bq 20"; do
+    check "coverage $opts" "$st coverage $opts $short" "$nt coverage $opts $short"
+done
+for opts in "-d 3" "-m -d 4 -w 90"; do
+    check "coverage $opts tagged" "$st coverage $opts $tagged" "$nt coverage $opts $tagged"
+done
+printf "%s\n\n%s  \n" "$short" "$tagged" > coverage.list
+check "coverage -b" "$st coverage -b coverage.list" "$nt coverage -b coverage.list"
+check "coverage -b -D" "$st coverage -D -w 50 -b coverage.list" "$nt coverage -D -w 50 -b coverage.list"
+check "coverage two inputs -m" "$st coverage -m -w 40 $short $tagged" "$nt coverage -m -w 40 $short $tagged"
+check "coverage CRAM --reference" "$st coverage -d 4 --reference $ref $corpus/short/input.3.1.cram | cut -f1-7,9" "$nt coverage -d 4 --reference $ref $corpus/short/input.3.1.cram | cut -f1-7,9"
+# reads that start together beyond the limit, empty reads, deletions, and skips
+printf "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:a\tLN:40\n@SQ\tSN:b\tLN:30\n" > coverage.cap.sam
+for r in "5 5S AAAAA" "5 3M AAA" "5 3M AAA" "5 2M1D1M AAA" "5 4I AAAA" "6 1M A" "6 6M AAAAAA" \
+    "6 2M3N2M AAAA" "8 3M AAA" "8 3M AAA" "8 1M2D1M AA" "8 3M AAA" "9 2S2M AAAA"; do
+    read -r pos cigar seq <<<"$r"
+    printf "r\t0\ta\t%s\t30\t%s\t*\t0\t0\t%s\t%s\n" "$pos" "$cigar" "$seq" "$(echo "$seq" | tr A I)" >> coverage.cap.sam
+done
+printf "s\t0\tb\t3\t30\t2M\t*\t0\t0\tAA\tII\n" >> coverage.cap.sam
+for d in 1 2 3; do
+    check "coverage -d $d (reads left out)" "$st coverage -d $d coverage.cap.sam; $st coverage -d $d -D -w 40 coverage.cap.sam" "$nt coverage -d $d coverage.cap.sam; $nt coverage -d $d -D -w 40 coverage.cap.sam"
+done
 
 # mpileup refuses inputs whose reference sequences differ from the first's
 check "mpileup mismatched references" "echo 1" "$nt mpileup mp.short.bam md.bam > /dev/null 2>&1; echo \$?"
